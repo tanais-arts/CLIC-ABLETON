@@ -32,10 +32,8 @@ TICKS_PER_QUARTER = 24
 
 BG_IDLE = "#1e1e1e"
 FLASH_YELLOW = "#f5c518"
+FLASH_BLUE = "#2b4bff"  # bleu outremer
 FG_TEXT = "#f5f5f5"
-FG_DIM = "#5a5a5a"
-BIG_SQUARE_FRACTION = 0.55
-SMALL_SQUARE_FRACTION = 0.275  # 50% de la taille du grand carré
 
 
 def _lerp_color(start: str, end: str, t: float) -> str:
@@ -194,6 +192,9 @@ class App:
         # pas commencer au milieu d'une mesure.
         self._was_connected = False
         self._awaiting_downbeat = False
+        # Dernier tempo connu, pour animer la ligne de défilement à l'arrêt
+        # (même quand la source ne fournit plus de temps courant fiable).
+        self._last_bpm: float | None = None
 
         self._build_ui()
         self._refresh_ports()
@@ -376,8 +377,8 @@ class App:
             if self.midi_state.handle_message([CLOCK], tick_seconds):
                 fractional = self.midi_state.phase() % 1.0
                 self._update_display(
-                    self.midi_state.beat_in_bar, fractional, self.midi_state.bpm,
-                    self.midi_state.running, self.midi_state.running,
+                    self.midi_state.beat_in_bar, self.midi_state.beats_per_bar, fractional,
+                    self.midi_state.bpm, self.midi_state.running, self.midi_state.running,
                 )
         self._demo_job = self.root.after(int(quarter_seconds * 1000), self._demo_tick)
 
@@ -403,7 +404,7 @@ class App:
             if connected and self._awaiting_downbeat and beat == 1:
                 self._awaiting_downbeat = False
             connected = connected and not self._awaiting_downbeat
-            self._update_display(beat, phase % 1.0, self.midi_state.bpm, connected, connected)
+            self._update_display(beat, self.midi_state.beats_per_bar, phase % 1.0, self.midi_state.bpm, connected, connected)
             self.shared_state.update(
                 self.midi_state.phase(), self.midi_state.beats_per_bar,
                 self.midi_state.bpm, connected, connected, "midi",
@@ -432,7 +433,7 @@ class App:
                 if connected and self._awaiting_downbeat and beat == 1:
                     self._awaiting_downbeat = False
                 connected = connected and not self._awaiting_downbeat
-                self._update_display(beat, phase % 1.0, snapshot["bpm"], connected, snapshot["is_playing"])
+                self._update_display(beat, int(quantum), phase % 1.0, snapshot["bpm"], connected, snapshot["is_playing"])
                 self.link_peers_label.config(text=f"Pairs Link connectés : {link.num_peers}")
                 self.shared_state.update(
                     snapshot["phase"], quantum, snapshot["bpm"], connected, snapshot["is_playing"], "link",
@@ -441,38 +442,52 @@ class App:
         self.root.after(30, self._poll)
 
     # ----------------------------------------------------------- Display --
-    def _draw_square(self, color: str, size_fraction: float) -> None:
+    def _draw_digit(self, beat: int) -> None:
         canvas = self.display
-        canvas.delete("all")
         width, height = canvas.winfo_width(), canvas.winfo_height()
-        side = min(width, height) * size_fraction
-        if side <= 1:
+        if width <= 1 or height <= 1:
             return
-        cx, cy = width / 2, height / 2
-        canvas.create_rectangle(
-            cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2,
-            fill=color, outline="",
+        font_size = int(min(width, height) * 0.6)
+        canvas.create_text(
+            width / 2, height / 2, text=str(beat), fill=FG_TEXT, font=("Helvetica", font_size, "bold"),
         )
 
-    def _update_display(self, beat: int, fractional: float, bpm: float | None, connected: bool, running: bool) -> None:
-        self.root.configure(bg=BG_IDLE)
-        self.display.configure(bg=BG_IDLE)
-        # Sans source fiable (pas de clock MIDI / aucun pair Link), un carré
-        # figé ou faux serait trompeur pour le batteur : on n'affiche rien
-        # plutôt que d'inventer une position.
-        if not connected:
-            self.display.delete("all")
-        elif beat == 1:
-            # Flash jaune vif au temps 1, qui s'estompe vers la couleur normale.
-            color = _lerp_color(FLASH_YELLOW, FG_TEXT, fractional)
-            self._draw_square(color, BIG_SQUARE_FRACTION)
-        elif beat == 3:
-            # Même taille que le temps 1, sans le flash, s'estompe comme les autres.
-            color = _lerp_color(FG_TEXT, FG_DIM, fractional)
-            self._draw_square(color, BIG_SQUARE_FRACTION)
+    def _draw_scroll_line(self, beats_per_bar: int) -> None:
+        # À l'arrêt : une ligne blanche défile de gauche à droite au milieu de
+        # l'écran, en boucle sur la durée d'une mesure (tempo connu le plus récent).
+        canvas = self.display
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        bpm = self._last_bpm or 120.0
+        bar_duration = max(0.05, max(1, beats_per_bar) * 60.0 / bpm)
+        frac = (time.perf_counter() % bar_duration) / bar_duration
+        x = frac * width
+        y0, y1 = height * 0.15, height * 0.85
+        canvas.create_line(x, y0, x, y1, fill=FG_TEXT, width=4)
+
+    def _update_display(
+        self, beat: int, beats_per_bar: int, fractional: float, bpm: float | None, connected: bool, running: bool,
+    ) -> None:
+        # Flash jaune vif du fond au temps 1, bleu outremer au temps 3, qui
+        # s'estompent tous deux vers le fond normal.
+        if connected and beat == 1:
+            bg = _lerp_color(FLASH_YELLOW, BG_IDLE, fractional)
+        elif connected and beat == 3:
+            bg = _lerp_color(FLASH_BLUE, BG_IDLE, fractional)
         else:
-            color = _lerp_color(FG_TEXT, FG_DIM, fractional)
-            self._draw_square(color, SMALL_SQUARE_FRACTION)
+            bg = BG_IDLE
+        self.root.configure(bg=bg)
+        self.display.configure(bg=bg)
+        self.display.delete("all")
+        if bpm:
+            self._last_bpm = bpm
+        # Sans source fiable (pas de clock MIDI / aucun pair Link), un chiffre
+        # affiché au hasard serait trompeur pour le batteur : rien du tout.
+        if connected:
+            self._draw_digit(beat)
+        elif self._last_bpm:
+            self._draw_scroll_line(beats_per_bar)
 
         if bpm:
             self.bpm_label.config(text=f"{bpm:.1f} BPM")

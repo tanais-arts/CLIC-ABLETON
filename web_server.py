@@ -53,29 +53,35 @@ _PAGE = """<!DOCTYPE html>
   }
   #beat {
     flex: 1 1 auto; min-height: 0;
-    display: flex; align-items: center; justify-content: center;
+    position: relative;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 1.5vh;
   }
-  #square {
-    background: #f5f5f5;
-    aspect-ratio: 1 / 1;
-    -webkit-user-select: none; user-select: none;
-  }
-  #square.big { width: 42vh; height: 42vh; }
-  #square.small { width: 21vh; height: 21vh; }
   #dot {
     display: none;
     font-size: 20vh; color: #f5f5f5;
     -webkit-user-select: none; user-select: none;
+  }
+  #digit {
+    display: none;
+    font-size: 40vh; font-weight: bold; color: #f5f5f5;
+    -webkit-user-select: none; user-select: none;
+  }
+  #scrollLine {
+    display: none;
+    position: absolute; top: 15%; bottom: 15%; left: 0;
+    width: 0.8vh; background: #f5f5f5;
   }
   #info {
     flex: 0 0 auto; margin-bottom: 6px;
     display: flex; align-items: center; justify-content: center;
     font-size: 5vh; color: #bbbbbb;
   }
-  @keyframes flashYellow { from { background: #f5c518; } to { background: #f5f5f5; } }
-  @keyframes fadeSquare { from { opacity: 1; } to { opacity: 0.3; } }
-  #square.flash { animation: flashYellow 300ms ease-out; }
-  #square.fade { animation: fadeSquare linear forwards; }
+  @keyframes flashYellow { from { background: #f5c518; } to { background: #1e1e1e; } }
+  @keyframes flashBlue { from { background: #2b4bff; } to { background: #1e1e1e; } }
+  @keyframes scrollAcross { from { left: 0; } to { left: calc(100% - 0.8vh); } }
+  body.flash { animation: flashYellow 300ms ease-out; }
+  body.flash-blue { animation: flashBlue 300ms ease-out; }
 </style>
 </head>
 <body>
@@ -88,8 +94,9 @@ _PAGE = """<!DOCTYPE html>
     <div class="ticks"><span>-60</span><span>0 (référence)</span><span>+60</span></div>
   </div>
   <div id="beat">
-    <div id="square"></div>
     <div id="dot">•</div>
+    <div id="digit"></div>
+    <div id="scrollLine"></div>
   </div>
   <div id="info">-- BPM</div>
 <script>
@@ -104,6 +111,11 @@ slider.addEventListener('input', () => {
 });
 
 let lastBeat = null;
+let scrolling = false;
+const beatEl = document.getElementById('beat');
+const dotEl = document.getElementById('dot');
+const digitEl = document.getElementById('digit');
+const scrollLineEl = document.getElementById('scrollLine');
 
 function retrigger(el, cls) {
   el.classList.remove(cls);
@@ -115,32 +127,45 @@ async function poll() {
   try {
     const res = await fetch('/state?latency_ms=' + slider.value, {cache: 'no-store'});
     const data = await res.json();
-    const squareEl = document.getElementById('square');
-    const dotEl = document.getElementById('dot');
     const infoEl = document.getElementById('info');
     if (data.connected) {
       dotEl.style.display = 'none';
-      squareEl.style.display = 'block';
-      const big = (data.beat === 1 || data.beat === 3);
-      squareEl.classList.toggle('big', big);
-      squareEl.classList.toggle('small', !big);
+      scrollLineEl.style.display = 'none';
+      scrolling = false;
+      digitEl.style.display = 'block';
+      digitEl.textContent = data.beat;
       if (data.beat !== lastBeat) {
         lastBeat = data.beat;
         if (data.beat === 1) {
-          squareEl.classList.remove('fade');
-          retrigger(squareEl, 'flash');
-        } else {
-          squareEl.classList.remove('flash');
-          squareEl.style.animationDuration = (data.bpm ? 60 / data.bpm : 0.5) + 's';
-          retrigger(squareEl, 'fade');
+          document.body.classList.remove('flash-blue');
+          retrigger(document.body, 'flash');
+        } else if (data.beat === 3) {
+          document.body.classList.remove('flash');
+          retrigger(document.body, 'flash-blue');
         }
       }
     } else {
-      // Pas de signal fiable : un carré figé/faux serait trompeur.
-      squareEl.style.display = 'none';
-      squareEl.classList.remove('flash', 'fade');
-      dotEl.style.display = 'block';
+      digitEl.style.display = 'none';
       lastBeat = null;
+      if (data.bpm) {
+        // À l'arrêt (mais tempo connu) : une ligne blanche défile au milieu
+        // de l'écran, en boucle sur la durée d'une mesure.
+        dotEl.style.display = 'none';
+        if (!scrolling) {
+          scrolling = true;
+          const barMs = (data.beats_per_bar || 4) * 60000 / data.bpm;
+          scrollLineEl.style.display = 'block';
+          scrollLineEl.style.animation = 'none';
+          void scrollLineEl.offsetWidth;
+          scrollLineEl.style.animation = `scrollAcross ${barMs}ms linear infinite`;
+        }
+      } else {
+        // Pas de signal fiable ni de tempo connu : un chiffre ou une ligne
+        // affichés au hasard seraient trompeurs.
+        scrollLineEl.style.display = 'none';
+        scrolling = false;
+        dotEl.style.display = 'block';
+      }
     }
     let suffix = '';
     if (data.mode === 'link') {
@@ -227,8 +252,8 @@ class SharedBeatState:
             latency_ms + (elapsed_ms if data["connected"] else 0.0),
         )
         return {
-            "beat": beat, "bpm": data["bpm"], "connected": data["connected"],
-            "running": data["running"], "mode": data["mode"],
+            "beat": beat, "beats_per_bar": data["beats_per_bar"], "bpm": data["bpm"],
+            "connected": data["connected"], "running": data["running"], "mode": data["mode"],
         }
 
 
