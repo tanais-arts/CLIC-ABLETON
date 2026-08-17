@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+config.json
+
+# Dépôt Ableton Link vendored (voir README.md pour le cloner/recompiler)
+link-src/
