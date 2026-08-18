@@ -16,7 +16,12 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+# Sons de clic (extraits d'Ableton Live, usage privé local, voir .gitignore).
+_SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
+_SOUND_FILES = {"click.wav", "click_up.wav"}
 
 _PAGE = """<!DOCTYPE html>
 <html lang="fr">
@@ -69,8 +74,15 @@ _PAGE = """<!DOCTYPE html>
   }
   #scrollLine {
     display: none;
-    position: absolute; top: 15%; bottom: 15%; left: 0;
-    width: 0.8vh; background: #f5f5f5;
+    position: absolute; left: 15%; right: 15%; top: 50%;
+    height: 0.8vh; transform: translateY(-50%);
+    overflow: hidden;
+    background: rgba(245, 245, 245, 0.15);
+  }
+  #scrollThumb {
+    position: absolute; top: 0; bottom: 0; left: 0;
+    width: 0%; background: #f5f5f5;
+    transition: width 0.06s linear;
   }
   #info {
     flex: 0 0 auto; margin-bottom: 6px;
@@ -79,9 +91,14 @@ _PAGE = """<!DOCTYPE html>
   }
   @keyframes flashYellow { from { background: #f5c518; } to { background: #1e1e1e; } }
   @keyframes flashBlue { from { background: #2b4bff; } to { background: #1e1e1e; } }
-  @keyframes scrollAcross { from { left: 0; } to { left: calc(100% - 0.8vh); } }
   body.flash { animation: flashYellow 300ms ease-out; }
   body.flash-blue { animation: flashBlue 300ms ease-out; }
+  #muteBtn {
+    margin-top: 8px; padding: 6px 16px; font-size: 2.4vh;
+    background: #333333; color: #f5f5f5; border: none; border-radius: 6px;
+    -webkit-user-select: none; user-select: none;
+  }
+  #muteBtn.unmuted { background: #2b7a2b; }
 </style>
 </head>
 <body>
@@ -92,11 +109,12 @@ _PAGE = """<!DOCTYPE html>
       <span id="latencyValue">0 ms</span>
     </div>
     <div class="ticks"><span>-60</span><span>0 (référence)</span><span>+60</span></div>
+    <button id="muteBtn">🔇 Son coupé</button>
   </div>
   <div id="beat">
     <div id="dot">•</div>
     <div id="digit"></div>
-    <div id="scrollLine"></div>
+    <div id="scrollLine"><div id="scrollThumb"></div></div>
   </div>
   <div id="info">-- BPM</div>
 <script>
@@ -111,11 +129,77 @@ slider.addEventListener('input', () => {
 });
 
 let lastBeat = null;
-let scrolling = false;
+let lastBarPhase = 0;
 const beatEl = document.getElementById('beat');
 const dotEl = document.getElementById('dot');
 const digitEl = document.getElementById('digit');
 const scrollLineEl = document.getElementById('scrollLine');
+const scrollThumbEl = document.getElementById('scrollThumb');
+
+const MUTE_KEY = 'beatDisplayMuted';
+const muteBtn = document.getElementById('muteBtn');
+let muted = localStorage.getItem(MUTE_KEY) !== '0';
+
+// Web Audio API plutôt que <audio> : lecture bien plus précise/rapide,
+// nécessaire pour rester synchrone avec l'affichage des chiffres.
+let audioCtx = null;
+let clickBuffer = null;
+let clickUpBuffer = null;
+
+async function loadBuffer(ctx, url) {
+  const res = await fetch(url);
+  const data = await res.arrayBuffer();
+  return await ctx.decodeAudioData(data);
+}
+
+async function initAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume();
+  }
+  if (!clickBuffer) clickBuffer = await loadBuffer(audioCtx, '/sounds/click.wav');
+  if (!clickUpBuffer) clickUpBuffer = await loadBuffer(audioCtx, '/sounds/click_up.wav');
+}
+
+function updateMuteBtn() {
+  muteBtn.textContent = muted ? '🔇 Son coupé' : '🔊 Son actif';
+  muteBtn.classList.toggle('unmuted', !muted);
+}
+updateMuteBtn();
+if (!muted) {
+  initAudio().catch(() => {});
+}
+
+// iOS/Safari ne débloque le son que sur un vrai geste utilisateur : le
+// premier tap n'importe où sur la page relance le contexte s'il est encore
+// suspendu (ex. init faite au chargement de la page, sans geste).
+function unlockAudio() {
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+}
+document.addEventListener('pointerdown', unlockAudio);
+document.addEventListener('touchend', unlockAudio);
+
+muteBtn.addEventListener('click', () => {
+  muted = !muted;
+  localStorage.setItem(MUTE_KEY, muted ? '1' : '0');
+  updateMuteBtn();
+  if (!muted) {
+    // Débloque/charge l'audio (nécessite un geste utilisateur sur mobile).
+    initAudio().catch(() => {});
+  }
+});
+
+function playClick(beat) {
+  if (muted || !audioCtx || !clickBuffer || !clickUpBuffer) return;
+  const source = audioCtx.createBufferSource();
+  source.buffer = beat === 1 ? clickUpBuffer : clickBuffer;
+  source.connect(audioCtx.destination);
+  source.start(0);
+}
 
 function retrigger(el, cls) {
   el.classList.remove(cls);
@@ -131,11 +215,11 @@ async function poll() {
     if (data.connected) {
       dotEl.style.display = 'none';
       scrollLineEl.style.display = 'none';
-      scrolling = false;
       digitEl.style.display = 'block';
       digitEl.textContent = data.beat;
       if (data.beat !== lastBeat) {
         lastBeat = data.beat;
+        playClick(data.beat);
         if (data.beat === 1) {
           document.body.classList.remove('flash-blue');
           retrigger(document.body, 'flash');
@@ -147,24 +231,27 @@ async function poll() {
     } else {
       digitEl.style.display = 'none';
       lastBeat = null;
-      if (data.bpm) {
-        // À l'arrêt (mais tempo connu) : une ligne blanche défile au milieu
-        // de l'écran, en boucle sur la durée d'une mesure.
+      if (data.bpm && !data.running) {
+        // À l'arrêt (mais tempo connu) : la ligne se remplit de gauche à
+        // droite, synchronisée sur le temps réel (vide au temps 1, pleine
+        // à la fin du dernier temps de la mesure).
         dotEl.style.display = 'none';
-        if (!scrolling) {
-          scrolling = true;
-          const barMs = (data.beats_per_bar || 4) * 60000 / data.bpm;
-          scrollLineEl.style.display = 'block';
-          scrollLineEl.style.animation = 'none';
-          void scrollLineEl.offsetWidth;
-          scrollLineEl.style.animation = `scrollAcross ${barMs}ms linear infinite`;
+        scrollLineEl.style.display = 'block';
+        const barPhase = data.bar_phase || 0;
+        if (barPhase < lastBarPhase) {
+          // Nouvelle mesure : on revide instantanément, sans animer le retour à 0.
+          scrollThumbEl.style.transition = 'none';
+          scrollThumbEl.style.width = '0%';
+          void scrollThumbEl.offsetWidth;
+          scrollThumbEl.style.transition = '';
         }
+        lastBarPhase = barPhase;
+        scrollThumbEl.style.width = (barPhase * 100) + '%';
       } else {
-        // Pas de signal fiable ni de tempo connu : un chiffre ou une ligne
-        // affichés au hasard seraient trompeurs.
+        // Pas de tempo connu, ou transport relancé mais pas encore
+        // resynchronisé sur le temps 1 : rien qui induirait en erreur.
         scrollLineEl.style.display = 'none';
-        scrolling = false;
-        dotEl.style.display = 'block';
+        dotEl.style.display = data.bpm ? 'none' : 'block';
       }
     }
     let suffix = '';
@@ -247,12 +334,16 @@ class SharedBeatState:
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
         elapsed_ms = (time.monotonic() - data["ref_monotonic"]) * 1000.0
-        beat = project_beat(
-            data["phase"], data["beats_per_bar"], data["bpm"], data["connected"],
-            latency_ms + (elapsed_ms if data["connected"] else 0.0),
-        )
+        total_latency_ms = latency_ms + (elapsed_ms if data["connected"] else 0.0)
+        beat = project_beat(data["phase"], data["beats_per_bar"], data["bpm"], data["connected"], total_latency_ms)
+        beats_per_bar = data["beats_per_bar"] or 4
+        phase = project_phase(data["phase"], data["bpm"], data["connected"], total_latency_ms)
+        # Position (0..1) dans la mesure : synchronise l'animation d'attente
+        # (segment défilant) sur le tempo réel, même à l'arrêt.
+        bar_phase = (phase % beats_per_bar) / beats_per_bar
         return {
             "beat": beat, "beats_per_bar": data["beats_per_bar"], "bpm": data["bpm"],
+            "bar_phase": bar_phase,
             "connected": data["connected"], "running": data["running"], "mode": data["mode"],
         }
 
@@ -278,6 +369,19 @@ def _make_handler(shared_state: SharedBeatState):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
+            elif parsed.path.startswith("/sounds/") and parsed.path[len("/sounds/"):] in _SOUND_FILES:
+                file_path = _SOUNDS_DIR / parsed.path[len("/sounds/"):]
+                if file_path.is_file():
+                    body = file_path.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "audio/wav")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
             else:
                 body = _PAGE.encode("utf-8")
                 self.send_response(200)

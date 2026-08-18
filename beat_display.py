@@ -403,11 +403,12 @@ class App:
             beat = int(phase % self.midi_state.beats_per_bar) + 1
             if connected and self._awaiting_downbeat and beat == 1:
                 self._awaiting_downbeat = False
+            running = connected  # présence réelle du clock, avant masquage
             connected = connected and not self._awaiting_downbeat
-            self._update_display(beat, self.midi_state.beats_per_bar, phase % 1.0, self.midi_state.bpm, connected, connected)
+            self._update_display(beat, self.midi_state.beats_per_bar, phase % 1.0, self.midi_state.bpm, connected, running)
             self.shared_state.update(
                 self.midi_state.phase(), self.midi_state.beats_per_bar,
-                self.midi_state.bpm, connected, connected, "midi",
+                self.midi_state.bpm, connected, running, "midi",
             )
         else:
             link = self._ensure_link()
@@ -452,19 +453,22 @@ class App:
             width / 2, height / 2, text=str(beat), fill=FG_TEXT, font=("Helvetica", font_size, "bold"),
         )
 
-    def _draw_scroll_line(self, beats_per_bar: int) -> None:
-        # À l'arrêt : une ligne blanche défile de gauche à droite au milieu de
-        # l'écran, en boucle sur la durée d'une mesure (tempo connu le plus récent).
+    def _draw_scroll_line(self, beats_per_bar: int, beat: int, fractional: float) -> None:
+        # À l'arrêt : la ligne se remplit de gauche à droite au milieu de
+        # l'écran (façon barre de progression), synchronisée sur le temps réel
+        # (vide au temps 1, pleine à la fin du dernier temps de la mesure).
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
             return
-        bpm = self._last_bpm or 120.0
-        bar_duration = max(0.05, max(1, beats_per_bar) * 60.0 / bpm)
-        frac = (time.perf_counter() % bar_duration) / bar_duration
-        x = frac * width
-        y0, y1 = height * 0.15, height * 0.85
-        canvas.create_line(x, y0, x, y1, fill=FG_TEXT, width=4)
+        beats_per_bar = max(1, beats_per_bar)
+        bar_phase = ((beat - 1) + fractional) / beats_per_bar
+        x0, x1 = width * 0.15, width * 0.85
+        y = height / 2
+        canvas.create_line(x0, y, x1, y, fill="#3a3a3a", width=4)
+        fill_end = x0 + bar_phase * (x1 - x0)
+        if fill_end > x0:
+            canvas.create_line(x0, y, fill_end, y, fill=FG_TEXT, width=4)
 
     def _update_display(
         self, beat: int, beats_per_bar: int, fractional: float, bpm: float | None, connected: bool, running: bool,
@@ -486,8 +490,8 @@ class App:
         # affiché au hasard serait trompeur pour le batteur : rien du tout.
         if connected:
             self._draw_digit(beat)
-        elif self._last_bpm:
-            self._draw_scroll_line(beats_per_bar)
+        elif self._last_bpm and not running:
+            self._draw_scroll_line(beats_per_bar, beat, fractional)
 
         if bpm:
             self.bpm_label.config(text=f"{bpm:.1f} BPM")
