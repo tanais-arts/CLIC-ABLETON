@@ -182,11 +182,6 @@ class App:
         self.web_server = BeatWebServer(self.shared_state, port=self.config["web_port"])
         self.web_server.start()
 
-        self._demo_job = None
-        self._demo_running = False
-        # Devient vrai dès qu'on observe is_playing=True au moins une fois :
-        # preuve que "Start Stop Sync" est activé côté Live et donc fiable.
-        self._link_start_stop_confirmed = False
         # À la reprise (connecté/en lecture après ne pas l'avoir été), on
         # n'affiche les temps qu'à partir du prochain temps 1 réel, pour ne
         # pas commencer au milieu d'une mesure.
@@ -260,9 +255,6 @@ class App:
             settings_frame, from_=-60, to=60, increment=1, width=6,
             textvariable=self.latency_var, command=self._on_settings_change,
         ).pack(side="left", padx=6)
-
-        self.demo_btn = tk.Button(settings_frame, text="Démo 120 BPM (sans Live)", command=self._toggle_demo)
-        self.demo_btn.pack(side="right")
 
         # -- Affichage principal du temps : un carré, gros pour 1/3, petit pour 2/4 --
         self.display = tk.Canvas(self.root, bg=BG_IDLE, highlightthickness=0)
@@ -349,44 +341,9 @@ class App:
         self.link = link
         return self.link
 
-    # --------------------------------------------------------- Demo mode --
-    def _toggle_demo(self) -> None:
-        if self._demo_running:
-            self._demo_running = False
-            if self._demo_job is not None:
-                self.root.after_cancel(self._demo_job)
-                self._demo_job = None
-            self.demo_btn.config(text="Démo 120 BPM (sans Live)")
-            self.midi_state.running = False
-            self.status_label.config(text="Démo arrêtée")
-            return
-
-        self._demo_running = True
-        self.demo_btn.config(text="Arrêter la démo")
-        self.midi_state.reset_position()
-        self.midi_state.running = True
-        self.status_label.config(text="Démo interne à 120 BPM (aucun MIDI/Link requis)")
-        self._demo_tick()
-
-    def _demo_tick(self) -> None:
-        if not self._demo_running:
-            return
-        quarter_seconds = 60.0 / 120.0
-        tick_seconds = quarter_seconds / TICKS_PER_QUARTER
-        for _ in range(TICKS_PER_QUARTER):
-            if self.midi_state.handle_message([CLOCK], tick_seconds):
-                fractional = self.midi_state.phase() % 1.0
-                self._update_display(
-                    self.midi_state.beat_in_bar, self.midi_state.beats_per_bar, fractional,
-                    self.midi_state.bpm, self.midi_state.running, self.midi_state.running,
-                )
-        self._demo_job = self.root.after(int(quarter_seconds * 1000), self._demo_tick)
-
     # -------------------------------------------------------- Boucle poll --
     def _poll(self) -> None:
-        if self._demo_running:
-            pass  # la démo pilote déjà l'affichage via son propre timer
-        elif self.mode_var.get() == "midi":
+        if self.mode_var.get() == "midi":
             try:
                 while True:
                     message, delta_time, _ts = self._event_queue.get_nowait()
@@ -415,17 +372,10 @@ class App:
             if link is not None:
                 quantum = float(max(1, self.beats_var.get()))
                 snapshot = link.snapshot(quantum=quantum)
-                # Le timeline Link tourne en continu dès qu'on a un pair, donc
-                # les pairs connectés servent de base pour figer/afficher.
-                # "is_playing" nécessite en plus "Start Stop Sync" activé côté
-                # Live : on ne l'utilise pour figer le compteur à l'arrêt que
-                # dès qu'on l'a vu passer à vrai une fois (signal confirmé
-                # fiable), pour ne pas figer à tort chez qui ne l'active pas.
-                if snapshot["is_playing"]:
-                    self._link_start_stop_confirmed = True
-                connected = link.num_peers >= 1
-                if self._link_start_stop_confirmed:
-                    connected = connected and snapshot["is_playing"]
+                # On n'affiche le comptage qu'une fois le signal START de Link
+                # reçu (is_playing) : la seule présence de pairs ne suffit pas,
+                # sinon le compteur démarre au lancement même sans lecture.
+                connected = link.num_peers >= 1 and snapshot["is_playing"]
                 if connected and not self._was_connected:
                     self._awaiting_downbeat = True
                 self._was_connected = connected
