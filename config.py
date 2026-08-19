@@ -17,6 +17,7 @@ DEFAULTS = {
     "beats_per_bar": 4,
     "latency_ms": 0,
     "web_port": 8765,
+    "dots_only": False,  # affiche un gros point au lieu du numéro de temps
 }
 
 

@@ -72,6 +72,17 @@ _PAGE = """<!DOCTYPE html>
     font-size: 40vh; font-weight: bold; color: #f5f5f5;
     -webkit-user-select: none; user-select: none;
   }
+  #circles {
+    display: none;
+    flex-direction: row; align-items: center; justify-content: center;
+    gap: 11.2vh;
+  }
+  .circle {
+    width: 32vh; height: 32vh; border-radius: 50%;
+    border: 0.6vh solid #f5f5f5; box-sizing: border-box;
+    background: transparent;
+  }
+  .circle.filled { background: #f5f5f5; }
   #scrollLine {
     display: none;
     position: absolute; left: 15%; right: 15%; top: 50%;
@@ -99,6 +110,7 @@ _PAGE = """<!DOCTYPE html>
     -webkit-user-select: none; user-select: none;
   }
   #muteBtn.unmuted { background: #2b7a2b; }
+  #dotsBtn.active { background: #2b7a2b; }
 </style>
 </head>
 <body>
@@ -110,10 +122,12 @@ _PAGE = """<!DOCTYPE html>
     </div>
     <div class="ticks"><span>-60</span><span>0 (référence)</span><span>+60</span></div>
     <button id="muteBtn">🔇 Son coupé</button>
+    <button id="dotsBtn">🔢 Chiffres</button>
   </div>
   <div id="beat">
     <div id="dot">•</div>
     <div id="digit"></div>
+    <div id="circles"><div id="circleLeft" class="circle"></div><div id="circleRight" class="circle"></div></div>
     <div id="scrollLine"><div id="scrollThumb"></div></div>
   </div>
   <div id="info">-- BPM</div>
@@ -133,6 +147,9 @@ let lastBarPhase = 0;
 const beatEl = document.getElementById('beat');
 const dotEl = document.getElementById('dot');
 const digitEl = document.getElementById('digit');
+const circlesEl = document.getElementById('circles');
+const circleLeftEl = document.getElementById('circleLeft');
+const circleRightEl = document.getElementById('circleRight');
 const scrollLineEl = document.getElementById('scrollLine');
 const scrollThumbEl = document.getElementById('scrollThumb');
 
@@ -171,6 +188,21 @@ updateMuteBtn();
 if (!muted) {
   initAudio().catch(() => {});
 }
+
+const DOTS_KEY = 'beatDisplayDotsOnly';
+const dotsBtn = document.getElementById('dotsBtn');
+let dotsOnly = localStorage.getItem(DOTS_KEY) === '1';
+
+function updateDotsBtn() {
+  dotsBtn.textContent = dotsOnly ? '● Points' : '🔢 Chiffres';
+  dotsBtn.classList.toggle('active', dotsOnly);
+}
+updateDotsBtn();
+dotsBtn.addEventListener('click', () => {
+  dotsOnly = !dotsOnly;
+  localStorage.setItem(DOTS_KEY, dotsOnly ? '1' : '0');
+  updateDotsBtn();
+});
 
 // iOS/Safari ne débloque le son que sur un vrai geste utilisateur : le
 // premier tap n'importe où sur la page relance le contexte s'il est encore
@@ -213,10 +245,22 @@ async function poll() {
     const data = await res.json();
     const infoEl = document.getElementById('info');
     if (data.connected) {
-      dotEl.style.display = 'none';
       scrollLineEl.style.display = 'none';
-      digitEl.style.display = 'block';
-      digitEl.textContent = data.beat;
+      if (dotsOnly) {
+        digitEl.style.display = 'none';
+        dotEl.style.display = 'none';
+        circlesEl.style.display = 'flex';
+        // Gauche remplie aux temps impairs (1, 3...), droite aux temps
+        // pairs (2, 4...) : l'alternance rend le pulse visible.
+        const leftFilled = data.beat % 2 === 1;
+        circleLeftEl.classList.toggle('filled', leftFilled);
+        circleRightEl.classList.toggle('filled', !leftFilled);
+      } else {
+        circlesEl.style.display = 'none';
+        dotEl.style.display = 'none';
+        digitEl.style.display = 'block';
+        digitEl.textContent = data.beat;
+      }
       if (data.beat !== lastBeat) {
         lastBeat = data.beat;
         playClick(data.beat);
@@ -230,6 +274,7 @@ async function poll() {
       }
     } else {
       digitEl.style.display = 'none';
+      circlesEl.style.display = 'none';
       lastBeat = null;
       if (data.bpm && !data.running) {
         // À l'arrêt (mais tempo connu) : la ligne se remplit de gauche à

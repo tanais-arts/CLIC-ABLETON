@@ -256,6 +256,13 @@ class App:
             textvariable=self.latency_var, command=self._on_settings_change,
         ).pack(side="left", padx=6)
 
+        self.dots_var = tk.BooleanVar(value=self.config["dots_only"])
+        tk.Checkbutton(
+            settings_frame, text="Points au lieu des chiffres", variable=self.dots_var,
+            command=self._on_settings_change, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
+            activebackground=BG_IDLE, activeforeground=FG_TEXT,
+        ).pack(side="left", padx=(16, 0))
+
         # -- Affichage principal du temps : un carré, gros pour 1/3, petit pour 2/4 --
         self.display = tk.Canvas(self.root, bg=BG_IDLE, highlightthickness=0)
         self.display.pack(expand=True, fill="both", padx=10, pady=4)
@@ -323,6 +330,7 @@ class App:
         self.config["beats_per_bar"] = beats
         self.config["latency_ms"] = latency
         self.config["mode"] = self.mode_var.get()
+        self.config["dots_only"] = self.dots_var.get()
         save_config(self.config)
 
     # --------------------------------------------------------- Ableton Link --
@@ -403,6 +411,26 @@ class App:
             width / 2, height / 2, text=str(beat), fill=FG_TEXT, font=("Helvetica", font_size, "bold"),
         )
 
+    def _draw_two_circles(self, beat: int, bg: str) -> None:
+        # Deux cercles côte à côte : celui de gauche se remplit aux temps
+        # impairs (1, 3...), celui de droite aux temps pairs (2, 4...) —
+        # l'alternance rend le pulse visible à chaque temps.
+        canvas = self.display
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        diameter = min(width, height) * 0.6 * 0.8
+        radius = diameter / 2
+        cy = height / 2
+        left_cx = width / 2 - diameter * 0.7
+        right_cx = width / 2 + diameter * 0.7
+        left_filled = beat % 2 == 1
+        for cx, filled in ((left_cx, left_filled), (right_cx, not left_filled)):
+            canvas.create_oval(
+                cx - radius, cy - radius, cx + radius, cy + radius,
+                fill=FG_TEXT if filled else bg, outline=FG_TEXT, width=3,
+            )
+
     def _draw_scroll_line(self, beats_per_bar: int, beat: int, fractional: float) -> None:
         # À l'arrêt : la ligne se remplit de gauche à droite au milieu de
         # l'écran (façon barre de progression), synchronisée sur le temps réel
@@ -439,7 +467,10 @@ class App:
         # Sans source fiable (pas de clock MIDI / aucun pair Link), un chiffre
         # affiché au hasard serait trompeur pour le batteur : rien du tout.
         if connected:
-            self._draw_digit(beat)
+            if self.dots_var.get():
+                self._draw_two_circles(beat, bg)
+            else:
+                self._draw_digit(beat)
         elif self._last_bpm and not running:
             self._draw_scroll_line(beats_per_bar, beat, fractional)
 
