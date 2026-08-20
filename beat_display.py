@@ -679,6 +679,11 @@ class App:
             # de flash, pas d'agrandissement (réservés aux scènes nommées).
             if self._scene_name.strip().isdigit():
                 self.live_osc.start_playing()
+                # 2s après le lancement d'une scène "tempo seul", on
+                # sélectionne automatiquement la scène suivante (comme un
+                # appui sur ▼), prête à être lancée avec le bouton ▶.
+                launched_index = self._scene_index
+                self.root.after(2000, lambda: self._auto_advance_scene(launched_index))
             else:
                 self.scene_name_label.config(fg=SCENE_LAUNCHED)
                 # Le smartphone n'affiche le vrai titre qu'à ce moment (pas de
@@ -688,6 +693,13 @@ class App:
                 self._scene_flash_start = time.monotonic()
         except OSError as exc:
             self.scene_name_label.config(text=f"Erreur OSC : {exc}")
+
+    def _auto_advance_scene(self, expected_index: int) -> None:
+        """Callback différée de _scene_launch : n'avance que si on est
+        toujours sur la scène lancée il y a 2s (pas de navigation manuelle
+        entretemps)."""
+        if self._scene_index == expected_index:
+            self._scene_step(1)
 
     def _stop_return_to_start(self) -> None:
         """Simule un double appui sur Stop dans Live : arrête la lecture (et les
