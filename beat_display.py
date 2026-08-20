@@ -34,6 +34,11 @@ TICKS_PER_QUARTER = 24
 BG_IDLE = "#1e1e1e"
 FLASH_YELLOW = "#f5c518"
 FLASH_BLUE = "#2b4bff"  # bleu outremer
+SCENE_NOT_LAUNCHED = "#f5c518"  # jaune : scène sélectionnée, pas encore lancée
+SCENE_LAUNCHED = "#3ddc57"  # vert : scène lancée
+SCENE_FLASH_WHITE = "#ffffff"
+SCENE_FLASH_PULSE = 0.15  # secondes par flash
+SCENE_FLASH_GAP = 0.1  # secondes entre les deux flashs
 FG_TEXT = "#f5f5f5"
 
 
@@ -293,6 +298,8 @@ class App:
         # Dernier tempo connu, pour animer la ligne de défilement à l'arrêt
         # (même quand la source ne fournit plus de temps courant fiable).
         self._last_bpm: float | None = None
+        # Flash blanc ponctuel du canvas au lancement d'une scène.
+        self._scene_flash_start: float = 0.0
 
         self._build_ui()
         self._refresh_ports()
@@ -384,8 +391,9 @@ class App:
         self.display.pack(expand=True, fill="both", padx=10, pady=4)
 
         # -- Nom de la scène en cours, détaché des boutons de navigation --
+        # Jaune = scène sélectionnée mais pas encore lancée, vert = lancée.
         self.scene_name_label = tk.Label(
-            self.root, text="…", bg=BG_IDLE, fg="#7fb2ff", font=("Helvetica", 20, "bold"),
+            self.root, text="…", bg=BG_IDLE, fg=SCENE_NOT_LAUNCHED, font=("Helvetica", 20, "bold"),
             justify="center",
         )
         self.scene_name_label.pack(fill="x", padx=10, pady=(0, 4))
@@ -660,9 +668,15 @@ class App:
             self.live_osc.fire_scene(self._scene_index)
             # Convention "tempo seul" : une scène nommée juste avec des
             # chiffres ne contient pas de clip, donc fire() ne démarre pas le
-            # transport tout seul — on le déclenche explicitement.
+            # transport tout seul — on le déclenche explicitement. Ce n'est
+            # qu'un réglage de tempo, pas un vrai lancement : pas de vert, pas
+            # de flash, pas d'agrandissement (réservés aux scènes nommées).
             if self._scene_name.strip().isdigit():
                 self.live_osc.start_playing()
+            else:
+                self.scene_name_label.config(fg=SCENE_LAUNCHED)
+                self.shared_state.set_scene_launched(True)
+                self._scene_flash_start = time.monotonic()
         except OSError as exc:
             self.scene_name_label.config(text=f"Erreur OSC : {exc}")
 
@@ -707,7 +721,8 @@ class App:
         if next_name:
             name = f"{name} ({next_name})"
         text = f"{self._scene_index + 1}/{self._scene_count} : {name}"
-        self.scene_name_label.config(text=text)
+        # Nouvelle sélection de scène : on repart en jaune (pas encore lancée).
+        self.scene_name_label.config(text=text, fg=SCENE_NOT_LAUNCHED)
         # Page web : juste le titre, sans le numéro de scène.
         self.shared_state.set_scene_name(name)
 
@@ -812,6 +827,17 @@ class App:
         if fill_end > x0:
             canvas.create_line(x0, y, fill_end, y, fill=FG_TEXT, width=4)
 
+    def _scene_flash_bg(self, bg: str) -> str:
+        """Double flash blanc (2×150 ms, séparés d'un court silence) au-dessus
+        de la couleur de fond normale, déclenché au lancement d'une scène."""
+        if self._scene_flash_start <= 0:
+            return bg
+        elapsed = time.monotonic() - self._scene_flash_start
+        for pulse_start in (0.0, SCENE_FLASH_PULSE + SCENE_FLASH_GAP):
+            if pulse_start <= elapsed < pulse_start + SCENE_FLASH_PULSE:
+                return _lerp_color(SCENE_FLASH_WHITE, bg, (elapsed - pulse_start) / SCENE_FLASH_PULSE)
+        return bg
+
     def _update_display(
         self, beat: int, beats_per_bar: int, fractional: float, bpm: float | None, connected: bool, running: bool,
     ) -> None:
@@ -823,6 +849,7 @@ class App:
             bg = _lerp_color(FLASH_BLUE, BG_IDLE, fractional)
         else:
             bg = BG_IDLE
+        bg = self._scene_flash_bg(bg)
         # Le flash reste cantonné au canvas (digits/dots), pas à toute la fenêtre.
         self.display.configure(bg=bg)
         self.display.delete("all")

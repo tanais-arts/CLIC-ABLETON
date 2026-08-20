@@ -87,9 +87,10 @@ _PAGE = """<!DOCTYPE html>
   #sceneName {
     flex: 0 0 auto; margin-top: 0;
     display: flex; align-items: center; justify-content: center;
-    font-size: 3.5vh; color: #7fb2ff;
+    font-size: 3.5vh; color: #ff4d4d;
     min-height: 1em;
   }
+  #sceneName.launched { color: #3ddc57; font-size: 5.25vh; }
   #info {
     flex: 0 0 auto; margin-bottom: 6px;
     display: flex; align-items: center; justify-content: center;
@@ -97,8 +98,10 @@ _PAGE = """<!DOCTYPE html>
   }
   @keyframes flashYellow { from { background: #f5c518; } to { background: #1e1e1e; } }
   @keyframes flashBlue { from { background: #2b4bff; } to { background: #1e1e1e; } }
+  @keyframes flashWhite { from { background: #ffffff; } to { background: #1e1e1e; } }
   body.flash { animation: flashYellow 300ms ease-out; }
   body.flash-blue { animation: flashBlue 300ms ease-out; }
+  body.flash-white { animation: flashWhite 150ms ease-out; }
   #muteBtn {
     margin-top: 8px; padding: 6px 16px; font-size: 2.4vh;
     background: #333333; color: #f5f5f5; border: none; border-radius: 6px;
@@ -133,6 +136,18 @@ slider.addEventListener('input', () => {
 
 let lastBeat = null;
 let lastBarPhase = 0;
+let lastSceneLaunched = false;
+const SCENE_FLASH_PULSE_MS = 150;
+const SCENE_FLASH_GAP_MS = 100;
+
+function sceneFlashDouble() {
+  retrigger(document.body, 'flash-white');
+  setTimeout(() => document.body.classList.remove('flash-white'), SCENE_FLASH_PULSE_MS);
+  setTimeout(() => {
+    retrigger(document.body, 'flash-white');
+    setTimeout(() => document.body.classList.remove('flash-white'), SCENE_FLASH_PULSE_MS);
+  }, SCENE_FLASH_PULSE_MS + SCENE_FLASH_GAP_MS);
+}
 const beatEl = document.getElementById('beat');
 const dotEl = document.getElementById('dot');
 const digitEl = document.getElementById('digit');
@@ -258,6 +273,11 @@ async function poll() {
       }
     }
     document.getElementById('sceneName').textContent = data.scene_name || '';
+    document.getElementById('sceneName').classList.toggle('launched', !!data.scene_launched);
+    if (data.scene_launched && !lastSceneLaunched) {
+      sceneFlashDouble();
+    }
+    lastSceneLaunched = !!data.scene_launched;
     let suffix = '';
     if (data.mode === 'link') {
       // Le "Lecture/Arrêt" Link nécessite un réglage optionnel côté Live :
@@ -313,6 +333,7 @@ class SharedBeatState:
             "ref_monotonic": time.monotonic(),
         }
         self._scene_name = ""
+        self._scene_launched = False
 
     def update(
         self, phase: float, beats_per_bar: float, bpm: float | None,
@@ -334,15 +355,22 @@ class SharedBeatState:
 
     def set_scene_name(self, scene_name: str) -> None:
         """Nom de scène Live affiché sur la page web (mis à jour indépendamment
-        de `update()`, qui tourne toutes les ~30ms et ne connaît pas la scène)."""
+        de `update()`, qui tourne toutes les ~30ms et ne connaît pas la scène).
+        Une nouvelle sélection de scène repart toujours à l'état « non lancée »."""
         with self._lock:
             self._scene_name = scene_name
+            self._scene_launched = False
+
+    def set_scene_launched(self, launched: bool) -> None:
+        with self._lock:
+            self._scene_launched = launched
 
     def compute(self, latency_ms: float = 0.0) -> dict:
         """Calcule {beat, bpm, connected, running, mode} pour un décalage donné."""
         with self._lock:
             data = dict(self._data)
             scene_name = self._scene_name
+            scene_launched = self._scene_launched
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
         elapsed_ms = (time.monotonic() - data["ref_monotonic"]) * 1000.0
@@ -358,6 +386,7 @@ class SharedBeatState:
             "bar_phase": bar_phase,
             "connected": data["connected"], "running": data["running"], "mode": data["mode"],
             "scene_name": scene_name,
+            "scene_launched": scene_launched,
         }
 
 
