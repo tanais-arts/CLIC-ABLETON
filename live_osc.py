@@ -132,6 +132,14 @@ class LiveOSC:
     def fire_scene(self, index: int) -> None:
         self.send("/live/scene/fire", index)
 
+    def set_track_volume(self, track_index: int, value: float) -> None:
+        """Position du volume d'une piste (0.0 à 1.0, cf. Track.volume du LOM)."""
+        self.send("/live/track/set/volume", track_index, value)
+
+    def set_track_mute(self, track_index: int, muted: bool) -> None:
+        """Coupe (True) ou réactive (False) le son d'une piste (Track.mute du LOM)."""
+        self.send("/live/track/set/mute", track_index, 1.0 if muted else 0.0)
+
     def start_playing(self) -> None:
         """Démarre la lecture (Song.start_playing) — utilisé après le
         lancement d'une scène "tempo seul" (nom purement numérique), qui ne

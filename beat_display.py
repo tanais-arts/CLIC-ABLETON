@@ -20,6 +20,7 @@ from tkinter import ttk
 import rtmidi
 
 from config import load_config, save_config
+from hui_bridge import HuiBridge
 from link_client import AbletonLink, LinkUnavailable
 from live_osc import LiveOSC
 from web_server import BeatWebServer, SharedBeatState, project_phase
@@ -290,6 +291,9 @@ class App:
         }
         self._learning: str | None = None
 
+        # -- Pont HUI -> OSC (ex. Yamaha 01V96V2) pour faders/mutes des pistes --
+        self.hui_bridge = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"))
+
         # À la reprise (connecté/en lecture après ne pas l'avoir été), on
         # n'affiche les temps qu'à partir du prochain temps 1 réel, pour ne
         # pas commencer au milieu d'une mesure.
@@ -306,6 +310,7 @@ class App:
         if self.config.get("midi_port"):
             self.port_var.set(self.config["midi_port"])
         self._refresh_controller_ports()
+        self._refresh_controller_ports_2()
         configured_controller_port = self.config.get("controller_port")
         connected_at_startup = False
         if configured_controller_port:
@@ -313,6 +318,11 @@ class App:
             if configured_controller_port in self.controller_port_combo["values"]:
                 self._toggle_controller_connect()
                 connected_at_startup = True
+        configured_hui_port = self.config.get("hui_port")
+        if configured_hui_port:
+            self.controller_port_var_2.set(configured_hui_port)
+            if configured_hui_port in self.controller_port_combo_2["values"]:
+                self._toggle_hui_connect()
         if connected_at_startup:
             self._refresh_controller_map_table()
         else:
@@ -444,7 +454,7 @@ class App:
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour piloter les mêmes boutons --
         controller_row = tk.Frame(self.root, bg=BG_IDLE)
         controller_row.pack(fill="x", padx=10, pady=(0, 4))
-        tk.Label(controller_row, text="Contrôleur MIDI :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        tk.Label(controller_row, text="MIDI IN OSC Boutons :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
         self.controller_port_var = tk.StringVar()
         self.controller_port_combo = ttk.Combobox(
             controller_row, textvariable=self.controller_port_var, state="readonly", width=22,
@@ -455,6 +465,23 @@ class App:
             controller_row, text="Connecter", command=self._toggle_controller_connect,
         )
         self.controller_connect_btn.pack(side="left", padx=2)
+
+        # -- Placeholder pour une future implémentation (faders & mutes Ableton) --
+        controller_row_2 = tk.Frame(self.root, bg=BG_IDLE)
+        controller_row_2.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(controller_row_2, text="MIDI IN Faders and Mutes :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.controller_port_var_2 = tk.StringVar()
+        self.controller_port_combo_2 = ttk.Combobox(
+            controller_row_2, textvariable=self.controller_port_var_2, state="readonly", width=22,
+        )
+        self.controller_port_combo_2.pack(side="left", padx=6)
+        tk.Button(controller_row_2, text="Rafraîchir", command=self._refresh_controller_ports_2).pack(
+            side="left", padx=2
+        )
+        self.hui_connect_btn = tk.Button(
+            controller_row_2, text="Connecter", command=self._toggle_hui_connect,
+        )
+        self.hui_connect_btn.pack(side="left", padx=2)
 
         status_row = tk.Frame(self.root, bg=BG_IDLE)
         status_row.pack(fill="x", padx=10, pady=(0, 4))
@@ -482,10 +509,21 @@ class App:
         web_row = tk.Frame(self.root, bg=BG_IDLE)
         web_row.pack(fill="x", padx=10, pady=(0, 10))
         tk.Label(web_row, text="Affichage smartphone :", bg=BG_IDLE, fg="#bbbbbb").pack(side="left")
-        tk.Label(
-            web_row, text=self.web_server.url(), bg=BG_IDLE, fg="#7fb2ff",
-            font=("Helvetica", 12, "bold"),
-        ).pack(side="left", padx=6)
+        url_var = tk.StringVar(value=self.web_server.url())
+        # Entry en lecture seule plutôt qu'un Label : le texte reste
+        # sélectionnable/copiable (Ctrl/Cmd+C) même si non modifiable.
+        url_entry = tk.Entry(
+            web_row, textvariable=url_var, fg="#7fb2ff", bg=BG_IDLE, disabledforeground="#7fb2ff",
+            font=("Helvetica", 12, "bold"), bd=0, relief="flat", width=len(url_var.get()) + 1,
+            state="readonly", readonlybackground=BG_IDLE,
+        )
+        url_entry.pack(side="left", padx=6)
+
+        def _copy_url() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url_var.get())
+
+        tk.Button(web_row, text="Copier", command=_copy_url).pack(side="left", padx=(4, 0))
 
     def _apply_mode(self) -> None:
         mode = self.mode_var.get()
@@ -531,6 +569,29 @@ class App:
         self.controller_port_combo["values"] = ports
         if ports and not self.controller_port_var.get():
             self.controller_port_var.set(ports[0])
+
+    def _refresh_controller_ports_2(self) -> None:
+        ports = self.controller.list_ports()
+        self.controller_port_combo_2["values"] = ports
+        if ports and not self.controller_port_var_2.get():
+            self.controller_port_var_2.set(ports[0])
+
+    def _toggle_hui_connect(self) -> None:
+        if self.hui_bridge.port_name:
+            self.hui_bridge.close()
+            self.hui_connect_btn.config(text="Connecter")
+            return
+        port_name = self.controller_port_var_2.get()
+        if not port_name:
+            return
+        try:
+            self.hui_bridge.connect(port_name)
+        except Exception as exc:  # noqa: BLE001 - affichage utilisateur simple
+            print(f"[HUI] erreur de connexion : {exc}")
+            return
+        self.hui_connect_btn.config(text="Déconnecter")
+        self.config["hui_port"] = port_name
+        save_config(self.config)
 
     def _toggle_controller_connect(self) -> None:
         if self.controller.port_name:
@@ -912,6 +973,7 @@ class App:
             self.link.close()
         self.live_osc.close()
         self.controller.close()
+        self.hui_bridge.close()
         self.web_server.stop()
         self.root.destroy()
 
