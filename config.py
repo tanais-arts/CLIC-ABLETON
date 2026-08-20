@@ -17,7 +17,15 @@ DEFAULTS = {
     "beats_per_bar": 4,
     "latency_ms": 0,
     "web_port": 8765,
-    "dots_only": False,  # affiche un gros point au lieu du numéro de temps
+    # YAMAHA 01V96 (Note On canal 1) : G-2 pour -1, Sol#-2 pour +1.
+    "controller_map_minus": ["note", 0, 7],
+    "controller_map_plus": ["note", 0, 8],
+    # F#-2 pour la scène suivante (DOWN), F-2 pour la scène précédente (UP).
+    "controller_map_scene_prev": ["note", 0, 5],
+    "controller_map_scene_next": ["note", 0, 6],
+    # C#-2 pour Stop, D-2 pour Lancer la scène (Play).
+    "controller_map_stop": ["note", 0, 1],
+    "controller_map_play": ["note", 0, 2],
 }
 
 

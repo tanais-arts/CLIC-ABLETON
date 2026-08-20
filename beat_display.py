@@ -21,6 +21,7 @@ import rtmidi
 
 from config import load_config, save_config
 from link_client import AbletonLink, LinkUnavailable
+from live_osc import LiveOSC
 from web_server import BeatWebServer, SharedBeatState, project_phase
 
 CLOCK = 0xF8
@@ -86,6 +87,78 @@ class ClockListener:
     def _callback(self, event, _data=None) -> None:
         message, delta_time = event
         self._queue.put((message, delta_time, time.perf_counter()))
+
+
+def _controller_key(message: list[int]) -> tuple[str, int, int] | None:
+    """Identifiant (type, canal, numéro) d'un message Note On / Control Change,
+    utilisé pour l'apprentissage MIDI d'un bouton de contrôleur."""
+    if len(message) < 2:
+        return None
+    status = message[0]
+    kind = status & 0xF0
+    channel = status & 0x0F
+    if kind == 0x90:
+        return ("note", channel, message[1])
+    if kind == 0xB0:
+        return ("cc", channel, message[1])
+    return None
+
+
+def _controller_label(key: tuple[str, int, int] | None) -> str:
+    if key is None:
+        return "non assigné"
+    kind, channel, number = key
+    kind_label = "Note" if kind == "note" else "CC"
+    return f"{kind_label} {number} (canal {channel + 1})"
+
+
+def _as_key(value) -> tuple[str, int, int] | None:
+    """Reconstruit un tuple (type, canal, numéro) depuis la config JSON (liste)."""
+    if not value:
+        return None
+    kind, channel, number = value
+    return (kind, int(channel), int(number))
+
+
+class ControllerListener:
+    """Lit les messages Note On / Control Change d'un contrôleur MIDI (ex.
+    Behringer BCF2000), pour déclencher des actions (boutons -1/+1)."""
+
+    def __init__(self, event_queue: "queue.Queue[list[int]]"):
+        self._queue = event_queue
+        self._midi_in: rtmidi.MidiIn | None = None
+        self._port_name: str | None = None
+
+    def list_ports(self) -> list[str]:
+        probe = rtmidi.MidiIn()
+        names = probe.get_ports()
+        del probe
+        return names
+
+    def connect(self, port_name: str) -> None:
+        self.close()
+        midi_in = rtmidi.MidiIn()
+        names = midi_in.get_ports()
+        index = names.index(port_name)
+        midi_in.open_port(index)
+        midi_in.ignore_types(sysex=True, timing=True, active_sense=True)
+        midi_in.set_callback(self._callback)
+        self._midi_in = midi_in
+        self._port_name = port_name
+
+    def close(self) -> None:
+        if self._midi_in is not None:
+            self._midi_in.close_port()
+            self._midi_in = None
+            self._port_name = None
+
+    @property
+    def port_name(self) -> str | None:
+        return self._port_name
+
+    def _callback(self, event, _data=None) -> None:
+        message, _delta_time = event
+        self._queue.put(message)
 
 
 class BeatState:
@@ -182,6 +255,36 @@ class App:
         self.web_server = BeatWebServer(self.shared_state, port=self.config["web_port"])
         self.web_server.start()
 
+        # -- Décalage à la volée du playhead de Live (rattrapage faux départ) --
+        self.live_osc = LiveOSC()
+
+        # -- Navigation dans la colonne des scènes de Live (nom + précédente/suivante) --
+        self._scene_index: int | None = None
+        self._scene_count: int | None = None
+        self._scene_name: str = ""
+
+        # -- Contrôleur MIDI (ex. Behringer BCF2000) pour les 6 boutons (nudge,
+        # navigation scènes, stop, lancer la scène) --
+        self._controller_queue: "queue.Queue[list[int]]" = queue.Queue()
+        self.controller = ControllerListener(self._controller_queue)
+        self._action_order = ["minus", "plus", "scene_prev", "scene_next", "stop", "play"]
+        self._action_labels = {
+            "minus": "−1", "plus": "+1", "scene_prev": "▲", "scene_next": "▼", "stop": "■", "play": "▶",
+        }
+        self._action_commands = {
+            "minus": lambda: self._jump_beats(-1),
+            "plus": lambda: self._jump_beats(1),
+            "scene_prev": lambda: self._scene_step(-1),
+            "scene_next": lambda: self._scene_step(1),
+            "stop": self._stop_return_to_start,
+            "play": self._scene_launch,
+        }
+        self.controller_map: dict[str, tuple[str, int, int] | None] = {
+            action: _as_key(self.config.get(f"controller_map_{action}"))
+            for action in self._action_order
+        }
+        self._learning: str | None = None
+
         # À la reprise (connecté/en lecture après ne pas l'avoir été), on
         # n'affiche les temps qu'à partir du prochain temps 1 réel, pour ne
         # pas commencer au milieu d'une mesure.
@@ -195,6 +298,19 @@ class App:
         self._refresh_ports()
         if self.config.get("midi_port"):
             self.port_var.set(self.config["midi_port"])
+        self._refresh_controller_ports()
+        configured_controller_port = self.config.get("controller_port")
+        connected_at_startup = False
+        if configured_controller_port:
+            self.controller_port_var.set(configured_controller_port)
+            if configured_controller_port in self.controller_port_combo["values"]:
+                self._toggle_controller_connect()
+                connected_at_startup = True
+        if connected_at_startup:
+            self._refresh_controller_map_table()
+        else:
+            self._update_controller_status_label()
+        self._refresh_scene_state()
         self._apply_mode()
         self._poll()
 
@@ -267,12 +383,93 @@ class App:
         self.display = tk.Canvas(self.root, bg=BG_IDLE, highlightthickness=0)
         self.display.pack(expand=True, fill="both", padx=10, pady=4)
 
+        # -- Nom de la scène en cours, détaché des boutons de navigation --
+        self.scene_name_label = tk.Label(
+            self.root, text="…", bg=BG_IDLE, fg="#7fb2ff", font=("Helvetica", 20, "bold"),
+            justify="center",
+        )
+        self.scene_name_label.pack(fill="x", padx=10, pady=(0, 4))
+
         bottom = tk.Frame(self.root, bg=BG_IDLE)
         bottom.pack(fill="x", padx=10, pady=4)
         self.status_label = tk.Label(bottom, text="Déconnecté", bg=BG_IDLE, fg="#bbbbbb")
         self.status_label.pack(side="left")
         self.bpm_label = tk.Label(bottom, text="", bg=BG_IDLE, fg="#bbbbbb")
         self.bpm_label.pack(side="right")
+
+        # -- Nudge (-1/+1), navigation scènes (▲▼), Lecture (▶) et Stop (■) :
+        # boutons carrés de même taille (modèle : le bouton +1), alignés sur
+        # une seule ligne sous Lecture/Tempo. À gauche de chaque bouton : "A"
+        # (apprendre le code MIDI) au-dessus de "E" (effacer l'apprentissage),
+        # eux aussi carrés (taille fixe en pixels). --
+        controls_row = tk.Frame(self.root, bg=BG_IDLE)
+        controls_row.pack(fill="x", padx=10, pady=(0, 8))
+        square_btn = dict(width=4, height=2, font=("Helvetica", 14, "bold"))
+        MINI_SIZE = 22  # pixels : taille fixe pour que A/E soient réellement carrés
+        self.learn_buttons: dict[str, tk.Button] = {}
+        self.clear_buttons: dict[str, tk.Button] = {}
+
+        def add_mini_button(parent: tk.Frame, text: str, command) -> tk.Button:
+            holder = tk.Frame(parent, width=MINI_SIZE, height=MINI_SIZE, bg=BG_IDLE)
+            holder.pack_propagate(False)
+            holder.pack(side="top", pady=(0, 2) if text == "A" else (2, 0))
+            btn = tk.Button(holder, text=text, command=command, font=("Helvetica", 9), padx=0, pady=0)
+            btn.pack(fill="both", expand=True)
+            return btn
+
+        def add_control(action: str, text: str) -> None:
+            group = tk.Frame(controls_row, bg=BG_IDLE)
+            group.pack(side="left", padx=4)
+            mini = tk.Frame(group, bg=BG_IDLE)
+            mini.pack(side="left", padx=(0, 2))
+            self.learn_buttons[action] = add_mini_button(mini, "A", lambda: self._start_learn(action))
+            self.clear_buttons[action] = add_mini_button(mini, "E", lambda: self._clear_assignment(action))
+            tk.Button(group, text=text, command=self._action_commands[action], **square_btn).pack(side="left")
+
+        add_control("minus", "−1")
+        add_control("plus", "+1")
+        add_control("scene_prev", "▲")
+        add_control("scene_next", "▼")
+        add_control("play", "▶")
+        add_control("stop", "■")
+
+        # -- Contrôleur MIDI (ex. Behringer BCF2000) pour piloter les mêmes boutons --
+        controller_row = tk.Frame(self.root, bg=BG_IDLE)
+        controller_row.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(controller_row, text="Contrôleur MIDI :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.controller_port_var = tk.StringVar()
+        self.controller_port_combo = ttk.Combobox(
+            controller_row, textvariable=self.controller_port_var, state="readonly", width=22,
+        )
+        self.controller_port_combo.pack(side="left", padx=6)
+        tk.Button(controller_row, text="Rafraîchir", command=self._refresh_controller_ports).pack(side="left", padx=2)
+        self.controller_connect_btn = tk.Button(
+            controller_row, text="Connecter", command=self._toggle_controller_connect,
+        )
+        self.controller_connect_btn.pack(side="left", padx=2)
+
+        status_row = tk.Frame(self.root, bg=BG_IDLE)
+        status_row.pack(fill="x", padx=10, pady=(0, 4))
+        self.controller_status_label = tk.Label(status_row, text="", bg=BG_IDLE, fg="#bbbbbb")
+        self.controller_status_label.pack(side="left")
+
+        table_row = tk.Frame(self.root, bg=BG_IDLE)
+        table_row.pack(fill="x", padx=10, pady=(0, 8))
+        header_font = ("Helvetica", 9, "bold")
+        tk.Label(table_row, text="Bouton", bg=BG_IDLE, fg="#888888", font=header_font).grid(
+            row=0, column=0, sticky="w", padx=(0, 16),
+        )
+        tk.Label(table_row, text="Commande MIDI", bg=BG_IDLE, fg="#888888", font=header_font).grid(
+            row=0, column=1, sticky="w",
+        )
+        self.controller_map_labels: dict[str, tk.Label] = {}
+        for row, action in enumerate(self._action_order, start=1):
+            tk.Label(table_row, text=self._action_labels[action], bg=BG_IDLE, fg=FG_TEXT).grid(
+                row=row, column=0, sticky="w", padx=(0, 16),
+            )
+            value_label = tk.Label(table_row, text="", bg=BG_IDLE, fg="#bbbbbb")
+            value_label.grid(row=row, column=1, sticky="w")
+            self.controller_map_labels[action] = value_label
 
         web_row = tk.Frame(self.root, bg=BG_IDLE)
         web_row.pack(fill="x", padx=10, pady=(0, 10))
@@ -320,6 +517,79 @@ class App:
         self.config["midi_port"] = port_name
         save_config(self.config)
 
+    # ------------------------------------------------ Contrôleur MIDI (BCF2000) --
+    def _refresh_controller_ports(self) -> None:
+        ports = self.controller.list_ports()
+        self.controller_port_combo["values"] = ports
+        if ports and not self.controller_port_var.get():
+            self.controller_port_var.set(ports[0])
+
+    def _toggle_controller_connect(self) -> None:
+        if self.controller.port_name:
+            self.controller.close()
+            self.controller_connect_btn.config(text="Connecter")
+            return
+        port_name = self.controller_port_var.get()
+        if not port_name:
+            return
+        try:
+            self.controller.connect(port_name)
+        except Exception as exc:  # noqa: BLE001 - affichage utilisateur simple
+            self.controller_status_label.config(text=f"Erreur de connexion : {exc}")
+            return
+        self.controller_connect_btn.config(text="Déconnecter")
+        self.config["controller_port"] = port_name
+        save_config(self.config)
+        self._update_controller_status_label()
+
+    def _start_learn(self, action: str) -> None:
+        self._learning = action
+        self._update_controller_status_label()
+
+    def _clear_assignment(self, action: str) -> None:
+        self.controller_map[action] = None
+        self.config[f"controller_map_{action}"] = None
+        save_config(self.config)
+        self._update_controller_status_label()
+
+    def _update_controller_status_label(self) -> None:
+        if self._learning is not None:
+            self.controller_status_label.config(
+                text=f"Appuyez sur le bouton du contrôleur pour {self._action_labels[self._learning]}…"
+            )
+        else:
+            self.controller_status_label.config(text="")
+        self._refresh_controller_map_table()
+
+    def _refresh_controller_map_table(self) -> None:
+        for action in self._action_order:
+            self.controller_map_labels[action].config(text=_controller_label(self.controller_map[action]))
+        for action, btn in self.clear_buttons.items():
+            btn.config(state="normal" if self.controller_map[action] else "disabled")
+
+    def _poll_controller(self) -> None:
+        try:
+            while True:
+                message = self._controller_queue.get_nowait()
+                key = _controller_key(message)
+                # Ne déclenche que sur l'appui (vélocité/valeur > 0), pas le relâchement.
+                if key is None or len(message) < 3 or message[2] <= 0:
+                    continue
+                if self._learning is not None:
+                    action = self._learning
+                    self.controller_map[action] = key
+                    self.config[f"controller_map_{action}"] = list(key)
+                    save_config(self.config)
+                    self._learning = None
+                    self._update_controller_status_label()
+                    continue
+                for action, mapped_key in self.controller_map.items():
+                    if key == mapped_key:
+                        self._action_commands[action]()
+                        break
+        except queue.Empty:
+            pass
+
     def _on_settings_change(self) -> None:
         try:
             beats = max(1, int(self.beats_var.get()))
@@ -349,8 +619,102 @@ class App:
         self.link = link
         return self.link
 
+    def _jump_beats(self, beats: int) -> None:
+        """Décale de `beats` temps le clip en cours de lecture de chaque
+        piste, sans déplacer le compteur général de Live (voir README.md) —
+        indépendant du mode Link/MIDI choisi pour l'affichage."""
+        try:
+            self.live_osc.jump_tracks_by(beats)
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC (AbletonOSC lancé côté Live ?) : {exc}")
+
+    # --------------------------------------------------- Scènes (Live) --
+    def _refresh_scene_state(self) -> None:
+        try:
+            self.live_osc.get_num_scenes()
+            self.live_osc.get_selected_scene()
+        except OSError as exc:
+            self.scene_name_label.config(text=f"Erreur OSC : {exc}")
+
+    def _scene_step(self, delta: int) -> None:
+        if self._scene_index is None or self._scene_count is None:
+            self._refresh_scene_state()
+            return
+        new_index = max(0, min(self._scene_count - 1, self._scene_index + delta))
+        if new_index == self._scene_index:
+            return
+        self._scene_index = new_index
+        try:
+            self.live_osc.set_selected_scene(new_index)
+            self.live_osc.get_scene_name(new_index)
+        except OSError as exc:
+            self.scene_name_label.config(text=f"Erreur OSC : {exc}")
+
+    def _scene_launch(self) -> None:
+        # fire_selected (Scene.fire_as_selected) avance aussi la sélection vers
+        # la scène suivante côté Live : on utilise fire(index) pour ne lancer
+        # que la scène affichée, sans bouger la sélection.
+        if self._scene_index is None:
+            return
+        try:
+            self.live_osc.fire_scene(self._scene_index)
+            # Convention "tempo seul" : une scène nommée juste avec des
+            # chiffres ne contient pas de clip, donc fire() ne démarre pas le
+            # transport tout seul — on le déclenche explicitement.
+            if self._scene_name.strip().isdigit():
+                self.live_osc.start_playing()
+        except OSError as exc:
+            self.scene_name_label.config(text=f"Erreur OSC : {exc}")
+
+    def _stop_return_to_start(self) -> None:
+        """Simule un double appui sur Stop dans Live : arrête la lecture (et les
+        clips en cours, comportement natif normal), puis (comme au 2e Stop) ramène
+        le curseur à 1:1:1, en attente d'un start de scène."""
+        try:
+            self.live_osc.stop_playing()
+            self.root.after(120, self.live_osc.stop_playing)
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC : {exc}")
+
+    def _poll_scene_replies(self) -> None:
+        for address, args in self.live_osc.poll_replies():
+            if address == "/live/song/get/num_scenes":
+                self._scene_count = int(args[0])
+            elif address == "/live/view/get/selected_scene":
+                self._scene_index = int(args[0])
+                self.live_osc.get_scene_name(self._scene_index)
+            elif address == "/live/scene/get/name":
+                index, name = int(args[0]), (args[1] or "")
+                if index == self._scene_index:
+                    self._scene_name = name
+                    # Convention du set : une scène nommée juste "84" ne fait
+                    # que régler le tempo, la scène suivante contient le
+                    # morceau prêt à être lancé — on affiche donc son nom
+                    # entre parenthèses (ex. "84 (Briser)").
+                    if name.strip().isdigit() and self._scene_count and index + 1 < self._scene_count:
+                        self.live_osc.get_scene_name(index + 1)
+                    else:
+                        self._update_scene_label()
+                elif (
+                    self._scene_index is not None
+                    and index == self._scene_index + 1
+                    and self._scene_name.strip().isdigit()
+                ):
+                    self._update_scene_label(next_name=name)
+
+    def _update_scene_label(self, next_name: str | None = None) -> None:
+        name = self._scene_name or "(sans nom)"
+        if next_name:
+            name = f"{name} ({next_name})"
+        text = f"{self._scene_index + 1}/{self._scene_count} : {name}"
+        self.scene_name_label.config(text=text)
+        # Page web : juste le titre, sans le numéro de scène.
+        self.shared_state.set_scene_name(name)
+
     # -------------------------------------------------------- Boucle poll --
     def _poll(self) -> None:
+        self._poll_controller()
+        self._poll_scene_replies()
         if self.mode_var.get() == "midi":
             try:
                 while True:
@@ -459,7 +823,7 @@ class App:
             bg = _lerp_color(FLASH_BLUE, BG_IDLE, fractional)
         else:
             bg = BG_IDLE
-        self.root.configure(bg=bg)
+        # Le flash reste cantonné au canvas (digits/dots), pas à toute la fenêtre.
         self.display.configure(bg=bg)
         self.display.delete("all")
         if bpm:
@@ -492,6 +856,8 @@ class App:
         self.listener.close()
         if self.link is not None:
             self.link.close()
+        self.live_osc.close()
+        self.controller.close()
         self.web_server.stop()
         self.root.destroy()
 

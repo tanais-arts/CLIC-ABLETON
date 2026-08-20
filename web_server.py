@@ -72,17 +72,6 @@ _PAGE = """<!DOCTYPE html>
     font-size: 40vh; font-weight: bold; color: #f5f5f5;
     -webkit-user-select: none; user-select: none;
   }
-  #circles {
-    display: none;
-    flex-direction: row; align-items: center; justify-content: center;
-    gap: 11.2vh;
-  }
-  .circle {
-    width: 32vh; height: 32vh; border-radius: 50%;
-    border: 0.6vh solid #f5f5f5; box-sizing: border-box;
-    background: transparent;
-  }
-  .circle.filled { background: #f5f5f5; }
   #scrollLine {
     display: none;
     position: absolute; left: 15%; right: 15%; top: 50%;
@@ -94,6 +83,12 @@ _PAGE = """<!DOCTYPE html>
     position: absolute; top: 0; bottom: 0; left: 0;
     width: 0%; background: #f5f5f5;
     transition: width 0.06s linear;
+  }
+  #sceneName {
+    flex: 0 0 auto; margin-top: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 3.5vh; color: #7fb2ff;
+    min-height: 1em;
   }
   #info {
     flex: 0 0 auto; margin-bottom: 6px;
@@ -110,35 +105,29 @@ _PAGE = """<!DOCTYPE html>
     -webkit-user-select: none; user-select: none;
   }
   #muteBtn.unmuted { background: #2b7a2b; }
-  #dotsBtn.active { background: #2b7a2b; }
 </style>
 </head>
 <body>
   <div id="latency">
     <div class="row">
       <span>Délai</span>
-      <input type="range" id="latencySlider" min="-60" max="60" step="1" value="0">
-      <span id="latencyValue">0 ms</span>
+      <input type="range" id="latencySlider" min="-120" max="120" step="1" value="0">
     </div>
-    <div class="ticks"><span>-60</span><span>0 (référence)</span><span>+60</span></div>
+    <div class="ticks"><span>Retard</span><span>Référence</span><span>Avance</span></div>
     <button id="muteBtn">🔇 Son coupé</button>
-    <button id="dotsBtn">🔢 Chiffres</button>
   </div>
   <div id="beat">
     <div id="dot">•</div>
     <div id="digit"></div>
-    <div id="circles"><div id="circleLeft" class="circle"></div><div id="circleRight" class="circle"></div></div>
     <div id="scrollLine"><div id="scrollThumb"></div></div>
   </div>
+  <div id="sceneName"></div>
   <div id="info">-- BPM</div>
 <script>
 const KEY = 'beatDisplayLatencyMs';
 const slider = document.getElementById('latencySlider');
-const latencyValueEl = document.getElementById('latencyValue');
 slider.value = localStorage.getItem(KEY) || 0;
-latencyValueEl.textContent = slider.value + ' ms';
 slider.addEventListener('input', () => {
-  latencyValueEl.textContent = slider.value + ' ms';
   localStorage.setItem(KEY, slider.value);
 });
 
@@ -147,9 +136,6 @@ let lastBarPhase = 0;
 const beatEl = document.getElementById('beat');
 const dotEl = document.getElementById('dot');
 const digitEl = document.getElementById('digit');
-const circlesEl = document.getElementById('circles');
-const circleLeftEl = document.getElementById('circleLeft');
-const circleRightEl = document.getElementById('circleRight');
 const scrollLineEl = document.getElementById('scrollLine');
 const scrollThumbEl = document.getElementById('scrollThumb');
 
@@ -188,21 +174,6 @@ updateMuteBtn();
 if (!muted) {
   initAudio().catch(() => {});
 }
-
-const DOTS_KEY = 'beatDisplayDotsOnly';
-const dotsBtn = document.getElementById('dotsBtn');
-let dotsOnly = localStorage.getItem(DOTS_KEY) === '1';
-
-function updateDotsBtn() {
-  dotsBtn.textContent = dotsOnly ? '● Points' : '🔢 Chiffres';
-  dotsBtn.classList.toggle('active', dotsOnly);
-}
-updateDotsBtn();
-dotsBtn.addEventListener('click', () => {
-  dotsOnly = !dotsOnly;
-  localStorage.setItem(DOTS_KEY, dotsOnly ? '1' : '0');
-  updateDotsBtn();
-});
 
 // iOS/Safari ne débloque le son que sur un vrai geste utilisateur : le
 // premier tap n'importe où sur la page relance le contexte s'il est encore
@@ -245,22 +216,10 @@ async function poll() {
     const data = await res.json();
     const infoEl = document.getElementById('info');
     if (data.connected) {
+      dotEl.style.display = 'none';
       scrollLineEl.style.display = 'none';
-      if (dotsOnly) {
-        digitEl.style.display = 'none';
-        dotEl.style.display = 'none';
-        circlesEl.style.display = 'flex';
-        // Gauche remplie aux temps impairs (1, 3...), droite aux temps
-        // pairs (2, 4...) : l'alternance rend le pulse visible.
-        const leftFilled = data.beat % 2 === 1;
-        circleLeftEl.classList.toggle('filled', leftFilled);
-        circleRightEl.classList.toggle('filled', !leftFilled);
-      } else {
-        circlesEl.style.display = 'none';
-        dotEl.style.display = 'none';
-        digitEl.style.display = 'block';
-        digitEl.textContent = data.beat;
-      }
+      digitEl.style.display = 'block';
+      digitEl.textContent = data.beat;
       if (data.beat !== lastBeat) {
         lastBeat = data.beat;
         playClick(data.beat);
@@ -274,7 +233,6 @@ async function poll() {
       }
     } else {
       digitEl.style.display = 'none';
-      circlesEl.style.display = 'none';
       lastBeat = null;
       if (data.bpm && !data.running) {
         // À l'arrêt (mais tempo connu) : la ligne se remplit de gauche à
@@ -299,6 +257,7 @@ async function poll() {
         dotEl.style.display = data.bpm ? 'none' : 'block';
       }
     }
+    document.getElementById('sceneName').textContent = data.scene_name || '';
     let suffix = '';
     if (data.mode === 'link') {
       // Le "Lecture/Arrêt" Link nécessite un réglage optionnel côté Live :
@@ -353,6 +312,7 @@ class SharedBeatState:
             "mode": "link",
             "ref_monotonic": time.monotonic(),
         }
+        self._scene_name = ""
 
     def update(
         self, phase: float, beats_per_bar: float, bpm: float | None,
@@ -372,10 +332,17 @@ class SharedBeatState:
                 "ref_monotonic": time.monotonic(),
             }
 
+    def set_scene_name(self, scene_name: str) -> None:
+        """Nom de scène Live affiché sur la page web (mis à jour indépendamment
+        de `update()`, qui tourne toutes les ~30ms et ne connaît pas la scène)."""
+        with self._lock:
+            self._scene_name = scene_name
+
     def compute(self, latency_ms: float = 0.0) -> dict:
         """Calcule {beat, bpm, connected, running, mode} pour un décalage donné."""
         with self._lock:
             data = dict(self._data)
+            scene_name = self._scene_name
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
         elapsed_ms = (time.monotonic() - data["ref_monotonic"]) * 1000.0
@@ -390,6 +357,7 @@ class SharedBeatState:
             "beat": beat, "beats_per_bar": data["beats_per_bar"], "bpm": data["bpm"],
             "bar_phase": bar_phase,
             "connected": data["connected"], "running": data["running"], "mode": data["mode"],
+            "scene_name": scene_name,
         }
 
 
