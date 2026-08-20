@@ -34,7 +34,7 @@ TICKS_PER_QUARTER = 24
 BG_IDLE = "#1e1e1e"
 FLASH_YELLOW = "#f5c518"
 FLASH_BLUE = "#2b4bff"  # bleu outremer
-SCENE_NOT_LAUNCHED = "#f5c518"  # jaune : scène sélectionnée, pas encore lancée
+SCENE_NOT_LAUNCHED = "#ff4d4d"  # rouge : scène sélectionnée, pas encore lancée (identique au web)
 SCENE_LAUNCHED = "#3ddc57"  # vert : scène lancée
 SCENE_FLASH_WHITE = "#ffffff"
 SCENE_FLASH_PULSE = 0.15  # secondes par flash
@@ -652,6 +652,11 @@ class App:
         if new_index == self._scene_index:
             return
         self._scene_index = new_index
+        # Réinitialise tout de suite le vert/rouge du lancement précédent : le
+        # nom/statut exacts de la nouvelle scène n'arriveront qu'après l'aller-
+        # retour OSC, sinon on voit brièvement l'ancienne scène encore verte.
+        self.scene_name_label.config(fg=SCENE_NOT_LAUNCHED)
+        self.shared_state.set_scene_launched(False)
         try:
             self.live_osc.set_selected_scene(new_index)
             self.live_osc.get_scene_name(new_index)
@@ -721,10 +726,16 @@ class App:
         if next_name:
             name = f"{name} ({next_name})"
         text = f"{self._scene_index + 1}/{self._scene_count} : {name}"
-        # Nouvelle sélection de scène : on repart en jaune (pas encore lancée).
+        # Nouvelle sélection de scène : rouge (pas encore lancée), même règle
+        # de couleur que sur le web (les scènes numériques restent rouge, cf.
+        # _scene_launch qui ne passe jamais au vert pour elles).
         self.scene_name_label.config(text=text, fg=SCENE_NOT_LAUNCHED)
-        # Page web : juste le titre, sans le numéro de scène.
-        self.shared_state.set_scene_name(name)
+        # Page web : juste le titre, sans le numéro de scène. Le tempo seul
+        # (chiffres) n'a pas de sens pour le public, on affiche "À SUIVRE".
+        web_name = name
+        if self._scene_name.strip().isdigit():
+            web_name = name.replace(self._scene_name, "À SUIVRE", 1)
+        self.shared_state.set_scene_name(web_name)
 
     # -------------------------------------------------------- Boucle poll --
     def _poll(self) -> None:
