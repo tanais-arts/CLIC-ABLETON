@@ -656,6 +656,7 @@ class App:
         # nom/statut exacts de la nouvelle scène n'arriveront qu'après l'aller-
         # retour OSC, sinon on voit brièvement l'ancienne scène encore verte.
         self.scene_name_label.config(fg=SCENE_NOT_LAUNCHED)
+        self.shared_state.set_scene_name("À SUIVRE")
         self.shared_state.set_scene_launched(False)
         try:
             self.live_osc.set_selected_scene(new_index)
@@ -680,6 +681,9 @@ class App:
                 self.live_osc.start_playing()
             else:
                 self.scene_name_label.config(fg=SCENE_LAUNCHED)
+                # Le smartphone n'affiche le vrai titre qu'à ce moment (pas de
+                # spoiler avant l'appui) : À SUIVRE jusqu'ici, nom révélé ici.
+                self.shared_state.set_scene_name(self._scene_name)
                 self.shared_state.set_scene_launched(True)
                 self._scene_flash_start = time.monotonic()
         except OSError as exc:
@@ -730,11 +734,11 @@ class App:
         # de couleur que sur le web (les scènes numériques restent rouge, cf.
         # _scene_launch qui ne passe jamais au vert pour elles).
         self.scene_name_label.config(text=text, fg=SCENE_NOT_LAUNCHED)
-        # Page web : juste le titre, sans le numéro de scène. Le tempo seul
-        # (chiffres) n'a pas de sens pour le public, on affiche "À SUIVRE".
-        web_name = name
-        if self._scene_name.strip().isdigit():
-            web_name = name.replace(self._scene_name, "À SUIVRE", 1)
+        # Page web : "À SUIVRE (Titre)" dans tous les cas — le titre entre
+        # parenthèses est celui du morceau à jouer (le suivant si scène
+        # "tempo seul", ou la scène elle-même si elle porte déjà le vrai nom).
+        display_name = next_name if self._scene_name.strip().isdigit() else self._scene_name
+        web_name = f"À SUIVRE ({display_name})" if display_name else "À SUIVRE"
         self.shared_state.set_scene_name(web_name)
 
     # -------------------------------------------------------- Boucle poll --
