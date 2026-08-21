@@ -615,6 +615,7 @@ class App:
     def _toggle_hui_connect(self) -> None:
         if self.hui_bridge.port_name:
             self.hui_bridge.close()
+            self._set_hui_listen(0, listen=False)
             self.hui_connect_btn.config(text="Connecter")
             return
         port_name = self.controller_port_var_2.get()
@@ -625,6 +626,7 @@ class App:
         except Exception as exc:  # noqa: BLE001 - affichage utilisateur simple
             print(f"[HUI] erreur de connexion : {exc}")
             return
+        self._set_hui_listen(0, listen=True)
         self.hui_connect_btn.config(text="Déconnecter")
         self.config["hui_port"] = port_name
         save_config(self.config)
@@ -638,6 +640,7 @@ class App:
     def _toggle_hui_connect_2(self) -> None:
         if self.hui_bridge_2.port_name:
             self.hui_bridge_2.close()
+            self._set_hui_listen(8, listen=False)
             self.hui_connect_btn_2.config(text="Connecter")
             return
         port_name = self.controller_port_var_3.get()
@@ -648,9 +651,22 @@ class App:
         except Exception as exc:  # noqa: BLE001 - affichage utilisateur simple
             print(f"[HUI] erreur de connexion : {exc}")
             return
+        self._set_hui_listen(8, listen=True)
         self.hui_connect_btn_2.config(text="Déconnecter")
         self.config["hui_port_2"] = port_name
         save_config(self.config)
+
+    def _set_hui_listen(self, channel_offset: int, listen: bool) -> None:
+        """Abonne/désabonne aux changements de volume et mute d'Ableton pour
+        les 8 pistes couvertes par un pont HUI, pour le retour vers la console
+        (fader/LED mute qui reflètent l'état réel de Live)."""
+        for track in range(channel_offset, channel_offset + 8):
+            if listen:
+                self.live_osc.start_listen_track_volume(track)
+                self.live_osc.start_listen_track_mute(track)
+            else:
+                self.live_osc.stop_listen_track_volume(track)
+                self.live_osc.stop_listen_track_mute(track)
 
     def _toggle_controller_connect(self) -> None:
         if self.controller.port_name:
@@ -847,6 +863,14 @@ class App:
         for address, args in self.live_osc.poll_replies():
             if address == "/live/error":
                 print(f"[OSC] erreur renvoyée par AbletonOSC : {args}")
+            elif address == "/live/track/get/volume":
+                track_index, volume = int(args[0]), float(args[1])
+                self.hui_bridge.send_volume_feedback(track_index, volume)
+                self.hui_bridge_2.send_volume_feedback(track_index, volume)
+            elif address == "/live/track/get/mute":
+                track_index, muted = int(args[0]), bool(args[1])
+                self.hui_bridge.send_mute_feedback(track_index, muted)
+                self.hui_bridge_2.send_mute_feedback(track_index, muted)
             elif address == "/live/song/get/num_scenes":
                 self._scene_count = int(args[0])
             elif address == "/live/view/get/selected_scene":

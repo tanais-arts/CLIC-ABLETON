@@ -1,8 +1,13 @@
-"""Pont HUI -> OSC : traduit les messages MIDI HUI reçus d'une console de
+"""Pont HUI <-> OSC : traduit les messages MIDI HUI reçus d'une console de
 mixage (ex. Yamaha 01V96V2 en mode "HUI") en commandes OSC vers Ableton Live
-(volume et mute des pistes). Un canal HUI = une piste Live, dans l'ordre
-(tranche 1 -> piste 1, etc.). Sens unique pour l'instant : la console pilote
-Live, Live ne renvoie rien vers la console (pas de LED/fader motorisé).
+(volume et mute des pistes), et renvoie en retour vers la console la position
+de fader / l'état mute réels d'Ableton (ex. si changés depuis la souris dans
+Live). Encodage du retour confirmé par capture MIDI Monitor de Pro Tools
+(implémentation HUI de référence) le 2026-08-21 : le fader utilise les mêmes
+CC(zone)/CC(zone+32) que la réception, sans zone select ; le mute utilise le
+même schéma zone/port que la réception mais décalé de -3 en numéro de CC
+(0x0C/0x2C au lieu de 0x0F/0x2F).
+Un canal HUI = une piste Live, dans l'ordre (tranche 1 -> piste 1, etc.).
 
 Protocole observé sur le 01V96V2 réel (relevé via MIDI Monitor, 2026-08-21 —
 diffère de la doc HUI générique "theageman" sur plusieurs points) :
@@ -42,6 +47,14 @@ FADER_PORT = 0
 MUTE_PORT = 2
 PING_INTERVAL = 1.0  # secondes
 
+# Sens host -> surface (retour vers la console), confirmé par capture MIDI
+# Monitor de Pro Tools (référence HUI) : même schéma zone/port mais décalé de
+# -3 par rapport au sens surface -> host ci-dessus. La valeur de fader
+# (CC(zone)/CC(zone+32)) n'a elle pas besoin de zone select, elle s'auto-
+# identifie par son numéro de CC.
+ZONE_CC_OUT = 0x0C
+PORT_CC_OUT = 0x2C
+
 
 class HuiBridge:
     """Ouvre un port MIDI IN (messages HUI) et, si possible, un port MIDI OUT
@@ -61,6 +74,7 @@ class HuiBridge:
         self._pending_zone: int | None = None
         self._pending_coarse: int | None = None
         self._mute_state: dict[int, bool] = {}
+        self._track_volume: dict[int, float] = {}
         self._ping_stop = threading.Event()
         self._ping_thread: threading.Thread | None = None
 
@@ -171,7 +185,36 @@ class HuiBridge:
             self._pending_coarse = None
             volume = raw / 16383.0
             self._log(f"HUI : volume piste {track + 1} -> {volume:.3f}")
+            self._track_volume[track] = volume
             self._live_osc.set_track_volume(track, volume)
             return
 
         self._log(f"HUI : zone={zone} CC{cc}={value} (non géré pour l'instant)")
+
+    def send_volume_feedback(self, track_index: int, volume: float) -> None:
+        """Renvoie vers la console la position de fader réelle d'Ableton pour
+        `track_index` (ignoré si hors de la plage de ce port, ou si c'est
+        juste l'écho de ce qu'on vient nous-même d'envoyer)."""
+        zone = track_index - self._channel_offset
+        if self._midi_out is None or not 0 <= zone < 8:
+            return
+        if abs(volume - self._track_volume.get(track_index, -1.0)) < 1 / 16383.0:
+            return
+        self._track_volume[track_index] = volume
+        raw = max(0, min(16383, round(volume * 16383)))
+        coarse, fine = raw >> 7, raw & 0x7F
+        self._midi_out.send_message([0xB0, zone, coarse])
+        self._midi_out.send_message([0xB0, zone + 32, fine])
+
+    def send_mute_feedback(self, track_index: int, muted: bool) -> None:
+        """Renvoie vers la console l'état mute réel d'Ableton pour
+        `track_index` (mêmes conditions d'ignorance que send_volume_feedback)."""
+        zone = track_index - self._channel_offset
+        if self._midi_out is None or not 0 <= zone < 8:
+            return
+        if self._mute_state.get(track_index) == muted:
+            return
+        self._mute_state[track_index] = muted
+        value = MUTE_PORT | (PORT_ON_MASK if muted else 0)
+        self._midi_out.send_message([0xB0, ZONE_CC_OUT, zone])
+        self._midi_out.send_message([0xB0, PORT_CC_OUT, value])

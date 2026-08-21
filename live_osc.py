@@ -149,6 +149,22 @@ class LiveOSC:
         """Coupe (True) ou réactive (False) le son d'une piste (Track.mute du LOM)."""
         self.send("/live/track/set/mute", track_index, bool(muted))
 
+    def start_listen_track_volume(self, track_index: int) -> None:
+        """Abonne aux changements de volume de la piste (même d'origine externe,
+        ex. souris dans Live) : chaque changement renvoie une réponse
+        /live/track/get/volume (track_index, volume) via poll_replies()."""
+        self.send("/live/track/start_listen/volume", track_index)
+
+    def start_listen_track_mute(self, track_index: int) -> None:
+        """Abonne aux changements de mute de la piste, cf. start_listen_track_volume."""
+        self.send("/live/track/start_listen/mute", track_index)
+
+    def stop_listen_track_volume(self, track_index: int) -> None:
+        self.send("/live/track/stop_listen/volume", track_index)
+
+    def stop_listen_track_mute(self, track_index: int) -> None:
+        self.send("/live/track/stop_listen/mute", track_index)
+
     def start_playing(self) -> None:
         """Démarre la lecture (Song.start_playing) — utilisé après le
         lancement d'une scène "tempo seul" (nom purement numérique), qui ne
