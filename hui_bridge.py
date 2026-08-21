@@ -36,6 +36,7 @@ pour permettre d'affiner le mapping si besoin.
 from __future__ import annotations
 
 import threading
+import unicodedata
 
 import rtmidi
 
@@ -54,6 +55,14 @@ PING_INTERVAL = 1.0  # secondes
 # identifie par son numéro de CC.
 ZONE_CC_OUT = 0x0C
 PORT_CC_OUT = 0x2C
+
+
+def _to_hui_ascii(text: str, length: int) -> bytes:
+    """Convertit vers l'ASCII 7 bits attendu par l'afficheur HUI (accents
+    retirés plutôt que remplacés), tronqué/complété à `length` caractères."""
+    normalized = unicodedata.normalize("NFKD", text)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    return ascii_text[:length].ljust(length).encode("ascii")
 
 
 class HuiBridge:
@@ -75,6 +84,7 @@ class HuiBridge:
         self._pending_coarse: int | None = None
         self._mute_state: dict[int, bool] = {}
         self._track_volume: dict[int, float] = {}
+        self._track_name: dict[int, bytes] = {}
         self._ping_stop = threading.Event()
         self._ping_thread: threading.Thread | None = None
 
@@ -218,3 +228,16 @@ class HuiBridge:
         value = MUTE_PORT | (PORT_ON_MASK if muted else 0)
         self._midi_out.send_message([0xB0, ZONE_CC_OUT, zone])
         self._midi_out.send_message([0xB0, PORT_CC_OUT, value])
+
+    def send_name_feedback(self, track_index: int, name: str) -> None:
+        """Envoie le nom (abrégé à 4 caractères) de la piste vers l'afficheur
+        de la tranche correspondante (SysEx confirmé par capture Pro Tools :
+        F0 00 00 66 05 00 10 <zone> <4 car. ASCII> F7)."""
+        zone = track_index - self._channel_offset
+        if self._midi_out is None or not 0 <= zone < 8:
+            return
+        text = _to_hui_ascii(name, 4)
+        if self._track_name.get(track_index) == text:
+            return
+        self._track_name[track_index] = text
+        self._midi_out.send_message([0xF0, 0x00, 0x00, 0x66, 0x05, 0x00, 0x10, zone, *text, 0xF7])

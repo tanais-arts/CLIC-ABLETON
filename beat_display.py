@@ -657,16 +657,23 @@ class App:
         save_config(self.config)
 
     def _set_hui_listen(self, channel_offset: int, listen: bool) -> None:
-        """Abonne/désabonne aux changements de volume et mute d'Ableton pour
-        les 8 pistes couvertes par un pont HUI, pour le retour vers la console
-        (fader/LED mute qui reflètent l'état réel de Live)."""
+        """Abonne/désabonne aux changements de volume, mute et nom d'Ableton
+        pour les 8 pistes couvertes par un pont HUI, pour le retour vers la
+        console (fader/LED mute/nom qui reflètent l'état réel de Live)."""
         for track in range(channel_offset, channel_offset + 8):
             if listen:
                 self.live_osc.start_listen_track_volume(track)
                 self.live_osc.start_listen_track_mute(track)
+                self.live_osc.start_listen_track_name(track)
+                # start_listen ne renvoie que les changements futurs : on
+                # demande aussi la valeur actuelle pour l'état de départ.
+                self.live_osc.get_track_volume(track)
+                self.live_osc.get_track_mute(track)
+                self.live_osc.get_track_name(track)
             else:
                 self.live_osc.stop_listen_track_volume(track)
                 self.live_osc.stop_listen_track_mute(track)
+                self.live_osc.stop_listen_track_name(track)
 
     def _toggle_controller_connect(self) -> None:
         if self.controller.port_name:
@@ -871,6 +878,10 @@ class App:
                 track_index, muted = int(args[0]), bool(args[1])
                 self.hui_bridge.send_mute_feedback(track_index, muted)
                 self.hui_bridge_2.send_mute_feedback(track_index, muted)
+            elif address == "/live/track/get/name":
+                track_index, name = int(args[0]), (args[1] or "")
+                self.hui_bridge.send_name_feedback(track_index, name)
+                self.hui_bridge_2.send_name_feedback(track_index, name)
             elif address == "/live/song/get/num_scenes":
                 self._scene_count = int(args[0])
             elif address == "/live/view/get/selected_scene":

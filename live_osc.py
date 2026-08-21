@@ -159,11 +159,29 @@ class LiveOSC:
         """Abonne aux changements de mute de la piste, cf. start_listen_track_volume."""
         self.send("/live/track/start_listen/mute", track_index)
 
+    def start_listen_track_name(self, track_index: int) -> None:
+        """Abonne aux changements de nom de la piste, cf. start_listen_track_volume."""
+        self.send("/live/track/start_listen/name", track_index)
+
     def stop_listen_track_volume(self, track_index: int) -> None:
         self.send("/live/track/stop_listen/volume", track_index)
 
     def stop_listen_track_mute(self, track_index: int) -> None:
         self.send("/live/track/stop_listen/mute", track_index)
+
+    def stop_listen_track_name(self, track_index: int) -> None:
+        self.send("/live/track/stop_listen/name", track_index)
+
+    def get_track_volume(self, track_index: int) -> None:
+        """Demande la valeur actuelle (le start_listen seul ne renvoie que les
+        changements futurs, pas l'état présent)."""
+        self.send("/live/track/get/volume", track_index)
+
+    def get_track_mute(self, track_index: int) -> None:
+        self.send("/live/track/get/mute", track_index)
+
+    def get_track_name(self, track_index: int) -> None:
+        self.send("/live/track/get/name", track_index)
 
     def start_playing(self) -> None:
         """Démarre la lecture (Song.start_playing) — utilisé après le
