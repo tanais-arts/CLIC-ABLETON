@@ -292,7 +292,10 @@ class App:
         self._learning: str | None = None
 
         # -- Pont HUI -> OSC (ex. Yamaha 01V96V2) pour faders/mutes des pistes --
+        # La console répartit ses 16 voies sur 2 ports MIDI (8 tranches chacun) :
+        # bridge principal = voies 1-8, bridge_2 = voies 9-16 (offset de piste +8).
         self.hui_bridge = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"))
+        self.hui_bridge_2 = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), channel_offset=8)
 
         # À la reprise (connecté/en lecture après ne pas l'avoir été), on
         # n'affiche les temps qu'à partir du prochain temps 1 réel, pour ne
@@ -311,6 +314,7 @@ class App:
             self.port_var.set(self.config["midi_port"])
         self._refresh_controller_ports()
         self._refresh_controller_ports_2()
+        self._refresh_controller_ports_3()
         configured_controller_port = self.config.get("controller_port")
         connected_at_startup = False
         if configured_controller_port:
@@ -323,6 +327,11 @@ class App:
             self.controller_port_var_2.set(configured_hui_port)
             if configured_hui_port in self.controller_port_combo_2["values"]:
                 self._toggle_hui_connect()
+        configured_hui_port_2 = self.config.get("hui_port_2")
+        if configured_hui_port_2:
+            self.controller_port_var_3.set(configured_hui_port_2)
+            if configured_hui_port_2 in self.controller_port_combo_3["values"]:
+                self._toggle_hui_connect_2()
         if connected_at_startup:
             self._refresh_controller_map_table()
         else:
@@ -426,6 +435,8 @@ class App:
         MINI_SIZE = 22  # pixels : taille fixe pour que A/E soient réellement carrés
         self.learn_buttons: dict[str, tk.Button] = {}
         self.clear_buttons: dict[str, tk.Button] = {}
+        self.action_buttons: dict[str, tk.Frame] = {}
+        self._action_flash_after_id: dict[str, str] = {}
 
         def add_mini_button(parent: tk.Frame, text: str, command) -> tk.Button:
             holder = tk.Frame(parent, width=MINI_SIZE, height=MINI_SIZE, bg=BG_IDLE)
@@ -442,7 +453,12 @@ class App:
             mini.pack(side="left", padx=(0, 2))
             self.learn_buttons[action] = add_mini_button(mini, "A", lambda: self._start_learn(action))
             self.clear_buttons[action] = add_mini_button(mini, "E", lambda: self._clear_assignment(action))
-            tk.Button(group, text=text, command=self._action_commands[action], **square_btn).pack(side="left")
+            # macOS Aqua ignore le bg d'un tk.Button natif : on flashe ce cadre autour, pas le bouton.
+            flash_holder = tk.Frame(group, bg=BG_IDLE)
+            flash_holder.pack(side="left")
+            btn = tk.Button(flash_holder, text=text, command=self._action_commands[action], **square_btn)
+            btn.pack(padx=3, pady=3)
+            self.action_buttons[action] = flash_holder
 
         add_control("minus", "−1")
         add_control("plus", "+1")
@@ -466,10 +482,12 @@ class App:
         )
         self.controller_connect_btn.pack(side="left", padx=2)
 
-        # -- Placeholder pour une future implémentation (faders & mutes Ableton) --
+        # -- Pont HUI -> OSC (ex. Yamaha 01V96V2), 16 voies réparties sur 2 ports --
         controller_row_2 = tk.Frame(self.root, bg=BG_IDLE)
         controller_row_2.pack(fill="x", padx=10, pady=(0, 4))
-        tk.Label(controller_row_2, text="MIDI IN Faders and Mutes :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        tk.Label(controller_row_2, text="MIDI IN Faders and Mutes (voies 1-8) :", bg=BG_IDLE, fg=FG_TEXT).pack(
+            side="left"
+        )
         self.controller_port_var_2 = tk.StringVar()
         self.controller_port_combo_2 = ttk.Combobox(
             controller_row_2, textvariable=self.controller_port_var_2, state="readonly", width=22,
@@ -482,6 +500,24 @@ class App:
             controller_row_2, text="Connecter", command=self._toggle_hui_connect,
         )
         self.hui_connect_btn.pack(side="left", padx=2)
+
+        controller_row_3 = tk.Frame(self.root, bg=BG_IDLE)
+        controller_row_3.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(controller_row_3, text="MIDI IN Faders and Mutes (voies 9-16) :", bg=BG_IDLE, fg=FG_TEXT).pack(
+            side="left"
+        )
+        self.controller_port_var_3 = tk.StringVar()
+        self.controller_port_combo_3 = ttk.Combobox(
+            controller_row_3, textvariable=self.controller_port_var_3, state="readonly", width=22,
+        )
+        self.controller_port_combo_3.pack(side="left", padx=6)
+        tk.Button(controller_row_3, text="Rafraîchir", command=self._refresh_controller_ports_3).pack(
+            side="left", padx=2
+        )
+        self.hui_connect_btn_2 = tk.Button(
+            controller_row_3, text="Connecter", command=self._toggle_hui_connect_2,
+        )
+        self.hui_connect_btn_2.pack(side="left", padx=2)
 
         status_row = tk.Frame(self.root, bg=BG_IDLE)
         status_row.pack(fill="x", padx=10, pady=(0, 4))
@@ -593,6 +629,29 @@ class App:
         self.config["hui_port"] = port_name
         save_config(self.config)
 
+    def _refresh_controller_ports_3(self) -> None:
+        ports = self.controller.list_ports()
+        self.controller_port_combo_3["values"] = ports
+        if ports and not self.controller_port_var_3.get():
+            self.controller_port_var_3.set(ports[0])
+
+    def _toggle_hui_connect_2(self) -> None:
+        if self.hui_bridge_2.port_name:
+            self.hui_bridge_2.close()
+            self.hui_connect_btn_2.config(text="Connecter")
+            return
+        port_name = self.controller_port_var_3.get()
+        if not port_name:
+            return
+        try:
+            self.hui_bridge_2.connect(port_name)
+        except Exception as exc:  # noqa: BLE001 - affichage utilisateur simple
+            print(f"[HUI] erreur de connexion : {exc}")
+            return
+        self.hui_connect_btn_2.config(text="Déconnecter")
+        self.config["hui_port_2"] = port_name
+        save_config(self.config)
+
     def _toggle_controller_connect(self) -> None:
         if self.controller.port_name:
             self.controller.close()
@@ -636,6 +695,17 @@ class App:
         for action, btn in self.clear_buttons.items():
             btn.config(state="normal" if self.controller_map[action] else "disabled")
 
+    def _flash_action_button(self, action: str) -> None:
+        """Flash bref en bleu pour visualiser la réception d'une donnée MIDI mappée."""
+        holder = self.action_buttons.get(action)
+        if holder is None:
+            return
+        pending = self._action_flash_after_id.pop(action, None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+        holder.config(bg="#2f6fed")
+        self._action_flash_after_id[action] = self.root.after(200, lambda: holder.config(bg=BG_IDLE))
+
     def _poll_controller(self) -> None:
         try:
             while True:
@@ -654,6 +724,7 @@ class App:
                     continue
                 for action, mapped_key in self.controller_map.items():
                     if key == mapped_key:
+                        self._flash_action_button(action)
                         self._action_commands[action]()
                         break
         except queue.Empty:
@@ -774,7 +845,9 @@ class App:
 
     def _poll_scene_replies(self) -> None:
         for address, args in self.live_osc.poll_replies():
-            if address == "/live/song/get/num_scenes":
+            if address == "/live/error":
+                print(f"[OSC] erreur renvoyée par AbletonOSC : {args}")
+            elif address == "/live/song/get/num_scenes":
                 self._scene_count = int(args[0])
             elif address == "/live/view/get/selected_scene":
                 self._scene_index = int(args[0])
@@ -974,6 +1047,7 @@ class App:
         self.live_osc.close()
         self.controller.close()
         self.hui_bridge.close()
+        self.hui_bridge_2.close()
         self.web_server.stop()
         self.root.destroy()
 

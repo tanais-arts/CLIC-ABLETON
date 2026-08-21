@@ -28,10 +28,19 @@ def _osc_read_string(data: bytes, offset: int) -> tuple[str, int]:
     return value, offset + padded_len
 
 
-def _osc_message(address: str, *args: float | str) -> bytes:
-    type_tags = "," + "".join("s" if isinstance(a, str) else "f" for a in args)
+def _osc_message(address: str, *args: float | str | bool) -> bytes:
+    type_tags = ","
+    for arg in args:
+        if isinstance(arg, bool):
+            type_tags += "T" if arg else "F"
+        elif isinstance(arg, str):
+            type_tags += "s"
+        else:
+            type_tags += "f"
     message = _osc_string(address) + _osc_string(type_tags)
     for value in args:
+        if isinstance(value, bool):
+            continue  # les tags T/F du protocole OSC ne portent aucun octet de donnée
         message += _osc_string(value) if isinstance(value, str) else struct.pack(">f", value)
     return message
 
@@ -100,7 +109,7 @@ class LiveOSC:
             pass
         return replies
 
-    def send(self, address: str, *args: float | str) -> None:
+    def send(self, address: str, *args: float | str | bool) -> None:
         self._sock.sendto(_osc_message(address, *args), self._addr)
 
     def jump_song_by(self, beats: float) -> None:
@@ -138,7 +147,7 @@ class LiveOSC:
 
     def set_track_mute(self, track_index: int, muted: bool) -> None:
         """Coupe (True) ou réactive (False) le son d'une piste (Track.mute du LOM)."""
-        self.send("/live/track/set/mute", track_index, 1.0 if muted else 0.0)
+        self.send("/live/track/set/mute", track_index, bool(muted))
 
     def start_playing(self) -> None:
         """Démarre la lecture (Song.start_playing) — utilisé après le
