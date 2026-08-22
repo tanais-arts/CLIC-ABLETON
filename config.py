@@ -28,9 +28,10 @@ DEFAULTS = {
     "controller_map_play": ["note", 0, 2],
     # D#-2 pour activer/désactiver le métronome de Live.
     "controller_map_metronome": ["note", 0, 3],
-    # Si True, inverse les bancs de faders HUI : les pistes 1-8 sortent sur
-    # le port "voies 9-16" et inversement (voir HuiBridge.channel_offset).
-    "hui_swap_banks": False,
+    # Mapping piste Live (index) -> tranche HUI/Yamaha (valeur), 0-15.
+    # Diagonale par défaut (piste 1 -> tranche 1, etc.), modifiable dans
+    # l'interface ("Configurer le mapping des faders…").
+    "hui_track_mapping": list(range(16)),
 }
 
 

@@ -299,15 +299,15 @@ class App:
         self._learning: str | None = None
 
         # -- Pont HUI -> OSC (ex. Yamaha 01V96V2) pour faders/mutes des pistes --
-        # La console répartit ses 16 voies sur 2 ports MIDI (8 tranches chacun) :
-        # bridge principal = voies 1-8, bridge_2 = voies 9-16 (offset de piste +8).
-        self.hui_bridge = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"))
-        self.hui_bridge_2 = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), channel_offset=8)
-        # Choix utilisateur (persisté, pas figé dans le code) : inverser quelles
-        # pistes Live sortent sur quel port HUI, ex. pistes 1-8 sur les faders 9-16.
-        self._hui_swap_var = tk.BooleanVar(value=bool(self.config.get("hui_swap_banks", False)))
-        if self._hui_swap_var.get():
-            self.hui_bridge.channel_offset, self.hui_bridge_2.channel_offset = 8, 0
+        # La console répartit ses 16 voies sur 2 ports MIDI (8 tranches chacun).
+        # Mapping piste Live <-> tranche HUI choisi par l'utilisateur (persisté,
+        # diagonale 1<->1 par défaut) : voir _open_hui_mapping_dialog.
+        self._track_mapping: list[int] = list(self.config.get("hui_track_mapping", list(range(16))))
+        if len(self._track_mapping) != 16:
+            self._track_mapping = list(range(16))
+        zone_map_1, zone_map_2 = self._hui_zone_maps(self._track_mapping)
+        self.hui_bridge = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_1)
+        self.hui_bridge_2 = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_2)
 
         # À la reprise (connecté/en lecture après ne pas l'avoir été), on
         # n'affiche les temps qu'à partir du prochain temps 1 réel, pour ne
@@ -319,6 +319,12 @@ class App:
         self._last_bpm: float | None = None
         # Flash blanc ponctuel du canvas au lancement d'une scène.
         self._scene_flash_start: float = 0.0
+        # Détection de la présence de Live/AbletonOSC (voir _ping_live) : si
+        # CLIC démarre avant Live, les abonnements OSC envoyés au tout début
+        # (start_listen_track_*, métronome) se perdent (personne n'écoute
+        # encore côté Live) — on les renvoie donc dès que Live répond.
+        self._live_available = False
+        self._live_last_seen = 0.0
 
         self._build_ui()
         self._refresh_ports()
@@ -351,6 +357,7 @@ class App:
         self._refresh_scene_state()
         self._apply_mode()
         self._poll()
+        self._ping_live()
 
     # ---------------------------------------------------------------- UI --
     def _build_ui(self) -> None:
@@ -532,11 +539,11 @@ class App:
         )
         self.hui_connect_btn_2.pack(side="left", padx=2)
 
-        tk.Checkbutton(
-            self.root, text="Inverser les bancs de faders (voies 1-8 ↔ 9-16)",
-            variable=self._hui_swap_var, command=self._toggle_hui_swap, bg=BG_IDLE, fg=FG_TEXT,
-            selectcolor="#333333", activebackground=BG_IDLE, activeforeground=FG_TEXT,
-        ).pack(anchor="w", padx=10, pady=(0, 4))
+        hui_mapping_row = tk.Frame(self.root, bg=BG_IDLE)
+        hui_mapping_row.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Button(
+            hui_mapping_row, text="Configurer le mapping des faders…", command=self._open_hui_mapping_dialog,
+        ).pack(side="left")
 
         status_row = tk.Frame(self.root, bg=BG_IDLE)
         status_row.pack(fill="x", padx=10, pady=(0, 4))
@@ -675,16 +682,76 @@ class App:
         self.config["hui_port_2"] = port_name
         save_config(self.config)
 
-    def _toggle_hui_swap(self) -> None:
-        """Bascule quelles pistes Live sortent sur quel port HUI (choix
-        utilisateur persisté, ex. pistes 1-8 sur les faders 9-16 au lieu
-        de 1-8). Ne touche pas aux abonnements OSC : à eux deux, les ponts
-        couvrent toujours les pistes 0-15, seule leur répartition change."""
-        swapped = self._hui_swap_var.get()
-        self.hui_bridge.channel_offset = 8 if swapped else 0
-        self.hui_bridge_2.channel_offset = 0 if swapped else 8
-        self.config["hui_swap_banks"] = swapped
+    @staticmethod
+    def _hui_zone_maps(mapping: list[int]) -> tuple[dict[int, int], dict[int, int]]:
+        """Convertit le mapping piste Live (index) -> tranche HUI (valeur,
+        0-15) en deux dicts zone (0-7) -> piste, un par port MIDI (tranches
+        0-7 -> bridge principal, 8-15 -> bridge_2)."""
+        zone_map_1: dict[int, int] = {}
+        zone_map_2: dict[int, int] = {}
+        for track, channel in enumerate(mapping):
+            if 0 <= channel < 8:
+                zone_map_1[channel] = track
+            elif 8 <= channel < 16:
+                zone_map_2[channel - 8] = track
+        return zone_map_1, zone_map_2
+
+    def _apply_track_mapping(self, mapping: list[int]) -> None:
+        """Applique le mapping choisi dans la fenêtre de configuration (pas
+        automatique : rien ne change avant l'appui sur "Appliquer")."""
+        self._track_mapping = list(mapping)
+        zone_map_1, zone_map_2 = self._hui_zone_maps(self._track_mapping)
+        self.hui_bridge.set_mapping(zone_map_1)
+        self.hui_bridge_2.set_mapping(zone_map_2)
+        self.config["hui_track_mapping"] = self._track_mapping
         save_config(self.config)
+        self._refresh_hui_feedback()
+
+    def _open_hui_mapping_dialog(self) -> None:
+        """Fenêtre de mapping piste Live (ligne) <-> tranche HUI/Yamaha
+        (colonne) : une seule tranche par piste (boutons radio par ligne,
+        donc pas de doublon possible sur une même ligne), diagonale 1<->1 par
+        défaut. Rien n'est appliqué avant l'appui sur "Appliquer"."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Mapping faders Live ↔ Yamaha")
+        dialog.configure(bg=BG_IDLE)
+
+        tk.Label(dialog, text="Piste \\ Tranche", bg=BG_IDLE, fg=FG_TEXT).grid(row=0, column=0, padx=(4, 6))
+        for col in range(16):
+            tk.Label(dialog, text=str(col + 1), bg=BG_IDLE, fg=FG_TEXT, width=2).grid(
+                row=0, column=col + 1, padx=1, pady=(4, 2)
+            )
+
+        row_vars: list[tk.IntVar] = []
+        for track in range(16):
+            var = tk.IntVar(value=self._track_mapping[track])
+            row_vars.append(var)
+            tk.Label(dialog, text=f"Piste {track + 1}", bg=BG_IDLE, fg=FG_TEXT).grid(
+                row=track + 1, column=0, sticky="w", padx=(4, 6)
+            )
+            for col in range(16):
+                tk.Radiobutton(
+                    dialog, variable=var, value=col, bg=BG_IDLE, activebackground=BG_IDLE, selectcolor="#333333",
+                ).grid(row=track + 1, column=col + 1)
+
+        button_row = tk.Frame(dialog, bg=BG_IDLE)
+        button_row.grid(row=17, column=0, columnspan=17, pady=8)
+        tk.Button(
+            button_row, text="Appliquer", command=lambda: self._apply_track_mapping([v.get() for v in row_vars]),
+        ).pack(side="left", padx=6)
+        tk.Button(button_row, text="Fermer", command=dialog.destroy).pack(side="left", padx=6)
+
+    def _refresh_hui_feedback(self) -> None:
+        """Redemande le volume/mute/nom actuel des 16 pistes pour repositionner
+        les faders et LED de la console sur leur véritable état (ex. après
+        _apply_track_mapping, ou pour se resynchroniser en cas de doute)."""
+        try:
+            for track in range(16):
+                self.live_osc.get_track_volume(track)
+                self.live_osc.get_track_mute(track)
+                self.live_osc.get_track_name(track)
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC : {exc}")
 
     def _set_hui_listen(self, channel_offset: int, listen: bool) -> None:
         """Abonne/désabonne aux changements de volume, mute et nom d'Ableton
@@ -829,6 +896,51 @@ class App:
         except OSError as exc:
             self.scene_name_label.config(text=f"Erreur OSC : {exc}")
 
+    def _ping_live(self) -> None:
+        """Sonde Live toutes les 2s (voir LiveOSC.ping) : si aucune réponse
+        n'arrive pendant ~6s, on considère Live absent, pour détecter sa
+        (re)connexion (ex. lancé après CLIC) via _poll_scene_replies et
+        renvoyer les abonnements perdus."""
+        try:
+            self.live_osc.ping()
+        except OSError:
+            pass
+        if self._live_available and time.monotonic() - self._live_last_seen > 6.0:
+            self._live_available = False
+        self.root.after(2000, self._ping_live)
+
+    def _on_live_available(self) -> None:
+        """Appelé quand Live répond pour la première fois (ou de nouveau après
+        une coupure/un lancement tardif) : renvoie les abonnements HUI et
+        métronome perdus au démarrage si Live n'était pas encore là, et
+        rafraîchit l'état des scènes."""
+        if self.hui_bridge.port_name:
+            self._set_hui_listen(0, listen=True)
+        if self.hui_bridge_2.port_name:
+            self._set_hui_listen(8, listen=True)
+        try:
+            self.live_osc.start_listen_metronome()
+        except OSError:
+            pass
+        self._refresh_scene_state()
+        try:
+            self.live_osc.get_num_tracks()
+        except OSError:
+            pass
+
+    def _reset_faders_beyond(self, num_tracks: int) -> None:
+        """Remet à zéro (fader en bas, mute éteint, nom vide) les tranches HUI
+        au-delà du nombre réel de pistes du projet courant : sans piste, Live
+        ne renvoie jamais de retour pour ces index (erreur "Index out of
+        range", déjà filtrée plus bas), donc le fader physique resterait
+        bloqué sur sa dernière position connue (ex. venant d'un projet
+        précédent avec plus de pistes)."""
+        for track in range(max(0, num_tracks), 16):
+            for bridge in (self.hui_bridge, self.hui_bridge_2):
+                bridge.send_volume_feedback(track, 0.0)
+                bridge.send_mute_feedback(track, False)
+                bridge.send_name_feedback(track, "")
+
     def _scene_step(self, delta: int) -> None:
         if self._scene_index is None or self._scene_count is None:
             self._refresh_scene_state()
@@ -906,7 +1018,19 @@ class App:
 
     def _poll_scene_replies(self) -> None:
         for address, args in self.live_osc.poll_replies():
-            if address == "/live/error":
+            if address == "/live/startup":
+                # Renvoyé par Live à chaque (re)chargement de projet, même si
+                # Live tournait déjà et répondait au ping /live/test : c'est
+                # le seul signal fiable pour détecter un changement de projet.
+                self._live_last_seen = time.monotonic()
+                self._live_available = True
+                self._on_live_available()
+            elif address == "/live/test":
+                self._live_last_seen = time.monotonic()
+                if not self._live_available:
+                    self._live_available = True
+                    self._on_live_available()
+            elif address == "/live/error":
                 # "Index out of range" est attendu en permanence si le pont
                 # HUI écoute des pistes au-delà du nombre réel de pistes du
                 # projet (ex. 16 canaux HUI pour un projet à moins de 16
@@ -915,6 +1039,8 @@ class App:
                     print(f"[OSC] erreur renvoyée par AbletonOSC : {args}")
             elif address == "/live/song/get/metronome":
                 self._metronome_on = bool(args[0])
+            elif address == "/live/song/get/num_tracks":
+                self._reset_faders_beyond(int(args[0]))
             elif address == "/live/track/get/volume":
                 track_index, volume = int(args[0]), float(args[1])
                 self.hui_bridge.send_volume_feedback(track_index, volume)

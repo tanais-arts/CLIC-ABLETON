@@ -19,7 +19,9 @@ diffère de la doc HUI générique "theageman" sur plusieurs points) :
     sur le canal de la zone courante : CC(zone) = poids fort (0-127),
     CC(zone + 32) = poids faible (0-127) -> valeur = (fort << 7) | faible.
     Le 01V96V2 n'a que 8 tranches par port MIDI : les 16 voies sont donc
-    réparties sur 2 ports (canaux 1-8 et 9-16), d'où `channel_offset`.
+    réparties sur 2 ports (canaux 1-8 et 9-16), d'où le mapping zone <-> piste
+    Live (`HuiBridge.set_mapping`), configurable par l'utilisateur (voir
+    beat_display.py) plutôt qu'une simple correspondance directe 1 pour 1.
   - Ping : pour que la console continue à envoyer les faders en continu, il
     faut lui envoyer un ping (Note On canal 0, note 0, vélocité 0) toutes les
     ~1s ; sans ping elle arrête l'envoi des faders au bout de 2s (le mute
@@ -79,14 +81,15 @@ class HuiBridge:
     """Ouvre un port MIDI IN (messages HUI) et, si possible, un port MIDI OUT
     du même nom (pour le ping), et traduit les événements reçus vers OSC.
 
-    `channel_offset` décale les tranches (0-7) reçues sur ce port vers les
-    pistes Live correspondantes — utile quand la console répartit ses voies
-    sur plusieurs ports MIDI (ex. port A = voies 1-8, port B = voies 9-16)."""
+    `zone_to_track` associe chaque tranche physique (0-7 sur ce port MIDI) à
+    une piste Live — utile quand la console répartit ses voies sur plusieurs
+    ports MIDI (ex. port A = tranches 0-7, port B = tranches 0-7 aussi mais
+    pour d'autres pistes), et pour permettre un mapping arbitraire choisi par
+    l'utilisateur plutôt qu'une simple correspondance 1 pour 1."""
 
-    def __init__(self, live_osc, log=print, channel_offset: int = 0):
+    def __init__(self, live_osc, log=print, zone_to_track: dict[int, int] | None = None):
         self._live_osc = live_osc
         self._log = log
-        self._channel_offset = channel_offset
         self._midi_in: rtmidi.MidiIn | None = None
         self._midi_out: rtmidi.MidiOut | None = None
         self._port_name: str | None = None
@@ -100,6 +103,9 @@ class HuiBridge:
         self._track_name: dict[int, bytes] = {}
         self._ping_stop = threading.Event()
         self._ping_thread: threading.Thread | None = None
+        self._zone_to_track: dict[int, int] = {}
+        self._track_to_zone: dict[int, int] = {}
+        self.set_mapping(zone_to_track if zone_to_track is not None else {z: z for z in range(8)})
 
     @staticmethod
     def list_ports() -> list[str]:
@@ -108,19 +114,14 @@ class HuiBridge:
         del probe
         return names
 
-    @property
-    def channel_offset(self) -> int:
-        return self._channel_offset
-
-    @channel_offset.setter
-    def channel_offset(self, value: int) -> None:
-        """Change à chaud les pistes Live couvertes par ce pont (ex. bascule
-        voies 1-8 <-> 9-16 choisie dans le logiciel). Purge les états locaux
-        indexés par piste : sinon ils resteraient associés aux anciennes
-        pistes et fausseraient la détection d'écho/dédoublonnage."""
-        if value == self._channel_offset:
-            return
-        self._channel_offset = value
+    def set_mapping(self, zone_to_track: dict[int, int]) -> None:
+        """Remplace la correspondance tranche HUI (0-7 sur ce port) <-> piste
+        Live, ex. quand l'utilisateur change le mapping des faders dans
+        l'interface. Purge les états locaux indexés par piste : sinon ils
+        resteraient associés aux anciennes pistes et fausseraient la
+        détection d'écho/dédoublonnage."""
+        self._zone_to_track = dict(zone_to_track)
+        self._track_to_zone = {track: zone for zone, track in self._zone_to_track.items()}
         self._pending_zone = None
         self._pending_coarse = None
         self._mute_toggle_state.clear()
@@ -206,13 +207,13 @@ class HuiBridge:
             self._log(f"HUI : CC{cc}={value} reçu sans zone en attente")
             return
         zone = self._pending_zone
-        track = zone + self._channel_offset
+        track = self._zone_to_track.get(zone)
 
         if cc == PORT_CC:
             port = value & PORT_NUMBER_MASK
             pressed = bool(value & PORT_ON_MASK)
             if port == MUTE_PORT:
-                if pressed:  # bascule à l'appui, pas au relâchement
+                if pressed and track is not None:  # bascule à l'appui, pas au relâchement
                     muted = not self._mute_toggle_state.get(track, False)
                     self._mute_toggle_state[track] = muted
                     self._log(f"HUI : mute piste {track + 1} -> {muted}")
@@ -233,6 +234,9 @@ class HuiBridge:
             elif raw <= FADER_SNAP_MARGIN:
                 raw = 0
             volume = raw / 16383.0
+            if track is None:
+                self._log(f"HUI : zone {zone} sans piste Live assignée (volume {volume:.3f} ignoré)")
+                return
             self._log(f"HUI : volume piste {track + 1} -> {volume:.3f}")
             self._track_volume_local[track] = volume
             self._track_volume_local_time[track] = time.monotonic()
@@ -249,8 +253,8 @@ class HuiBridge:
         fader physique vers une position dépassée sans toucher au vrai volume
         dans Live (déjà bon). On les ignore pendant VOLUME_ECHO_HOLDOFF_S,
         sauf s'ils confirment justement la valeur qu'on vient d'envoyer."""
-        zone = track_index - self._channel_offset
-        if self._midi_out is None or not 0 <= zone < 8:
+        zone = self._track_to_zone.get(track_index)
+        if self._midi_out is None or zone is None:
             return
         is_echo = abs(volume - self._track_volume_local.get(track_index, -1.0)) < 1 / 16383.0
         recent_local_move = (
@@ -273,8 +277,8 @@ class HuiBridge:
         sinon un appui sur le bouton de la console pré-remplissait la même
         valeur avant même le retour d'Ableton, et le message MIDI réel
         (celui qui allume/éteint la LED) n'était jamais envoyé."""
-        zone = track_index - self._channel_offset
-        if self._midi_out is None or not 0 <= zone < 8:
+        zone = self._track_to_zone.get(track_index)
+        if self._midi_out is None or zone is None:
             return
         self._mute_toggle_state[track_index] = muted
         if self._mute_sent_state.get(track_index) == muted:
@@ -288,8 +292,8 @@ class HuiBridge:
         """Envoie le nom (abrégé à 4 caractères) de la piste vers l'afficheur
         de la tranche correspondante (SysEx confirmé par capture Pro Tools :
         F0 00 00 66 05 00 10 <zone> <4 car. ASCII> F7)."""
-        zone = track_index - self._channel_offset
-        if self._midi_out is None or not 0 <= zone < 8:
+        zone = self._track_to_zone.get(track_index)
+        if self._midi_out is None or zone is None:
             return
         text = _to_hui_ascii(name, 4)
         if self._track_name.get(track_index) == text:

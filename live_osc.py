@@ -129,6 +129,9 @@ class LiveOSC:
     def get_num_scenes(self) -> None:
         self.send("/live/song/get/num_scenes")
 
+    def get_num_tracks(self) -> None:
+        self.send("/live/song/get/num_tracks")
+
     def get_selected_scene(self) -> None:
         self.send("/live/view/get/selected_scene")
 
@@ -182,6 +185,13 @@ class LiveOSC:
 
     def get_track_name(self, track_index: int) -> None:
         self.send("/live/track/get/name", track_index)
+
+    def ping(self) -> None:
+        """Sonde légère pour détecter la présence de Live/AbletonOSC : répond
+        toujours par /live/test ("ok",), même sans piste ni projet particulier
+        (contrairement à start_listen/get, qui ne renvoient rien si personne
+        n'écoute côté Live au moment de l'envoi)."""
+        self.send("/live/test")
 
     def start_listen_metronome(self) -> None:
         """Abonne aux changements du métronome (même d'origine externe, ex.
