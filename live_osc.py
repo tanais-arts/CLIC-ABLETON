@@ -183,6 +183,17 @@ class LiveOSC:
     def get_track_name(self, track_index: int) -> None:
         self.send("/live/track/get/name", track_index)
 
+    def start_listen_metronome(self) -> None:
+        """Abonne aux changements du métronome (même d'origine externe, ex.
+        souris dans Live) : chaque changement renvoie une réponse
+        /live/song/get/metronome (enabled) via poll_replies(), y compris la
+        valeur actuelle immédiatement à l'abonnement."""
+        self.send("/live/song/start_listen/metronome")
+
+    def set_metronome(self, enabled: bool) -> None:
+        """Active/désactive le métronome de Live (Song.metronome du LOM)."""
+        self.send("/live/song/set/metronome", bool(enabled))
+
     def start_playing(self) -> None:
         """Démarre la lecture (Song.start_playing) — utilisé après le
         lancement d'une scène "tempo seul" (nom purement numérique), qui ne

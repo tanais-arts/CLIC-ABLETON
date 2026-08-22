@@ -36,6 +36,7 @@ pour permettre d'affiner le mapping si besoin.
 from __future__ import annotations
 
 import threading
+import time
 import unicodedata
 
 import rtmidi
@@ -47,6 +48,15 @@ PORT_NUMBER_MASK = 0x07
 FADER_PORT = 0
 MUTE_PORT = 2
 PING_INTERVAL = 1.0  # secondes
+# Après un mouvement de fader local, on ignore les retours OSC qui ne
+# confirment pas la valeur envoyée pendant cette durée : ce sont des échos
+# en retard de positions intermédiaires déjà dépassées (voir send_volume_feedback).
+VOLUME_ECHO_HOLDOFF_S = 0.6
+# Une poussée physique "à fond" n'atteint pas toujours exactement raw=16383/0
+# (jeu mécanique) : comme la courbe de volume de Live est très resserrée près
+# de son maximum (+6dB), même 0,2% d'écart peut se traduire par plusieurs dB
+# de moins. On arrondit donc à l'extrême exact en dessous de cette marge.
+FADER_SNAP_MARGIN = 300
 
 # Sens host -> surface (retour vers la console), confirmé par capture MIDI
 # Monitor de Pro Tools (référence HUI) : même schéma zone/port mais décalé de
@@ -82,8 +92,11 @@ class HuiBridge:
         self._port_name: str | None = None
         self._pending_zone: int | None = None
         self._pending_coarse: int | None = None
-        self._mute_state: dict[int, bool] = {}
-        self._track_volume: dict[int, float] = {}
+        self._mute_toggle_state: dict[int, bool] = {}
+        self._mute_sent_state: dict[int, bool] = {}
+        self._track_volume_local: dict[int, float] = {}
+        self._track_volume_local_time: dict[int, float] = {}
+        self._track_volume_sent: dict[int, float] = {}
         self._track_name: dict[int, bytes] = {}
         self._ping_stop = threading.Event()
         self._ping_thread: threading.Thread | None = None
@@ -94,6 +107,28 @@ class HuiBridge:
         names = probe.get_ports()
         del probe
         return names
+
+    @property
+    def channel_offset(self) -> int:
+        return self._channel_offset
+
+    @channel_offset.setter
+    def channel_offset(self, value: int) -> None:
+        """Change à chaud les pistes Live couvertes par ce pont (ex. bascule
+        voies 1-8 <-> 9-16 choisie dans le logiciel). Purge les états locaux
+        indexés par piste : sinon ils resteraient associés aux anciennes
+        pistes et fausseraient la détection d'écho/dédoublonnage."""
+        if value == self._channel_offset:
+            return
+        self._channel_offset = value
+        self._pending_zone = None
+        self._pending_coarse = None
+        self._mute_toggle_state.clear()
+        self._mute_sent_state.clear()
+        self._track_volume_local.clear()
+        self._track_volume_local_time.clear()
+        self._track_volume_sent.clear()
+        self._track_name.clear()
 
     @property
     def port_name(self) -> str | None:
@@ -178,8 +213,8 @@ class HuiBridge:
             pressed = bool(value & PORT_ON_MASK)
             if port == MUTE_PORT:
                 if pressed:  # bascule à l'appui, pas au relâchement
-                    muted = not self._mute_state.get(track, False)
-                    self._mute_state[track] = muted
+                    muted = not self._mute_toggle_state.get(track, False)
+                    self._mute_toggle_state[track] = muted
                     self._log(f"HUI : mute piste {track + 1} -> {muted}")
                     self._live_osc.set_track_mute(track, muted)
             elif port != FADER_PORT:
@@ -193,9 +228,14 @@ class HuiBridge:
         if cc == zone + 32 and self._pending_coarse is not None:  # poids faible (fine)
             raw = (self._pending_coarse << 7) | value
             self._pending_coarse = None
+            if raw >= 16383 - FADER_SNAP_MARGIN:
+                raw = 16383
+            elif raw <= FADER_SNAP_MARGIN:
+                raw = 0
             volume = raw / 16383.0
             self._log(f"HUI : volume piste {track + 1} -> {volume:.3f}")
-            self._track_volume[track] = volume
+            self._track_volume_local[track] = volume
+            self._track_volume_local_time[track] = time.monotonic()
             self._live_osc.set_track_volume(track, volume)
             return
 
@@ -203,14 +243,24 @@ class HuiBridge:
 
     def send_volume_feedback(self, track_index: int, volume: float) -> None:
         """Renvoie vers la console la position de fader réelle d'Ableton pour
-        `track_index` (ignoré si hors de la plage de ce port, ou si c'est
-        juste l'écho de ce qu'on vient nous-même d'envoyer)."""
+        `track_index` (ignoré si hors de la plage de ce port). Juste après un
+        mouvement local, d'anciens retours OSC intermédiaires en retard
+        peuvent encore arriver en rafale : les appliquer ferait reculer le
+        fader physique vers une position dépassée sans toucher au vrai volume
+        dans Live (déjà bon). On les ignore pendant VOLUME_ECHO_HOLDOFF_S,
+        sauf s'ils confirment justement la valeur qu'on vient d'envoyer."""
         zone = track_index - self._channel_offset
         if self._midi_out is None or not 0 <= zone < 8:
             return
-        if abs(volume - self._track_volume.get(track_index, -1.0)) < 1 / 16383.0:
+        is_echo = abs(volume - self._track_volume_local.get(track_index, -1.0)) < 1 / 16383.0
+        recent_local_move = (
+            time.monotonic() - self._track_volume_local_time.get(track_index, 0.0)
+        ) < VOLUME_ECHO_HOLDOFF_S
+        if not is_echo and recent_local_move:
             return
-        self._track_volume[track_index] = volume
+        if abs(volume - self._track_volume_sent.get(track_index, -1.0)) < 1 / 16383.0:
+            return
+        self._track_volume_sent[track_index] = volume
         raw = max(0, min(16383, round(volume * 16383)))
         coarse, fine = raw >> 7, raw & 0x7F
         self._midi_out.send_message([0xB0, zone, coarse])
@@ -218,13 +268,18 @@ class HuiBridge:
 
     def send_mute_feedback(self, track_index: int, muted: bool) -> None:
         """Renvoie vers la console l'état mute réel d'Ableton pour
-        `track_index` (mêmes conditions d'ignorance que send_volume_feedback)."""
+        `track_index` (ignoré si hors de la plage de ce port). Utilise un
+        dict distinct de celui du basculement local (`_mute_toggle_state`) :
+        sinon un appui sur le bouton de la console pré-remplissait la même
+        valeur avant même le retour d'Ableton, et le message MIDI réel
+        (celui qui allume/éteint la LED) n'était jamais envoyé."""
         zone = track_index - self._channel_offset
         if self._midi_out is None or not 0 <= zone < 8:
             return
-        if self._mute_state.get(track_index) == muted:
+        self._mute_toggle_state[track_index] = muted
+        if self._mute_sent_state.get(track_index) == muted:
             return
-        self._mute_state[track_index] = muted
+        self._mute_sent_state[track_index] = muted
         value = MUTE_PORT | (PORT_ON_MASK if muted else 0)
         self._midi_out.send_message([0xB0, ZONE_CC_OUT, zone])
         self._midi_out.send_message([0xB0, PORT_CC_OUT, value])

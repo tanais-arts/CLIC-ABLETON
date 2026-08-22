@@ -269,13 +269,19 @@ class App:
         self._scene_count: int | None = None
         self._scene_name: str = ""
 
+        # -- Métronome de Live (activer/désactiver) : état tenu à jour par
+        # l'abonnement OSC (reflète aussi un changement fait depuis Live). --
+        self._metronome_on: bool = False
+        self.live_osc.start_listen_metronome()
+
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour les 6 boutons (nudge,
         # navigation scènes, stop, lancer la scène) --
         self._controller_queue: "queue.Queue[list[int]]" = queue.Queue()
         self.controller = ControllerListener(self._controller_queue)
-        self._action_order = ["minus", "plus", "scene_prev", "scene_next", "stop", "play"]
+        self._action_order = ["minus", "plus", "scene_prev", "scene_next", "stop", "play", "metronome"]
         self._action_labels = {
             "minus": "−1", "plus": "+1", "scene_prev": "▲", "scene_next": "▼", "stop": "■", "play": "▶",
+            "metronome": "M",
         }
         self._action_commands = {
             "minus": lambda: self._jump_beats(-1),
@@ -284,6 +290,7 @@ class App:
             "scene_next": lambda: self._scene_step(1),
             "stop": self._stop_return_to_start,
             "play": self._scene_launch,
+            "metronome": self._toggle_metronome,
         }
         self.controller_map: dict[str, tuple[str, int, int] | None] = {
             action: _as_key(self.config.get(f"controller_map_{action}"))
@@ -296,6 +303,11 @@ class App:
         # bridge principal = voies 1-8, bridge_2 = voies 9-16 (offset de piste +8).
         self.hui_bridge = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"))
         self.hui_bridge_2 = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), channel_offset=8)
+        # Choix utilisateur (persisté, pas figé dans le code) : inverser quelles
+        # pistes Live sortent sur quel port HUI, ex. pistes 1-8 sur les faders 9-16.
+        self._hui_swap_var = tk.BooleanVar(value=bool(self.config.get("hui_swap_banks", False)))
+        if self._hui_swap_var.get():
+            self.hui_bridge.channel_offset, self.hui_bridge_2.channel_offset = 8, 0
 
         # À la reprise (connecté/en lecture après ne pas l'avoir été), on
         # n'affiche les temps qu'à partir du prochain temps 1 réel, pour ne
@@ -466,6 +478,7 @@ class App:
         add_control("scene_next", "▼")
         add_control("play", "▶")
         add_control("stop", "■")
+        add_control("metronome", "M")
 
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour piloter les mêmes boutons --
         controller_row = tk.Frame(self.root, bg=BG_IDLE)
@@ -518,6 +531,12 @@ class App:
             controller_row_3, text="Connecter", command=self._toggle_hui_connect_2,
         )
         self.hui_connect_btn_2.pack(side="left", padx=2)
+
+        tk.Checkbutton(
+            self.root, text="Inverser les bancs de faders (voies 1-8 ↔ 9-16)",
+            variable=self._hui_swap_var, command=self._toggle_hui_swap, bg=BG_IDLE, fg=FG_TEXT,
+            selectcolor="#333333", activebackground=BG_IDLE, activeforeground=FG_TEXT,
+        ).pack(anchor="w", padx=10, pady=(0, 4))
 
         status_row = tk.Frame(self.root, bg=BG_IDLE)
         status_row.pack(fill="x", padx=10, pady=(0, 4))
@@ -656,20 +675,31 @@ class App:
         self.config["hui_port_2"] = port_name
         save_config(self.config)
 
+    def _toggle_hui_swap(self) -> None:
+        """Bascule quelles pistes Live sortent sur quel port HUI (choix
+        utilisateur persisté, ex. pistes 1-8 sur les faders 9-16 au lieu
+        de 1-8). Ne touche pas aux abonnements OSC : à eux deux, les ponts
+        couvrent toujours les pistes 0-15, seule leur répartition change."""
+        swapped = self._hui_swap_var.get()
+        self.hui_bridge.channel_offset = 8 if swapped else 0
+        self.hui_bridge_2.channel_offset = 0 if swapped else 8
+        self.config["hui_swap_banks"] = swapped
+        save_config(self.config)
+
     def _set_hui_listen(self, channel_offset: int, listen: bool) -> None:
         """Abonne/désabonne aux changements de volume, mute et nom d'Ableton
         pour les 8 pistes couvertes par un pont HUI, pour le retour vers la
-        console (fader/LED mute/nom qui reflètent l'état réel de Live)."""
+        console (fader/LED mute/nom qui reflètent l'état réel de Live).
+        Pas besoin d'un get explicite en plus du start_listen : AbletonOSC
+        renvoie déjà la valeur actuelle immédiatement à l'abonnement (sinon,
+        deux requêtes "état actuel" en vol pouvaient se répondre dans le
+        désordre et renvoyer une valeur périmée juste après un changement
+        réel, provoquant un faux retour en arrière du fader sur la console)."""
         for track in range(channel_offset, channel_offset + 8):
             if listen:
                 self.live_osc.start_listen_track_volume(track)
                 self.live_osc.start_listen_track_mute(track)
                 self.live_osc.start_listen_track_name(track)
-                # start_listen ne renvoie que les changements futurs : on
-                # demande aussi la valeur actuelle pour l'état de départ.
-                self.live_osc.get_track_volume(track)
-                self.live_osc.get_track_mute(track)
-                self.live_osc.get_track_name(track)
             else:
                 self.live_osc.stop_listen_track_volume(track)
                 self.live_osc.stop_listen_track_mute(track)
@@ -866,10 +896,25 @@ class App:
         except OSError as exc:
             self.status_label.config(text=f"Erreur OSC : {exc}")
 
+    def _toggle_metronome(self) -> None:
+        """Bascule le métronome de Live. `self._metronome_on` (mis à jour par
+        l'abonnement OSC) reflète l'état réel, pas seulement nos propres appuis."""
+        try:
+            self.live_osc.set_metronome(not self._metronome_on)
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC : {exc}")
+
     def _poll_scene_replies(self) -> None:
         for address, args in self.live_osc.poll_replies():
             if address == "/live/error":
-                print(f"[OSC] erreur renvoyée par AbletonOSC : {args}")
+                # "Index out of range" est attendu en permanence si le pont
+                # HUI écoute des pistes au-delà du nombre réel de pistes du
+                # projet (ex. 16 canaux HUI pour un projet à moins de 16
+                # pistes) : ce n'est pas une vraie erreur, on ne l'affiche pas.
+                if not any("Index out of range" in str(arg) for arg in args):
+                    print(f"[OSC] erreur renvoyée par AbletonOSC : {args}")
+            elif address == "/live/song/get/metronome":
+                self._metronome_on = bool(args[0])
             elif address == "/live/track/get/volume":
                 track_index, volume = int(args[0]), float(args[1])
                 self.hui_bridge.send_volume_feedback(track_index, volume)

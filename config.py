@@ -26,6 +26,11 @@ DEFAULTS = {
     # C#-2 pour Stop, D-2 pour Lancer la scène (Play).
     "controller_map_stop": ["note", 0, 1],
     "controller_map_play": ["note", 0, 2],
+    # D#-2 pour activer/désactiver le métronome de Live.
+    "controller_map_metronome": ["note", 0, 3],
+    # Si True, inverse les bancs de faders HUI : les pistes 1-8 sortent sur
+    # le port "voies 9-16" et inversement (voir HuiBridge.channel_offset).
+    "hui_swap_banks": False,
 }
 
 
