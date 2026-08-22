@@ -91,6 +91,17 @@ _PAGE = """<!DOCTYPE html>
     min-height: 1em;
   }
   #sceneName.launched { color: #3ddc57; font-size: 5.25vh; }
+  #barCount {
+    flex: 0 0 auto; margin-top: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 5vh; font-weight: bold; color: #bbbbbb;
+    min-height: 1em;
+  }
+  #offline {
+    display: none;
+    font-size: 10vh; font-weight: bold; color: #ff4d4d;
+    -webkit-user-select: none; user-select: none;
+  }
   #info {
     flex: 0 0 auto; margin-bottom: 6px;
     display: flex; align-items: center; justify-content: center;
@@ -122,8 +133,10 @@ _PAGE = """<!DOCTYPE html>
   <div id="beat">
     <div id="dot">•</div>
     <div id="digit"></div>
+    <div id="offline">OFFLINE</div>
     <div id="scrollLine"><div id="scrollThumb"></div></div>
   </div>
+  <div id="barCount"></div>
   <div id="sceneName"></div>
   <div id="info">-- BPM</div>
 <script>
@@ -230,6 +243,16 @@ async function poll() {
     const res = await fetch('/state?latency_ms=' + slider.value, {cache: 'no-store'});
     const data = await res.json();
     const infoEl = document.getElementById('info');
+    const offlineEl = document.getElementById('offline');
+    if (data.offline) {
+      dotEl.style.display = 'none';
+      digitEl.style.display = 'none';
+      scrollLineEl.style.display = 'none';
+      offlineEl.style.display = 'block';
+      lastBeat = null;
+      return;
+    }
+    offlineEl.style.display = 'none';
     if (data.connected) {
       dotEl.style.display = 'none';
       scrollLineEl.style.display = 'none';
@@ -274,6 +297,7 @@ async function poll() {
     }
     document.getElementById('sceneName').textContent = data.scene_name || '';
     document.getElementById('sceneName').classList.toggle('launched', !!data.scene_launched);
+    document.getElementById('barCount').textContent = data.bar_count ? ('Mes. ' + data.bar_count) : '';
     if (data.scene_launched && !lastSceneLaunched) {
       sceneFlashDouble();
     }
@@ -334,6 +358,8 @@ class SharedBeatState:
         }
         self._scene_name = ""
         self._scene_launched = False
+        self._bar_count: int | None = None
+        self._offline = False
 
     def update(
         self, phase: float, beats_per_bar: float, bpm: float | None,
@@ -365,12 +391,27 @@ class SharedBeatState:
         with self._lock:
             self._scene_launched = launched
 
+    def set_bar_count(self, bar_count: int | None) -> None:
+        """Numéro de mesure depuis le lancement du morceau en cours (voir
+        beat_display._update_bar_count), None = rien à afficher."""
+        with self._lock:
+            self._bar_count = bar_count
+
+    def set_offline(self) -> None:
+        """Signale la fermeture imminente de CLIC : affiche OFFLINE sur la
+        page web à la place des chiffres/de la ligne, avant même que le
+        serveur web ne s'arrête réellement (voir BeatDisplayApp.on_close)."""
+        with self._lock:
+            self._offline = True
+
     def compute(self, latency_ms: float = 0.0) -> dict:
         """Calcule {beat, bpm, connected, running, mode} pour un décalage donné."""
         with self._lock:
             data = dict(self._data)
             scene_name = self._scene_name
             scene_launched = self._scene_launched
+            bar_count = self._bar_count
+            offline = self._offline
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
         elapsed_ms = (time.monotonic() - data["ref_monotonic"]) * 1000.0
@@ -387,6 +428,8 @@ class SharedBeatState:
             "connected": data["connected"], "running": data["running"], "mode": data["mode"],
             "scene_name": scene_name,
             "scene_launched": scene_launched,
+            "bar_count": bar_count,
+            "offline": offline,
         }
 
 

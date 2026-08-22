@@ -314,11 +314,24 @@ class App:
         # pas commencer au milieu d'une mesure.
         self._was_connected = False
         self._awaiting_downbeat = False
+        # Avertissement "0 pair Link" (voir _update_link_peers_label) : une
+        # boîte de dialogue s'ouvre après 5s sans pair, et se referme toute
+        # seule dès qu'un pair est détecté (ou reste fermée si l'utilisateur
+        # l'a fermée manuellement entretemps, jusqu'à la prochaine coupure).
+        self._link_zero_peers_since: float | None = None
+        self._link_dialog: tk.Toplevel | None = None
+        self._link_dialog_shown = False
         # Dernier tempo connu, pour animer la ligne de défilement à l'arrêt
         # (même quand la source ne fournit plus de temps courant fiable).
         self._last_bpm: float | None = None
         # Flash blanc ponctuel du canvas au lancement d'une scène.
         self._scene_flash_start: float = 0.0
+        # Compteur de mesures depuis le lancement du morceau en cours (voir
+        # _scene_launch/_update_bar_count) : None = pas de comptage affiché.
+        # Les scènes "tempo seul" (chiffres) ne déclenchent jamais ce compte.
+        self._bar_count: int | None = None
+        self._awaiting_bar_start = False
+        self._bar_count_prev_beat: int | None = None
         # Détection de la présence de Live/AbletonOSC (voir _ping_live) : si
         # CLIC démarre avant Live, les abonnements OSC envoyés au tout début
         # (start_listen_track_*, métronome) se perdent (personne n'écoute
@@ -427,6 +440,12 @@ class App:
         # -- Affichage principal du temps : un carré, gros pour 1/3, petit pour 2/4 --
         self.display = tk.Canvas(self.root, bg=BG_IDLE, highlightthickness=0)
         self.display.pack(expand=True, fill="both", padx=10, pady=4)
+
+        # -- Compteur de mesures depuis le lancement du morceau en cours --
+        self.bar_count_label = tk.Label(
+            self.root, text="", bg=BG_IDLE, fg=FG_TEXT, font=("Helvetica", 16, "bold"),
+        )
+        self.bar_count_label.pack(fill="x", padx=10, pady=(0, 2))
 
         # -- Nom de la scène en cours, détaché des boutons de navigation --
         # Jaune = scène sélectionnée mais pas encore lancée, vert = lancée.
@@ -955,6 +974,13 @@ class App:
         self.scene_name_label.config(fg=SCENE_NOT_LAUNCHED)
         self.shared_state.set_scene_name("À SUIVRE")
         self.shared_state.set_scene_launched(False)
+        # Changer de sélection annule le comptage de mesures en cours : il ne
+        # doit reprendre qu'au lancement réel de la scène qui sera affichée.
+        self._bar_count = None
+        self._bar_count_prev_beat = None
+        self._awaiting_bar_start = False
+        self.bar_count_label.config(text="")
+        self.shared_state.set_bar_count(None)
         try:
             self.live_osc.set_selected_scene(new_index)
             self.live_osc.get_scene_name(new_index)
@@ -988,6 +1014,13 @@ class App:
                 self.shared_state.set_scene_name(self._scene_name)
                 self.shared_state.set_scene_launched(True)
                 self._scene_flash_start = time.monotonic()
+                # Le compteur de mesures démarre au premier vrai temps 1 qui
+                # suit ce lancement (voir _update_bar_count), pas à l'appui.
+                self._bar_count = None
+                self._bar_count_prev_beat = None
+                self._awaiting_bar_start = True
+                self.bar_count_label.config(text="")
+                self.shared_state.set_bar_count(None)
         except OSError as exc:
             self.scene_name_label.config(text=f"Erreur OSC : {exc}")
 
@@ -1094,6 +1127,67 @@ class App:
         self.shared_state.set_scene_name(web_name)
 
     # -------------------------------------------------------- Boucle poll --
+    def _update_link_peers_label(self, num_peers: int) -> None:
+        """CLIC ne peut pas activer Link à la place de l'utilisateur dans
+        Live (réglage interne à Live, non exposé par l'API Link ni par
+        AbletonOSC) : on se contente d'avertir immédiatement si 0 pair."""
+        if num_peers >= 1:
+            self.link_peers_label.config(text=f"Pairs Link connectés : {num_peers}", fg=FG_TEXT)
+            self._link_zero_peers_since = None
+            self._link_dialog_shown = False
+            self._close_link_dialog()
+            return
+        self.link_peers_label.config(
+            text="Pairs Link connectés : 0 — active Link dans Ableton Live "
+            "(Préférences > Link/Tempo/MIDI)",
+            fg=SCENE_NOT_LAUNCHED,
+        )
+        if self._link_zero_peers_since is None:
+            self._link_zero_peers_since = time.monotonic()
+        if not self._link_dialog_shown and time.monotonic() - self._link_zero_peers_since > 5.0:
+            self._link_dialog_shown = True
+            self._show_link_dialog()
+
+    def _show_link_dialog(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Link non détecté")
+        dialog.configure(bg=BG_IDLE)
+        tk.Label(
+            dialog, bg=BG_IDLE, fg=FG_TEXT, justify="left", wraplength=360, font=("Helvetica", 13),
+            text="Aucun pair Link détecté depuis 5 secondes.\n\n"
+            "Active Link dans Ableton Live (Préférences > Link/Tempo/MIDI).\n\n"
+            "Cette fenêtre se referme automatiquement dès qu'un pair est détecté.",
+        ).pack(padx=20, pady=(20, 10))
+        tk.Button(dialog, text="Fermer", command=self._close_link_dialog).pack(pady=(0, 16))
+        dialog.protocol("WM_DELETE_WINDOW", self._close_link_dialog)
+        self._link_dialog = dialog
+
+    def _close_link_dialog(self) -> None:
+        if self._link_dialog is not None:
+            self._link_dialog.destroy()
+            self._link_dialog = None
+
+    def _update_bar_count(self, connected: bool, beat: int) -> None:
+        """Compte les mesures depuis le premier vrai temps 1 qui suit le
+        lancement du morceau en cours (armé par _scene_launch pour les vraies
+        scènes uniquement, jamais pour les scènes "tempo seul"/préparation)."""
+        if not connected:
+            self._bar_count_prev_beat = None
+            return
+        if self._awaiting_bar_start:
+            if beat == 1:
+                self._awaiting_bar_start = False
+                self._bar_count = 1
+                self._bar_count_prev_beat = 1
+                self.bar_count_label.config(text="Mesure 1")
+                self.shared_state.set_bar_count(1)
+            return
+        if self._bar_count is not None and beat == 1 and self._bar_count_prev_beat != 1:
+            self._bar_count += 1
+            self.bar_count_label.config(text=f"Mesure {self._bar_count}")
+            self.shared_state.set_bar_count(self._bar_count)
+        self._bar_count_prev_beat = beat
+
     def _poll(self) -> None:
         self._poll_controller()
         self._poll_scene_replies()
@@ -1116,6 +1210,7 @@ class App:
                 self._awaiting_downbeat = False
             running = connected  # présence réelle du clock, avant masquage
             connected = connected and not self._awaiting_downbeat
+            self._update_bar_count(connected, beat)
             self._update_display(beat, self.midi_state.beats_per_bar, phase % 1.0, self.midi_state.bpm, connected, running)
             self.shared_state.update(
                 self.midi_state.phase(), self.midi_state.beats_per_bar,
@@ -1138,8 +1233,9 @@ class App:
                 if connected and self._awaiting_downbeat and beat == 1:
                     self._awaiting_downbeat = False
                 connected = connected and not self._awaiting_downbeat
+                self._update_bar_count(connected, beat)
                 self._update_display(beat, int(quantum), phase % 1.0, snapshot["bpm"], connected, snapshot["is_playing"])
-                self.link_peers_label.config(text=f"Pairs Link connectés : {link.num_peers}")
+                self._update_link_peers_label(link.num_peers)
                 self.shared_state.update(
                     snapshot["phase"], quantum, snapshot["bpm"], connected, snapshot["is_playing"], "link",
                 )
@@ -1247,6 +1343,7 @@ class App:
 
     def on_close(self) -> None:
         save_config(self.config)
+        self._close_link_dialog()
         self.listener.close()
         if self.link is not None:
             self.link.close()
@@ -1254,6 +1351,11 @@ class App:
         self.controller.close()
         self.hui_bridge.close()
         self.hui_bridge_2.close()
+        # Affiche OFFLINE sur la page web avant de couper le serveur : sans
+        # ça, la page reste figée sur le dernier chiffre/ligne affiché sans
+        # prévenir que CLIC a quitté (la page web poll toutes les 60ms).
+        self.shared_state.set_offline()
+        time.sleep(0.4)
         self.web_server.stop()
         self.root.destroy()
 
@@ -1262,6 +1364,9 @@ def main() -> None:
     root = tk.Tk()
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
+    # Sur macOS, Cmd+Q (menu appli) n'envoie pas WM_DELETE_WINDOW : sans ce
+    # remplacement, on_close (donc le message OFFLINE côté web) est sauté.
+    root.createcommand("::tk::mac::Quit", app.on_close)
     root.mainloop()
 
 
