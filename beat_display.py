@@ -375,10 +375,6 @@ class App:
         # changement externe (autre pair Link, ex. Live), voir
         # _on_link_tempo_observed/_update_tempo_display.
         self._tempo_last_sent_bpm: float | None = None
-        # Empêche _set_tempo de renvoyer à Link une valeur que l'on vient
-        # nous-même d'écrire dans le champ suite à un changement externe (voir
-        # _update_tempo_display).
-        self._suspend_tempo_send = False
         # Horodatages pour _poll_tempo_fader_keepalive : dernier geste de la
         # main sur le fader 16 (holdoff) et dernier renvoi de sa position.
         self._tempo_fader_local_time = 0.0
@@ -497,14 +493,18 @@ class App:
 
         tk.Label(self.link_frame, text="  Régler le tempo :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", pady=(6, 0))
         self.set_tempo_var = tk.DoubleVar(value=120.0)
-        # Envoi en temps réel : chaque changement (flèches, saisie clavier ou
-        # fader 16 dédié, voir _apply_tempo_fader) déclenche _set_tempo, pas
-        # de bouton "Envoyer" à part.
-        self.set_tempo_var.trace_add("write", lambda *_args: self._set_tempo())
-        tk.Spinbox(
+        # Envoi seulement à la validation (flèches, Entrée ou perte du focus),
+        # jamais à chaque touche tapée : sinon chaque état intermédiaire de la
+        # saisie (ex. curseur pas en fin de champ) part vers Link/Live, qui
+        # peut le rejeter/clamper (tempo max 999) et écraser ce qu'on tape.
+        self.tempo_spinbox = tk.Spinbox(
             self.link_frame, from_=0.0, to=500.0, increment=0.1, width=6,
-            textvariable=self.set_tempo_var,
-        ).pack(side="left", padx=(4, 4), pady=(6, 0))
+            textvariable=self.set_tempo_var, command=self._set_tempo,
+        )
+        self.tempo_spinbox.pack(side="left", padx=(4, 4), pady=(6, 0))
+        self.tempo_spinbox.bind("<Return>", lambda _event: self._set_tempo())
+        self.tempo_spinbox.bind("<KP_Enter>", lambda _event: self._set_tempo())
+        self.tempo_spinbox.bind("<FocusOut>", lambda _event: self._set_tempo())
 
         tk.Label(self.link_frame, text="  Plage fader 16 :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", pady=(6, 0))
         range_labels = [label for label, _key in self.TEMPO_RANGE_OPTIONS]
@@ -1047,11 +1047,10 @@ class App:
     def _set_tempo(self) -> None:
         """Impose le tempo choisi à tous les pairs Link (dont Ableton Live) en
         temps réel, à chaque changement du champ (voir trace_add dans _build_ui) —
-        le champ n'est visible qu'en mode Link. Ignoré quand le champ vient
-        d'être mis à jour par _update_tempo_display (écho d'un changement
-        externe), pour ne pas le renvoyer inutilement à Link."""
-        if self._suspend_tempo_send:
-            return
+        le champ n'est visible qu'en mode Link. Déclenché uniquement à la
+        validation (flèches, Entrée, perte du focus) ou par un mouvement du
+        fader 16 (_apply_tempo_fader/_reset_tempo_fader) : jamais à chaque
+        touche tapée (voir _build_ui)."""
         try:
             bpm = float(self.set_tempo_var.get())
         except (tk.TclError, ValueError):
@@ -1067,7 +1066,11 @@ class App:
         tempo changé à la souris dans Live, ou par un autre pair) : ignore les
         échos de notre propre dernier envoi (_tempo_last_sent_bpm) pour éviter
         une boucle, et n'écrit dans le champ que si la valeur diffère
-        réellement de ce qui y est déjà affiché."""
+        réellement de ce qui y est déjà affiché. Ne touche jamais au champ
+        pendant que l'utilisateur y tape (sinon le poll, ~30ms, écraserait sa
+        saisie en cours avant même qu'il ait pu valider)."""
+        if self.tempo_spinbox.focus_get() is self.tempo_spinbox:
+            return
         if self._tempo_last_sent_bpm is not None and abs(bpm - self._tempo_last_sent_bpm) < 0.05:
             return
         try:
@@ -1076,11 +1079,7 @@ class App:
             current = None
         if current is not None and abs(bpm - current) < 0.05:
             return
-        self._suspend_tempo_send = True
-        try:
-            self.set_tempo_var.set(round(bpm, 1))
-        finally:
-            self._suspend_tempo_send = False
+        self.set_tempo_var.set(round(bpm, 1))
 
     def _update_tempo_reference(self, bpm: float) -> None:
         """Tient à jour le tempo de référence ("morceau chargé sans
@@ -1130,8 +1129,8 @@ class App:
         frac = max(-1.0, min(1.0, (raw - 8191.5) / 8191.5))
         reference = self._tempo_reference_bpm if self._tempo_reference_bpm else 120.0
         new_bpm = reference * (1.0 + frac * pct)
-        self._tempo_last_sent_bpm = new_bpm
         self.set_tempo_var.set(round(new_bpm, 1))
+        self._set_tempo()
         self._tempo_fader_local_time = time.monotonic()
         # Réaffirme tout de suite la position que la main vient de donner :
         # sans cet écho, la console reprend le fader vers la dernière cible
@@ -1218,8 +1217,8 @@ class App:
         origin = self._scene_origin_tempo if self._scene_origin_tempo is not None else self._tempo_reference_bpm
         if origin is None:
             return
-        self._tempo_last_sent_bpm = origin
         self.set_tempo_var.set(round(origin, 1))
+        self._set_tempo()
 
     def _jump_beats(self, beats: int) -> None:
         """Décale de `beats` temps le clip en cours de lecture de chaque

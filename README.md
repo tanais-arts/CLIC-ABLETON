@@ -39,8 +39,9 @@ pip install -r requirements.txt
    affiche le temps un peu en avance). Ce réglage est mémorisé automatiquement
    (fichier `config.json`) : le batteur n'a jamais besoin d'y toucher.
 6. **Régler le tempo** : saisir la valeur voulue dans le champ "Régler le
-   tempo" — elle est envoyée en temps réel (à chaque changement, flèches ou
-   clavier) à toute la session Link (Live inclus), pas de bouton à part.
+   tempo" — elle est envoyée à toute la session Link (Live inclus) à la
+   validation (flèches, touche Entrée ou en cliquant ailleurs), pas à chaque
+   touche tapée (pour ne pas envoyer un nombre incomplet pendant la saisie).
    Nécessite au moins un pair Link connecté (Live doit avoir Link activé)
    pour que le changement soit pris en compte.
 7. **Régler le tempo au fader 16 (Yamaha 01V96V2, façon pitch de platine
