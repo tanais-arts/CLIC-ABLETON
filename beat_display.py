@@ -259,10 +259,14 @@ class App:
     # Tranche HUI (0-7) réservée au tempo sur le 2e port MIDI (channel_offset=8),
     # donc canal physique 16 = 8 + 7 + 1. Voir _apply_tempo_fader.
     TEMPO_FADER_ZONE = 7
+    # Position brute (0-16383) du fader 16 correspondant à 0% de modification
+    # du tempo (centre de course) : 0 = -X%, 16383 = +X%, X selon la plage
+    # choisie (Plage fader 16). Envoyée une fois au lancement de chaque scène.
+    TEMPO_FADER_CENTER_RAW = 8192
     # Options de plage du fader 16 : (libellé affiché, clé persistée en config).
     TEMPO_RANGE_OPTIONS = [
         ("± 3 %", "3"), ("± 6 %", "6"), ("± 10 %", "10"), ("± 20 %", "20"),
-        ("Libre (0-500 BPM)", "free"),
+        ("± 100 %", "100"),
     ]
 
     def __init__(self, root: tk.Tk):
@@ -1101,21 +1105,16 @@ class App:
     def _apply_tempo_fader(self, raw: int) -> None:
         """Traduit la position brute (0-16383) du fader 16, façon pitch de
         platine Pioneer DJ MK2 : au centre (~8192) le tempo de référence est
-        inchangé, monter/descendre l'augmente/diminue. En mode pourcentage,
-        la plage couvre toute la course du fader ; en mode "free", le fader
-        représente un tempo absolu de 0 (tout en bas) à 500 BPM (tout en haut),
-        indépendant du morceau chargé."""
+        inchangé, monter/descendre l'augmente/diminue sur la plage choisie
+        (± 3/6/10/20/100 % autour du tempo de référence)."""
         mode = self.config.get("tempo_fader_range", "6")
-        if mode == "free":
-            new_bpm = (raw / 16383.0) * 500.0
-        else:
-            try:
-                pct = float(mode) / 100.0
-            except ValueError:
-                pct = 0.06
-            frac = max(-1.0, min(1.0, (raw - 8191.5) / 8191.5))
-            reference = self._tempo_reference_bpm if self._tempo_reference_bpm else 120.0
-            new_bpm = reference * (1.0 + frac * pct)
+        try:
+            pct = float(mode) / 100.0
+        except ValueError:
+            pct = 0.06
+        frac = max(-1.0, min(1.0, (raw - 8191.5) / 8191.5))
+        reference = self._tempo_reference_bpm if self._tempo_reference_bpm else 120.0
+        new_bpm = reference * (1.0 + frac * pct)
         self._tempo_last_sent_bpm = new_bpm
         self.set_tempo_var.set(round(new_bpm, 1))
 
@@ -1267,6 +1266,9 @@ class App:
             return
         try:
             self.live_osc.fire_scene(self._scene_index)
+            # Fader 16 remis à 0% de modification (position centrale) à
+            # chaque lancement de scène, feuille de morceau ou tempo seul.
+            self.hui_bridge_2.send_tempo_fader_feedback(self.TEMPO_FADER_CENTER_RAW)
             # Convention "tempo seul" : une scène nommée juste avec des
             # chiffres ne contient pas de clip, donc fire() ne démarre pas le
             # transport tout seul — on le déclenche explicitement. Ce n'est

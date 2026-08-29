@@ -34,8 +34,8 @@ DEFAULTS = {
     # Diagonale par défaut (piste 1 -> tranche 1, etc.), modifiable dans
     # l'interface ("Configurer le mapping des faders…").
     "hui_track_mapping": [min(i, 14) for i in range(16)],
-    # Plage du fader 16 dédié au tempo : "3"/"6"/"10"/"20" (pourcentage autour
-    # du tempo de référence) ou "free" (0-500 BPM absolu, sans référence).
+    # Plage du fader 16 dédié au tempo : "3"/"6"/"10"/"20"/"100" (pourcentage
+    # autour du tempo de référence).
     "tempo_fader_range": "6",
 }
 

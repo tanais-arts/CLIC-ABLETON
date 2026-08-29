@@ -321,6 +321,17 @@ class HuiBridge:
         self._midi_out.send_message([0xB0, zone, coarse])
         self._midi_out.send_message([0xB0, zone + 32, fine])
 
+    def send_tempo_fader_feedback(self, raw: int) -> None:
+        """Positionne la tranche tempo (`tempo_zone`) à la valeur brute donnée
+        (0-16383). N'est appelée qu'une fois par lancement de scène (voir
+        beat_display.py), jamais en boucle : pas de rappel/keepalive."""
+        if self._midi_out is None or self._tempo_zone is None:
+            return
+        raw = max(0, min(16383, raw))
+        coarse, fine = raw >> 7, raw & 0x7F
+        self._midi_out.send_message([0xB0, self._tempo_zone, coarse])
+        self._midi_out.send_message([0xB0, self._tempo_zone + 32, fine])
+
     def send_mute_feedback(self, track_index: int, muted: bool) -> None:
         """Renvoie vers la console l'état mute réel d'Ableton pour
         `track_index` (ignoré si hors de la plage de ce port). Utilise un

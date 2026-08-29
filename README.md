@@ -52,8 +52,10 @@ pip install -r requirements.txt
    augmente le tempo, le baisser le diminue. La plage couverte par toute la
    course du fader se règle avec le menu déroulant "Plage fader 16" à côté du
    champ de tempo : **± 3 %**, **± 6 %** (par défaut), **± 10 %**, **± 20 %**
-   autour du tempo de référence, ou **Libre (0-500 BPM)** pour un tempo
-   absolu (0 tout en bas, 500 tout en haut, indépendant du morceau chargé).
+   ou **± 100 %** autour du tempo de référence. À chaque lancement de scène
+   (feuille de morceau ou tempo seul), le logiciel replace lui-même le fader
+   physique à sa position centrale (0% de modification), sans jamais y
+   toucher entre deux lancements.
    Le tempo de référence se remet à jour automatiquement dès qu'un
    changement de tempo ne provenant pas du fader est détecté (ex. nouveau
    morceau/scène, réglage manuel dans Live). Le champ de tempo reflète aussi
