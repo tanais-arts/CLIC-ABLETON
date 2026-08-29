@@ -54,8 +54,13 @@ pip install -r requirements.txt
    champ de tempo : **± 3 %**, **± 6 %** (par défaut), **± 10 %**, **± 20 %**
    ou **± 100 %** autour du tempo de référence. À chaque lancement de scène
    (feuille de morceau ou tempo seul), le logiciel replace lui-même le fader
-   physique à sa position centrale (0% de modification), sans jamais y
-   toucher entre deux lancements.
+   physique à sa position centrale (0% de modification). Entre deux
+   lancements, le logiciel réaffirme périodiquement au fader la position
+   correspondant au tempo affiché (qu'il vienne de Live, du champ de tempo ou
+   du fader lui-même) : les faders HUI motorisés reviennent tout seuls à leur
+   dernière position confirmée si on ne le fait pas, sans que ça change le
+   tempo. Un geste récent de la main sur le fader garde toujours la priorité
+   (pas de renvoi pendant 1,5s après un mouvement).
    Le tempo de référence se remet à jour automatiquement dès qu'un
    changement de tempo ne provenant pas du fader est détecté (ex. nouveau
    morceau/scène, réglage manuel dans Live). Le champ de tempo reflète aussi

@@ -263,6 +263,13 @@ class App:
     # du tempo (centre de course) : 0 = -X%, 16383 = +X%, X selon la plage
     # choisie (Plage fader 16). Envoyée une fois au lancement de chaque scène.
     TEMPO_FADER_CENTER_RAW = 8192
+    # Faders HUI motorisés : sans confirmation périodique de sa position, la
+    # console y ramène le fader tout seul (moteur), sans changer le tempo
+    # (voir _poll_tempo_fader_keepalive). On laisse la main de l'utilisateur
+    # gagner pendant HOLDOFF_S après son dernier geste, puis on renvoie la
+    # position au tempo affiché toutes les INTERVAL_S.
+    TEMPO_FADER_KEEPALIVE_HOLDOFF_S = 1.5
+    TEMPO_FADER_KEEPALIVE_INTERVAL_S = 1.0
     # Options de plage du fader 16 : (libellé affiché, clé persistée en config).
     TEMPO_RANGE_OPTIONS = [
         ("± 3 %", "3"), ("± 6 %", "6"), ("± 10 %", "10"), ("± 20 %", "20"),
@@ -372,6 +379,10 @@ class App:
         # nous-même d'écrire dans le champ suite à un changement externe (voir
         # _update_tempo_display).
         self._suspend_tempo_send = False
+        # Horodatages pour _poll_tempo_fader_keepalive : dernier geste de la
+        # main sur le fader 16 (holdoff) et dernier renvoi de sa position.
+        self._tempo_fader_local_time = 0.0
+        self._tempo_fader_refresh_time = 0.0
 
         # À la reprise (connecté/en lecture après ne pas l'avoir été), on
         # n'affiche les temps qu'à partir du prochain temps 1 réel, pour ne
@@ -1117,6 +1128,39 @@ class App:
         new_bpm = reference * (1.0 + frac * pct)
         self._tempo_last_sent_bpm = new_bpm
         self.set_tempo_var.set(round(new_bpm, 1))
+        self._tempo_fader_local_time = time.monotonic()
+
+    def _tempo_fader_raw_for_bpm(self, bpm: float) -> int:
+        """Inverse de _apply_tempo_fader : position brute (0-16383) du fader
+        16 correspondant au tempo donné, sur la plage actuellement choisie."""
+        mode = self.config.get("tempo_fader_range", "6")
+        try:
+            pct = float(mode) / 100.0
+        except ValueError:
+            pct = 0.06
+        reference = self._tempo_reference_bpm if self._tempo_reference_bpm else 120.0
+        frac = (bpm / reference - 1.0) / pct if pct and reference else 0.0
+        frac = max(-1.0, min(1.0, frac))
+        return max(0, min(16383, round(8191.5 + frac * 8191.5)))
+
+    def _poll_tempo_fader_keepalive(self) -> None:
+        """Réaffirme périodiquement au fader 16 la position correspondant au
+        tempo actuellement affiché (Live, logiciel ou fader lui-même), pour
+        contrer le retour automatique du moteur de la console en l'absence de
+        confirmation MIDI — sans jamais lutter contre un geste récent de la
+        main (voir TEMPO_FADER_KEEPALIVE_HOLDOFF_S/INTERVAL_S)."""
+        now = time.monotonic()
+        if now - self._tempo_fader_local_time < self.TEMPO_FADER_KEEPALIVE_HOLDOFF_S:
+            return
+        if now - self._tempo_fader_refresh_time < self.TEMPO_FADER_KEEPALIVE_INTERVAL_S:
+            return
+        try:
+            bpm = float(self.set_tempo_var.get())
+        except (tk.TclError, ValueError):
+            return
+        raw = self._tempo_fader_raw_for_bpm(bpm)
+        self.hui_bridge_2.send_tempo_fader_feedback(raw)
+        self._tempo_fader_refresh_time = now
 
     def _poll_tempo_reset(self) -> None:
         """Consomme les demandes de rappel du tempo d'origine (bouton Mute de
@@ -1269,6 +1313,7 @@ class App:
             # Fader 16 remis à 0% de modification (position centrale) à
             # chaque lancement de scène, feuille de morceau ou tempo seul.
             self.hui_bridge_2.send_tempo_fader_feedback(self.TEMPO_FADER_CENTER_RAW)
+            self._tempo_fader_refresh_time = time.monotonic()
             # Convention "tempo seul" : une scène nommée juste avec des
             # chiffres ne contient pas de clip, donc fire() ne démarre pas le
             # transport tout seul — on le déclenche explicitement. Ce n'est
@@ -1523,6 +1568,7 @@ class App:
         self._poll_controller()
         self._poll_scene_replies()
         self._poll_tempo_fader()
+        self._poll_tempo_fader_keepalive()
         self._poll_tempo_reset()
         if self.mode_var.get() == "midi":
             try:
