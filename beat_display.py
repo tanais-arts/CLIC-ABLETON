@@ -15,6 +15,7 @@ from __future__ import annotations
 import queue
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
 
 import rtmidi
@@ -23,6 +24,7 @@ from config import load_config, save_config
 from hui_bridge import HuiBridge
 from link_client import AbletonLink, LinkUnavailable
 from live_osc import LiveOSC
+from scene_sheet import SceneSheet, SceneSheetRow, load_scene_sheet
 from web_server import BeatWebServer, SharedBeatState, project_phase
 
 CLOCK = 0xF8
@@ -35,6 +37,8 @@ TICKS_PER_QUARTER = 24
 BG_IDLE = "#1e1e1e"
 FLASH_YELLOW = "#f5c518"
 FLASH_BLUE = "#2b4bff"  # bleu outremer
+FLASH_HIGHLIGHT = "#ff2b2b"  # fond ET chiffres/dots : mesure HIGHLIGHT (scene_sheet.py)
+HIGHLIGHT_SIZE_SCALE = 1.5  # chiffres/dots 50% plus grands sur une mesure HIGHLIGHT
 SCENE_NOT_LAUNCHED = "#ff4d4d"  # rouge : scène sélectionnée, pas encore lancée (identique au web)
 SCENE_LAUNCHED = "#3ddc57"  # vert : scène lancée
 SCENE_FLASH_WHITE = "#ffffff"
@@ -93,6 +97,17 @@ class ClockListener:
     def _callback(self, event, _data=None) -> None:
         message, delta_time = event
         self._queue.put((message, delta_time, time.perf_counter()))
+
+
+def _describe_controller_message(message: list[int], key: tuple[str, int, int] | None) -> str:
+    """Description lisible d'un message reçu du contrôleur MIDI (log terminal,
+    pour identifier quel bouton/encodeur physique correspond à quel CC/note)."""
+    if key is None:
+        return f"message brut non reconnu : {message}"
+    kind, channel, number = key
+    kind_label = "Note" if kind == "note" else "CC"
+    value = message[2] if len(message) > 2 else "?"
+    return f"{kind_label} {number} (canal {channel + 1}), valeur={value}"
 
 
 def _controller_key(message: list[int]) -> tuple[str, int, int] | None:
@@ -238,6 +253,18 @@ class BeatState:
 
 
 class App:
+    # Dossier où chercher <nom de scène>.xlsx (voir scene_sheet.py) : à côté du
+    # script, comme le fichier d'exemple Viser.xlsx.
+    SCENE_SHEET_DIR = Path(__file__).resolve().parent
+    # Tranche HUI (0-7) réservée au tempo sur le 2e port MIDI (channel_offset=8),
+    # donc canal physique 16 = 8 + 7 + 1. Voir _apply_tempo_fader.
+    TEMPO_FADER_ZONE = 7
+    # Options de plage du fader 16 : (libellé affiché, clé persistée en config).
+    TEMPO_RANGE_OPTIONS = [
+        ("± 3 %", "3"), ("± 6 %", "6"), ("± 10 %", "10"), ("± 20 %", "20"),
+        ("Libre (0-500 BPM)", "free"),
+    ]
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Compteur de temps - Ableton Live")
@@ -268,6 +295,11 @@ class App:
         self._scene_index: int | None = None
         self._scene_count: int | None = None
         self._scene_name: str = ""
+        # Tempo d'origine du morceau en cours, lu dans le nom de la scène qui
+        # précède la scène du morceau (convention du set : ex. morceau "OVLM"
+        # précédé d'une scène nommée "100") — voir _poll_scene_replies (peek
+        # arrière) et le rappel du fader 16 (bouton Mute, _reset_tempo_fader).
+        self._scene_origin_tempo: float | None = None
 
         # -- Métronome de Live (activer/désactiver) : état tenu à jour par
         # l'abonnement OSC (reflète aussi un changement fait depuis Live). --
@@ -301,19 +333,55 @@ class App:
         # -- Pont HUI -> OSC (ex. Yamaha 01V96V2) pour faders/mutes des pistes --
         # La console répartit ses 16 voies sur 2 ports MIDI (8 tranches chacun).
         # Mapping piste Live <-> tranche HUI choisi par l'utilisateur (persisté,
-        # diagonale 1<->1 par défaut) : voir _open_hui_mapping_dialog.
+        # diagonale 1<->1 par défaut) : voir _open_hui_mapping_dialog. Le
+        # fader 16 (tranche 7 du 2e port) est réservé au tempo (voir
+        # TEMPO_FADER_ZONE/_apply_tempo_fader), donc exclu du mapping/clampé.
         self._track_mapping: list[int] = list(self.config.get("hui_track_mapping", list(range(16))))
         if len(self._track_mapping) != 16:
             self._track_mapping = list(range(16))
+        self._track_mapping = [min(v, 14) for v in self._track_mapping]
         zone_map_1, zone_map_2 = self._hui_zone_maps(self._track_mapping)
         self.hui_bridge = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_1)
-        self.hui_bridge_2 = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_2)
+        # File des positions brutes (0-16383) du fader 16, remplie depuis le
+        # thread MIDI de hui_bridge_2, consommée dans _poll (thread Tk) via
+        # _poll_tempo_fader — jamais de widget Tk touché hors du thread principal.
+        self._tempo_fader_queue: "queue.Queue[int]" = queue.Queue()
+        # Envoi simple (pas un bascule) du bouton Mute de la tranche tempo :
+        # demande de rappel du tempo d'origine du morceau, appliquée au
+        # prochain temps (voir _poll_tempo_reset/_schedule_tempo_reset).
+        self._tempo_reset_queue: "queue.Queue[None]" = queue.Queue()
+        self._tempo_reset_after_id: str | None = None
+        self.hui_bridge_2 = HuiBridge(
+            self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_2,
+            tempo_zone=self.TEMPO_FADER_ZONE, on_tempo_fader=self._tempo_fader_queue.put,
+            on_tempo_reset=lambda: self._tempo_reset_queue.put(None),
+        )
+        # Tempo de référence ("morceau chargé sans modification", position
+        # centrale du fader 16) : voir _on_link_tempo_observed/_apply_tempo_fader.
+        self._tempo_reference_bpm: float | None = None
+        # Dernier BPM que NOUS avons envoyé à Link (spinbox ou fader 16) :
+        # permet de distinguer un écho de notre propre envoi d'un vrai
+        # changement externe (autre pair Link, ex. Live), voir
+        # _on_link_tempo_observed/_update_tempo_display.
+        self._tempo_last_sent_bpm: float | None = None
+        # Empêche _set_tempo de renvoyer à Link une valeur que l'on vient
+        # nous-même d'écrire dans le champ suite à un changement externe (voir
+        # _update_tempo_display).
+        self._suspend_tempo_send = False
 
         # À la reprise (connecté/en lecture après ne pas l'avoir été), on
         # n'affiche les temps qu'à partir du prochain temps 1 réel, pour ne
         # pas commencer au milieu d'une mesure.
         self._was_connected = False
         self._awaiting_downbeat = False
+        # Comptage du temps DANS la mesure, en mode Link, une fois le premier
+        # vrai temps 1 détecté (voir _poll) : incrémenté/rebouclé nous-mêmes
+        # sur self.beats_var (COUNT courant), PAS par un modulo de la phase
+        # Link brute (qui suppose une mesure de longueur constante depuis le
+        # début de la session Link — faux dès qu'une feuille de scène change
+        # le COUNT d'une mesure à l'autre, ex. 2 temps puis 4 temps).
+        self._link_beat_in_bar = 1
+        self._link_prev_fractional: float | None = None
         # Avertissement "0 pair Link" (voir _update_link_peers_label) : une
         # boîte de dialogue s'ouvre après 5s sans pair, et se referme toute
         # seule dès qu'un pair est détecté (ou reste fermée si l'utilisateur
@@ -332,6 +400,17 @@ class App:
         self._bar_count: int | None = None
         self._awaiting_bar_start = False
         self._bar_count_prev_beat: int | None = None
+        # Numéro de mesure de départ ("GO TO mesure", voir goto_bar_var) pour le
+        # prochain lancement de scène — 1 par défaut (début du morceau).
+        self._bar_count_start = 1
+        # Feuille de scène XLSX (scene_sheet.py) du morceau en cours, si le
+        # fichier <nom de scène>.xlsx existe à côté du script ; None = aucune
+        # feuille, comportement inchangé (voir _apply_scene_sheet_row).
+        self._scene_sheet: SceneSheet | None = None
+        self._scene_sheet_row: SceneSheetRow | None = None
+        # Dernier LABEL non vide rencontré : reste affiché tant qu'aucune
+        # nouvelle valeur non vide n'arrive ("collant", voir _apply_scene_sheet_row).
+        self._scene_label_sticky: str = ""
         # Détection de la présence de Live/AbletonOSC (voir _ping_live) : si
         # CLIC démarre avant Live, les abonnements OSC envoyés au tout début
         # (start_listen_track_*, métronome) se perdent (personne n'écoute
@@ -397,6 +476,36 @@ class App:
         self.link_peers_label = tk.Label(self.link_frame, text="Pairs Link connectés : —", bg=BG_IDLE, fg=FG_TEXT)
         self.link_peers_label.pack(side="left", pady=(6, 0))
 
+        tk.Label(self.link_frame, text="  Régler le tempo :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", pady=(6, 0))
+        self.set_tempo_var = tk.DoubleVar(value=120.0)
+        # Envoi en temps réel : chaque changement (flèches, saisie clavier ou
+        # fader 16 dédié, voir _apply_tempo_fader) déclenche _set_tempo, pas
+        # de bouton "Envoyer" à part.
+        self.set_tempo_var.trace_add("write", lambda *_args: self._set_tempo())
+        tk.Spinbox(
+            self.link_frame, from_=0.0, to=500.0, increment=0.1, width=6,
+            textvariable=self.set_tempo_var,
+        ).pack(side="left", padx=(4, 4), pady=(6, 0))
+
+        tk.Label(self.link_frame, text="  Plage fader 16 :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", pady=(6, 0))
+        range_labels = [label for label, _key in self.TEMPO_RANGE_OPTIONS]
+        range_by_label = dict(self.TEMPO_RANGE_OPTIONS)
+        label_by_range = {key: label for label, key in self.TEMPO_RANGE_OPTIONS}
+        self.tempo_fader_range_var = tk.StringVar(
+            value=label_by_range.get(self.config.get("tempo_fader_range", "6"), range_labels[1])
+        )
+        tempo_range_combo = ttk.Combobox(
+            self.link_frame, textvariable=self.tempo_fader_range_var, state="readonly",
+            values=range_labels, width=16,
+        )
+        tempo_range_combo.pack(side="left", padx=(4, 4), pady=(6, 0))
+
+        def _on_tempo_range_change(_event=None) -> None:
+            self.config["tempo_fader_range"] = range_by_label[self.tempo_fader_range_var.get()]
+            save_config(self.config)
+
+        tempo_range_combo.bind("<<ComboboxSelected>>", _on_tempo_range_change)
+
         # -- Bloc MIDI --
         self.midi_frame = tk.Frame(top, bg=BG_IDLE)
         port_row = tk.Frame(self.midi_frame, bg=BG_IDLE)
@@ -437,9 +546,21 @@ class App:
             activebackground=BG_IDLE, activeforeground=FG_TEXT,
         ).pack(side="left", padx=(16, 0))
 
+        tk.Label(settings_frame, text="  GO TO mesure :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.goto_bar_var = tk.IntVar(value=1)
+        tk.Spinbox(
+            settings_frame, from_=1, to=999, width=5, textvariable=self.goto_bar_var,
+        ).pack(side="left", padx=(6, 0))
+
         # -- Affichage principal du temps : un carré, gros pour 1/3, petit pour 2/4 --
         self.display = tk.Canvas(self.root, bg=BG_IDLE, highlightthickness=0)
         self.display.pack(expand=True, fill="both", padx=10, pady=4)
+
+        # -- Label de section (INTRO/COUPLET/REFRAIN..., voir scene_sheet.py) --
+        self.scene_label_label = tk.Label(
+            self.root, text="", bg=BG_IDLE, fg="#7fb2ff", font=("Helvetica", 16, "bold"),
+        )
+        self.scene_label_label.pack(fill="x", padx=10, pady=(0, 2))
 
         # -- Compteur de mesures depuis le lancement du morceau en cours --
         self.bar_count_label = tk.Label(
@@ -562,6 +683,9 @@ class App:
         hui_mapping_row.pack(fill="x", padx=10, pady=(0, 4))
         tk.Button(
             hui_mapping_row, text="Configurer le mapping des faders…", command=self._open_hui_mapping_dialog,
+        ).pack(side="left")
+        tk.Label(
+            hui_mapping_row, text="  (fader 16 dédié au tempo, voir plus haut)", bg=BG_IDLE, fg="#888888",
         ).pack(side="left")
 
         status_row = tk.Frame(self.root, bg=BG_IDLE)
@@ -730,13 +854,14 @@ class App:
         """Fenêtre de mapping piste Live (ligne) <-> tranche HUI/Yamaha
         (colonne) : une seule tranche par piste (boutons radio par ligne,
         donc pas de doublon possible sur une même ligne), diagonale 1<->1 par
-        défaut. Rien n'est appliqué avant l'appui sur "Appliquer"."""
+        défaut. Tranche 16 absente (réservée au tempo, voir
+        TEMPO_FADER_ZONE). Rien n'est appliqué avant l'appui sur "Appliquer"."""
         dialog = tk.Toplevel(self.root)
         dialog.title("Mapping faders Live ↔ Yamaha")
         dialog.configure(bg=BG_IDLE)
 
         tk.Label(dialog, text="Piste \\ Tranche", bg=BG_IDLE, fg=FG_TEXT).grid(row=0, column=0, padx=(4, 6))
-        for col in range(16):
+        for col in range(15):
             tk.Label(dialog, text=str(col + 1), bg=BG_IDLE, fg=FG_TEXT, width=2).grid(
                 row=0, column=col + 1, padx=1, pady=(4, 2)
             )
@@ -748,13 +873,13 @@ class App:
             tk.Label(dialog, text=f"Piste {track + 1}", bg=BG_IDLE, fg=FG_TEXT).grid(
                 row=track + 1, column=0, sticky="w", padx=(4, 6)
             )
-            for col in range(16):
+            for col in range(15):
                 tk.Radiobutton(
                     dialog, variable=var, value=col, bg=BG_IDLE, activebackground=BG_IDLE, selectcolor="#333333",
                 ).grid(row=track + 1, column=col + 1)
 
         button_row = tk.Frame(dialog, bg=BG_IDLE)
-        button_row.grid(row=17, column=0, columnspan=17, pady=8)
+        button_row.grid(row=17, column=0, columnspan=16, pady=8)
         tk.Button(
             button_row, text="Appliquer", command=lambda: self._apply_track_mapping([v.get() for v in row_vars]),
         ).pack(side="left", padx=6)
@@ -850,6 +975,8 @@ class App:
             while True:
                 message = self._controller_queue.get_nowait()
                 key = _controller_key(message)
+                # Log actif : identifier quel bouton/encodeur physique a été touché.
+                print(f"[Contrôleur MIDI] {_describe_controller_message(message, key)}")
                 # Ne déclenche que sur l'appui (vélocité/valeur > 0), pas le relâchement.
                 if key is None or len(message) < 3 or message[2] <= 0:
                     continue
@@ -897,6 +1024,143 @@ class App:
             return None
         self.link = link
         return self.link
+
+    def _set_tempo(self) -> None:
+        """Impose le tempo choisi à tous les pairs Link (dont Ableton Live) en
+        temps réel, à chaque changement du champ (voir trace_add dans _build_ui) —
+        le champ n'est visible qu'en mode Link. Ignoré quand le champ vient
+        d'être mis à jour par _update_tempo_display (écho d'un changement
+        externe), pour ne pas le renvoyer inutilement à Link."""
+        if self._suspend_tempo_send:
+            return
+        try:
+            bpm = float(self.set_tempo_var.get())
+        except (tk.TclError, ValueError):
+            return
+        link = self._ensure_link()
+        if link is None:
+            return
+        link.set_tempo(bpm)
+        self._tempo_last_sent_bpm = bpm
+
+    def _update_tempo_display(self, bpm: float) -> None:
+        """Reflète dans le champ de tempo un changement observé côté Link (ex.
+        tempo changé à la souris dans Live, ou par un autre pair) : ignore les
+        échos de notre propre dernier envoi (_tempo_last_sent_bpm) pour éviter
+        une boucle, et n'écrit dans le champ que si la valeur diffère
+        réellement de ce qui y est déjà affiché."""
+        if self._tempo_last_sent_bpm is not None and abs(bpm - self._tempo_last_sent_bpm) < 0.05:
+            return
+        try:
+            current = float(self.set_tempo_var.get())
+        except (tk.TclError, ValueError):
+            current = None
+        if current is not None and abs(bpm - current) < 0.05:
+            return
+        self._suspend_tempo_send = True
+        try:
+            self.set_tempo_var.set(round(bpm, 1))
+        finally:
+            self._suspend_tempo_send = False
+
+    def _update_tempo_reference(self, bpm: float) -> None:
+        """Tient à jour le tempo de référence ("morceau chargé sans
+        modification", position centrale du fader 16) à partir du tempo Link
+        observé : tout changement qui ne vient pas de notre propre dernier
+        envoi (_tempo_last_sent_bpm) est considéré comme un nouveau
+        morceau/tempo de base (ex. lancement de scène, réglage manuel dans
+        Live) et devient la nouvelle référence."""
+        if self._tempo_reference_bpm is None:
+            self._tempo_reference_bpm = bpm
+            return
+        if self._tempo_last_sent_bpm is not None and abs(bpm - self._tempo_last_sent_bpm) < 0.05:
+            return
+        if abs(bpm - self._tempo_reference_bpm) > 0.05:
+            self._tempo_reference_bpm = bpm
+
+    def _on_link_tempo_observed(self, bpm: float) -> None:
+        """Point d'entrée unique appelé à chaque poll avec le BPM Link actuel
+        (indépendamment du mode d'affichage midi/link) : met à jour à la fois
+        le tempo de référence du fader 16 et l'affichage du champ de tempo."""
+        self._update_tempo_reference(bpm)
+        self._update_tempo_display(bpm)
+
+    def _poll_tempo_fader(self) -> None:
+        """Consomme les positions brutes du fader 16 (voir _tempo_fader_queue) :
+        seule la dernière valeur reçue depuis le dernier passage est appliquée
+        (évite de spammer Link pendant un mouvement rapide du fader)."""
+        raw = None
+        try:
+            while True:
+                raw = self._tempo_fader_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if raw is not None:
+            self._apply_tempo_fader(raw)
+
+    def _apply_tempo_fader(self, raw: int) -> None:
+        """Traduit la position brute (0-16383) du fader 16, façon pitch de
+        platine Pioneer DJ MK2 : au centre (~8192) le tempo de référence est
+        inchangé, monter/descendre l'augmente/diminue. En mode pourcentage,
+        la plage couvre toute la course du fader ; en mode "free", le fader
+        représente un tempo absolu de 0 (tout en bas) à 500 BPM (tout en haut),
+        indépendant du morceau chargé."""
+        mode = self.config.get("tempo_fader_range", "6")
+        if mode == "free":
+            new_bpm = (raw / 16383.0) * 500.0
+        else:
+            try:
+                pct = float(mode) / 100.0
+            except ValueError:
+                pct = 0.06
+            frac = max(-1.0, min(1.0, (raw - 8191.5) / 8191.5))
+            reference = self._tempo_reference_bpm if self._tempo_reference_bpm else 120.0
+            new_bpm = reference * (1.0 + frac * pct)
+        self._tempo_last_sent_bpm = new_bpm
+        self.set_tempo_var.set(round(new_bpm, 1))
+
+    def _poll_tempo_reset(self) -> None:
+        """Consomme les demandes de rappel du tempo d'origine (bouton Mute de
+        la tranche tempo, envoi simple voir hui_bridge.py) : (re)programme le
+        rappel au prochain temps, sans jamais l'appliquer immédiatement."""
+        triggered = False
+        try:
+            while True:
+                self._tempo_reset_queue.get_nowait()
+                triggered = True
+        except queue.Empty:
+            pass
+        if triggered:
+            self._schedule_tempo_reset()
+
+    def _schedule_tempo_reset(self) -> None:
+        """Calcule le délai jusqu'au prochain temps directement à partir de la
+        phase/tempo Link courants (déterministe, indépendant du rythme des
+        polls) et y programme l'application du rappel via root.after. Annule
+        d'abord tout rappel déjà programmé : un second appui (ou le 2e envoi
+        du même appui physique) reprogramme au lieu de s'empiler."""
+        if self._tempo_reset_after_id is not None:
+            self.root.after_cancel(self._tempo_reset_after_id)
+            self._tempo_reset_after_id = None
+        delay_ms = 0.0
+        link = self._ensure_link()
+        if link is not None:
+            snapshot = link.snapshot(quantum=1.0)
+            bpm = snapshot["bpm"] if snapshot["bpm"] > 0 else 120.0
+            frac = snapshot["phase"] % 1.0
+            delay_ms = max(0.0, (1.0 - frac) * (60.0 / bpm) * 1000.0)
+        self._tempo_reset_after_id = self.root.after(int(delay_ms), self._apply_scheduled_tempo_reset)
+
+    def _apply_scheduled_tempo_reset(self) -> None:
+        self._tempo_reset_after_id = None
+        self._reset_tempo_fader()
+
+    def _reset_tempo_fader(self) -> None:
+        origin = self._scene_origin_tempo if self._scene_origin_tempo is not None else self._tempo_reference_bpm
+        if origin is None:
+            return
+        self._tempo_last_sent_bpm = origin
+        self.set_tempo_var.set(round(origin, 1))
 
     def _jump_beats(self, beats: int) -> None:
         """Décale de `beats` temps le clip en cours de lecture de chaque
@@ -981,6 +1245,14 @@ class App:
         self._awaiting_bar_start = False
         self.bar_count_label.config(text="")
         self.shared_state.set_bar_count(None)
+        # Idem pour la feuille de scène (COUNT/HIGHLIGHT/LABEL) : elle ne
+        # s'applique qu'à la scène effectivement lancée, pas à une simple
+        # navigation.
+        self._scene_sheet = None
+        self._scene_sheet_row = None
+        self._scene_label_sticky = ""
+        self.scene_label_label.config(text="")
+        self.shared_state.set_scene_label("")
         try:
             self.live_osc.set_selected_scene(new_index)
             self.live_osc.get_scene_name(new_index)
@@ -1002,6 +1274,12 @@ class App:
             # de flash, pas d'agrandissement (réservés aux scènes nommées).
             if self._scene_name.strip().isdigit():
                 self.live_osc.start_playing()
+                # Scène "tempo seul" : aucune feuille de scène ne s'applique.
+                self._scene_sheet = None
+                self._scene_sheet_row = None
+                self._scene_label_sticky = ""
+                self.scene_label_label.config(text="")
+                self.shared_state.set_scene_label("")
                 # 2s après le lancement d'une scène "tempo seul", on
                 # sélectionne automatiquement la scène suivante (comme un
                 # appui sur ▼), prête à être lancée avec le bouton ▶.
@@ -1021,6 +1299,25 @@ class App:
                 self._awaiting_bar_start = True
                 self.bar_count_label.config(text="")
                 self.shared_state.set_bar_count(None)
+                # Feuille de scène XLSX (<nom de scène>.xlsx, voir
+                # scene_sheet.py) : None si le fichier n'existe pas, aucun
+                # changement de comportement dans ce cas. "GO TO mesure"
+                # (goto_bar_var) fixe le point de départ du comptage ; on
+                # applique tout de suite la ligne correspondante (COUNT/
+                # HIGHLIGHT/LABEL) pour que le tout premier temps affiché
+                # soit déjà correct, sans attendre une mesure de retard.
+                self._scene_sheet = load_scene_sheet(
+                    self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Feuille de scène] {msg}"),
+                )
+                try:
+                    self._bar_count_start = max(1, int(self.goto_bar_var.get()))
+                except (tk.TclError, ValueError):
+                    self._bar_count_start = 1
+                self._scene_label_sticky = (
+                    self._scene_sheet.label_at_or_before(self._bar_count_start)
+                    if self._scene_sheet is not None else ""
+                )
+                self._apply_scene_sheet_row(self._bar_count_start)
         except OSError as exc:
             self.scene_name_label.config(text=f"Erreur OSC : {exc}")
 
@@ -1103,12 +1400,27 @@ class App:
                         self.live_osc.get_scene_name(index + 1)
                     else:
                         self._update_scene_label()
+                    # Tempo d'origine du morceau : lu dans le nom de la scène
+                    # PRÉCÉDENTE (convention du set, ex. morceau "OVLM" précédé
+                    # d'une scène "100") — seulement pertinent si la scène
+                    # sélectionnée est bien un morceau, pas une scène "tempo seul".
+                    self._scene_origin_tempo = None
+                    if not name.strip().isdigit() and index > 0:
+                        self.live_osc.get_scene_name(index - 1)
                 elif (
                     self._scene_index is not None
                     and index == self._scene_index + 1
                     and self._scene_name.strip().isdigit()
                 ):
                     self._update_scene_label(next_name=name)
+                elif (
+                    self._scene_index is not None
+                    and index == self._scene_index - 1
+                    and not self._scene_name.strip().isdigit()
+                    and name.strip().isdigit()
+                ):
+                    self._scene_origin_tempo = float(name.strip())
+
 
     def _update_scene_label(self, next_name: str | None = None) -> None:
         name = self._scene_name or "(sans nom)"
@@ -1125,6 +1437,22 @@ class App:
         display_name = next_name if self._scene_name.strip().isdigit() else self._scene_name
         web_name = f"À SUIVRE ({display_name})" if display_name else "À SUIVRE"
         self.shared_state.set_scene_name(web_name)
+
+    def _apply_scene_sheet_row(self, mes: int) -> None:
+        """Applique la ligne de la feuille de scène (scene_sheet.py) pour la
+        mesure `mes` : COUNT (temps par mesure, avec retour à la valeur
+        configurée si absent), HIGHLIGHT (consommé par _update_display) et
+        LABEL ("collant" : ne s'efface que quand une nouvelle valeur non vide
+        arrive). Sans feuille (ou mesure hors feuille), comportement normal."""
+        row = self._scene_sheet.get(mes) if self._scene_sheet is not None else None
+        self._scene_sheet_row = row
+        count = row.count if row is not None and row.count else self.config["beats_per_bar"]
+        self.beats_var.set(count)
+        self.midi_state.beats_per_bar = count
+        if row is not None and row.label:
+            self._scene_label_sticky = row.label
+        self.scene_label_label.config(text=self._scene_label_sticky)
+        self.shared_state.set_scene_label(self._scene_label_sticky)
 
     # -------------------------------------------------------- Boucle poll --
     def _update_link_peers_label(self, num_peers: int) -> None:
@@ -1177,13 +1505,14 @@ class App:
         if self._awaiting_bar_start:
             if beat == 1:
                 self._awaiting_bar_start = False
-                self._bar_count = 1
+                self._bar_count = self._bar_count_start
                 self._bar_count_prev_beat = 1
-                self.bar_count_label.config(text="Mesure 1")
-                self.shared_state.set_bar_count(1)
+                self.bar_count_label.config(text=f"Mesure {self._bar_count}")
+                self.shared_state.set_bar_count(self._bar_count)
             return
         if self._bar_count is not None and beat == 1 and self._bar_count_prev_beat != 1:
             self._bar_count += 1
+            self._apply_scene_sheet_row(self._bar_count)
             self.bar_count_label.config(text=f"Mesure {self._bar_count}")
             self.shared_state.set_bar_count(self._bar_count)
         self._bar_count_prev_beat = beat
@@ -1191,6 +1520,8 @@ class App:
     def _poll(self) -> None:
         self._poll_controller()
         self._poll_scene_replies()
+        self._poll_tempo_fader()
+        self._poll_tempo_reset()
         if self.mode_var.get() == "midi":
             try:
                 while True:
@@ -1216,6 +1547,13 @@ class App:
                 self.midi_state.phase(), self.midi_state.beats_per_bar,
                 self.midi_state.bpm, connected, running, "midi",
             )
+            # Le fader 16 pilote le tempo via Link indépendamment du mode
+            # d'affichage choisi (comme les boutons -1/+1) : on garde le tempo
+            # de référence et le champ de tempo à jour même si l'affichage
+            # courant est en MIDI Clock.
+            tempo_link = self._ensure_link()
+            if tempo_link is not None:
+                self._on_link_tempo_observed(tempo_link.snapshot(quantum=1.0)["bpm"])
         else:
             link = self._ensure_link()
             if link is not None:
@@ -1227,33 +1565,72 @@ class App:
                 connected = link.num_peers >= 1 and snapshot["is_playing"]
                 if connected and not self._was_connected:
                     self._awaiting_downbeat = True
+                    self._link_prev_fractional = None
                 self._was_connected = connected
                 phase = project_phase(snapshot["phase"], snapshot["bpm"], connected, self.latency_var.get())
-                beat = int(phase % quantum) + 1
-                if connected and self._awaiting_downbeat and beat == 1:
-                    self._awaiting_downbeat = False
+                fractional = phase % 1.0
+                if self._awaiting_downbeat or self._awaiting_bar_start:
+                    # Détection du premier vrai temps 1 (reconnexion Link ou
+                    # lancement de scène) : Live aligne réellement les clips
+                    # lancés sur ce quantum (quantification globale, cf. Link),
+                    # donc ce modulo est fiable ICI, à un instant donné.
+                    # Contrairement au comptage en continu ci-dessous, il ne
+                    # doit PAS servir une fois la mesure en cours (voir
+                    # _link_beat_in_bar plus bas).
+                    beat = int(phase % quantum) + 1
+                    if connected and self._awaiting_downbeat and beat == 1:
+                        self._awaiting_downbeat = False
+                    if beat == 1:
+                        self._link_beat_in_bar = 1
+                        self._link_prev_fractional = fractional
+                else:
+                    # Comptage en continu, indépendant du modulo Link : un
+                    # rebouclage de la partie fractionnaire du temps (0.95 ->
+                    # 0.05 par exemple, détecté ici) fait avancer notre PROPRE
+                    # compteur de temps dans la mesure, qui reboucle sur le
+                    # COUNT courant (self.beats_var) — donc correct même
+                    # quand ce COUNT change d'une mesure à l'autre (feuille de
+                    # scène, ex. 2 temps puis 4 temps), ce que ne permet pas
+                    # phase % quantum (aligné sur la session Link depuis son
+                    # tout début, pas sur le début de la mesure courante).
+                    if (
+                        self._link_prev_fractional is not None
+                        and fractional < self._link_prev_fractional - 0.5
+                    ):
+                        self._link_beat_in_bar += 1
+                        if self._link_beat_in_bar > int(quantum):
+                            self._link_beat_in_bar = 1
+                    self._link_prev_fractional = fractional
+                    beat = self._link_beat_in_bar
                 connected = connected and not self._awaiting_downbeat
                 self._update_bar_count(connected, beat)
-                self._update_display(beat, int(quantum), phase % 1.0, snapshot["bpm"], connected, snapshot["is_playing"])
+                self._update_display(beat, int(quantum), fractional, snapshot["bpm"], connected, snapshot["is_playing"])
                 self._update_link_peers_label(link.num_peers)
+                self._on_link_tempo_observed(snapshot["bpm"])
+                # Phase relative à la mesure en cours (0..quantum), déjà bornée
+                # par notre propre comptage : contrairement à la phase Link
+                # brute, un modulo par quantum côté page web (voir
+                # web_server.project_beat/compute) reste donc correct même
+                # après un changement de COUNT.
+                bar_relative_phase = (beat - 1) + fractional
                 self.shared_state.update(
-                    snapshot["phase"], quantum, snapshot["bpm"], connected, snapshot["is_playing"], "link",
+                    bar_relative_phase, quantum, snapshot["bpm"], connected, snapshot["is_playing"], "link",
                 )
 
         self.root.after(30, self._poll)
 
     # ----------------------------------------------------------- Display --
-    def _draw_digit(self, beat: int) -> None:
+    def _draw_digit(self, beat: int, fill: str = FG_TEXT, size_scale: float = 1.0) -> None:
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
             return
-        font_size = int(min(width, height) * 0.6)
+        font_size = int(min(width, height) * 0.6 * size_scale)
         canvas.create_text(
-            width / 2, height / 2, text=str(beat), fill=FG_TEXT, font=("Helvetica", font_size, "bold"),
+            width / 2, height / 2, text=str(beat), fill=fill, font=("Helvetica", font_size, "bold"),
         )
 
-    def _draw_two_circles(self, beat: int, bg: str) -> None:
+    def _draw_two_circles(self, beat: int, bg: str, fill: str = FG_TEXT, size_scale: float = 1.0) -> None:
         # Deux cercles côte à côte : celui de gauche se remplit aux temps
         # impairs (1, 3...), celui de droite aux temps pairs (2, 4...) —
         # l'alternance rend le pulse visible à chaque temps.
@@ -1261,7 +1638,7 @@ class App:
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
             return
-        diameter = min(width, height) * 0.6 * 0.8
+        diameter = min(width, height) * 0.6 * 0.8 * size_scale
         radius = diameter / 2
         cy = height / 2
         left_cx = width / 2 - diameter * 0.7
@@ -1270,7 +1647,7 @@ class App:
         for cx, filled in ((left_cx, left_filled), (right_cx, not left_filled)):
             canvas.create_oval(
                 cx - radius, cy - radius, cx + radius, cy + radius,
-                fill=FG_TEXT if filled else bg, outline=FG_TEXT, width=3,
+                fill=fill if filled else bg, outline=fill, width=3,
             )
 
     def _draw_scroll_line(self, beats_per_bar: int, beat: int, fractional: float) -> None:
@@ -1304,14 +1681,26 @@ class App:
     def _update_display(
         self, beat: int, beats_per_bar: int, fractional: float, bpm: float | None, connected: bool, running: bool,
     ) -> None:
-        # Flash jaune vif du fond au temps 1, bleu outremer au temps 3, qui
-        # s'estompent tous deux vers le fond normal.
-        if connected and beat == 1:
-            bg = _lerp_color(FLASH_YELLOW, BG_IDLE, fractional)
-        elif connected and beat == 3:
-            bg = _lerp_color(FLASH_BLUE, BG_IDLE, fractional)
+        # Mesure HIGHLIGHT (scene_sheet.py, valeur 1) : flash blanc du fond
+        # sur TOUS les temps (pas seulement 1/3), digits/dots eux-mêmes
+        # fondus du blanc vers leur couleur normale, et 50% plus grands ;
+        # remplace entièrement le flash jaune/bleu habituel pour ces mesures.
+        highlighted = connected and self._scene_sheet_row is not None and self._scene_sheet_row.highlight
+        if highlighted:
+            bg = _lerp_color(FLASH_HIGHLIGHT, BG_IDLE, fractional)
+            digit_fill = _lerp_color(FLASH_HIGHLIGHT, FG_TEXT, fractional)
+            size_scale = HIGHLIGHT_SIZE_SCALE
         else:
-            bg = BG_IDLE
+            # Flash jaune vif du fond au temps 1, bleu outremer au temps 3, qui
+            # s'estompent tous deux vers le fond normal.
+            if connected and beat == 1:
+                bg = _lerp_color(FLASH_YELLOW, BG_IDLE, fractional)
+            elif connected and beat == 3:
+                bg = _lerp_color(FLASH_BLUE, BG_IDLE, fractional)
+            else:
+                bg = BG_IDLE
+            digit_fill = FG_TEXT
+            size_scale = 1.0
         bg = self._scene_flash_bg(bg)
         # Le flash reste cantonné au canvas (digits/dots), pas à toute la fenêtre.
         self.display.configure(bg=bg)
@@ -1322,9 +1711,9 @@ class App:
         # affiché au hasard serait trompeur pour le batteur : rien du tout.
         if connected:
             if self.dots_var.get():
-                self._draw_two_circles(beat, bg)
+                self._draw_two_circles(beat, bg, fill=digit_fill, size_scale=size_scale)
             else:
-                self._draw_digit(beat)
+                self._draw_digit(beat, fill=digit_fill, size_scale=size_scale)
         elif self._last_bpm and not running:
             self._draw_scroll_line(beats_per_bar, beat, fractional)
 

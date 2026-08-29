@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 config.json
+.DS_Store
 
 # Dépôt Ableton Link vendored (voir README.md pour le cloner/recompiler)
 link-src/

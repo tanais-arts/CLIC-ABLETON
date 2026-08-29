@@ -7,14 +7,20 @@ Live). Encodage du retour confirmé par capture MIDI Monitor de Pro Tools
 CC(zone)/CC(zone+32) que la réception, sans zone select ; le mute utilise le
 même schéma zone/port que la réception mais décalé de -3 en numéro de CC
 (0x0C/0x2C au lieu de 0x0F/0x2F).
-Un canal HUI = une piste Live, dans l'ordre (tranche 1 -> piste 1, etc.).
+Un canal HUI = une piste Live, dans l'ordre (tranche 1 -> piste 1, etc.), à
+l'exception du canal 16 (dernière tranche du 2e port), réservé au contrôle du
+tempo (voir `tempo_zone`/`on_tempo_fader` et beat_display.py) et donc absent
+du mapping piste <-> tranche.
 
 Protocole observé sur le 01V96V2 réel (relevé via MIDI Monitor, 2026-08-21 —
 diffère de la doc HUI générique "theageman" sur plusieurs points) :
   - La console adresse un canal (0-7, une "tranche") avec CC 0x0F (zone),
     suivi d'un CC 0x2F (0x40 = enfoncé/actif, bits de poids faible = "port") :
       port 0 : fader/valeur continue en cours (précède une paire CC de valeur)
-      port 2 : bouton Mute (0x40 posé = appui, retiré = relâché)
+      port 2 : bouton Mute (0x40 posé = appui, retiré = relâché). Sur la
+        tranche tempo (voir `tempo_zone`), ce n'est pas un mute mais un envoi
+        simple (pas un bascule) qui rappelle le tempo à sa valeur de
+        référence au prochain temps (voir `on_tempo_reset`/beat_display.py).
   - Fader : après le CC 0x2F "port 0", la position (14 bits) arrive en 2 CC
     sur le canal de la zone courante : CC(zone) = poids fort (0-127),
     CC(zone + 32) = poids faible (0-127) -> valeur = (fort << 7) | faible.
@@ -28,9 +34,11 @@ diffère de la doc HUI générique "theageman" sur plusieurs points) :
     n'est pas affecté). La console répond à chaque ping par un Note On note 0
     vélocité 127 (poignée de main) : c'est un écho normal, ignoré silencieusement.
   - Les mêmes ports MIDI (Port3/Port4) véhiculent aussi les Note On/Off des
-    boutons +/-1, stop/play et navigation de scène : déjà traités par le
-    système `controller_map` (menu "MIDI IN Contrôleur") sur son propre port,
-    donc tout Note On/Off est ignoré ici sans journalisation.
+    boutons +/-1, stop/play et navigation de scène (déjà traités ailleurs par
+    le système `controller_map`, menu "MIDI IN OSC Boutons", sur son propre
+    port) ainsi que d'autres touches de la console (ex. USER SEL) : ces Note
+    On/Off sont ignorés ici (pas de traduction OSC) mais journalisés, sauf la
+    poignée de main du ping (Note On canal 0 note 0) qui est du bruit attendu.
 
 Tout message non reconnu est journalisé (au lieu d'être ignoré silencieusement)
 pour permettre d'affiner le mapping si besoin.
@@ -85,11 +93,29 @@ class HuiBridge:
     une piste Live — utile quand la console répartit ses voies sur plusieurs
     ports MIDI (ex. port A = tranches 0-7, port B = tranches 0-7 aussi mais
     pour d'autres pistes), et pour permettre un mapping arbitraire choisi par
-    l'utilisateur plutôt qu'une simple correspondance 1 pour 1."""
+    l'utilisateur plutôt qu'une simple correspondance 1 pour 1.
 
-    def __init__(self, live_osc, log=print, zone_to_track: dict[int, int] | None = None):
+    `tempo_zone`/`on_tempo_fader` réservent une tranche (ex. le fader 16) au
+    contrôle du tempo au lieu du volume d'une piste : sa position brute
+    (0-16383) est transmise à `on_tempo_fader` au lieu de suivre le chemin
+    volume/OSC habituel (voir beat_display.py). `on_tempo_reset` (sans
+    argument) est appelé pour cette même tranche à CHAQUE message Mute reçu,
+    sans condition sur la valeur (la console n'envoie pas une paire
+    appui/relâchement fiable sur ce bouton précis, confirmé sur matériel
+    réel : un filtre par changement de valeur en ratait un sur deux) pour
+    redemander le rappel du tempo d'origine (voir beat_display.py, où la
+    reprogrammation est idempotente donc sans risque en cas de déclenchement
+    en trop)."""
+
+    def __init__(
+        self, live_osc, log=print, zone_to_track: dict[int, int] | None = None,
+        tempo_zone: int | None = None, on_tempo_fader=None, on_tempo_reset=None,
+    ):
         self._live_osc = live_osc
         self._log = log
+        self._tempo_zone = tempo_zone
+        self._on_tempo_fader = on_tempo_fader
+        self._on_tempo_reset = on_tempo_reset
         self._midi_in: rtmidi.MidiIn | None = None
         self._midi_out: rtmidi.MidiOut | None = None
         self._port_name: str | None = None
@@ -190,8 +216,17 @@ class HuiBridge:
     def _handle_message(self, message: list[int]) -> None:
         status = message[0] & 0xF0
         if status in (0x80, 0x90):
-            # Note On/Off : écho du ping, ou boutons +/-1, stop/play, navigation
-            # de scène -- déjà traités ailleurs via controller_map. Ignoré ici.
+            channel, note, velocity = message[0] & 0x0F, message[1], message[2] if len(message) > 2 else 0
+            if note == 0 and channel == 0:
+                # Poignée de main du ping (Note On canal 0 note 0) : bruit attendu, pas de log.
+                return
+            # Boutons +/-1, stop/play, navigation de scène, USER SEL, etc. --
+            # déjà traités ailleurs (controller_map) si mappés ; journalisé ici
+            # aussi pour repérer les notes non encore mappées sur ce port.
+            self._log(
+                f"HUI : Note {'On' if status == 0x90 else 'Off'} canal={channel + 1} note={note} "
+                f"vélocité={velocity} (ignoré ici, voir MIDI IN OSC Boutons)"
+            )
             return
         if len(message) < 3 or status != 0xB0:
             self._log(f"HUI : message non reconnu {[hex(b) for b in message]}")
@@ -213,7 +248,19 @@ class HuiBridge:
             port = value & PORT_NUMBER_MASK
             pressed = bool(value & PORT_ON_MASK)
             if port == MUTE_PORT:
-                if pressed and track is not None:  # bascule à l'appui, pas au relâchement
+                if zone == self._tempo_zone:
+                    # Pas un vrai appui/relâchement fiable sur ce bouton précis
+                    # (confirmé sur matériel réel : la valeur ne bascule pas de
+                    # façon prévisible à chaque appui, un filtre par changement
+                    # de valeur en ratait un sur deux). On déclenche donc sur
+                    # CHAQUE message reçu pour cette tranche, sans condition :
+                    # sans risque ici, un déclenchement en trop ne fait que
+                    # reprogrammer le même rappel (voir _schedule_tempo_reset
+                    # dans beat_display.py, idempotent).
+                    self._log(f"HUI : mute fader tempo (valeur={value}) -> rappel du tempo d'origine au prochain temps")
+                    if self._on_tempo_reset is not None:
+                        self._on_tempo_reset()
+                elif pressed and track is not None:  # bascule à l'appui, pas au relâchement
                     muted = not self._mute_toggle_state.get(track, False)
                     self._mute_toggle_state[track] = muted
                     self._log(f"HUI : mute piste {track + 1} -> {muted}")
@@ -233,6 +280,10 @@ class HuiBridge:
                 raw = 16383
             elif raw <= FADER_SNAP_MARGIN:
                 raw = 0
+            if zone == self._tempo_zone:
+                if self._on_tempo_fader is not None:
+                    self._on_tempo_fader(raw)
+                return
             volume = raw / 16383.0
             if track is None:
                 self._log(f"HUI : zone {zone} sans piste Live assignée (volume {volume:.3f} ignoré)")

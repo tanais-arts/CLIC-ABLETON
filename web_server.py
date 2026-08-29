@@ -91,6 +91,12 @@ _PAGE = """<!DOCTYPE html>
     min-height: 1em;
   }
   #sceneName.launched { color: #3ddc57; font-size: 5.25vh; }
+  #sceneLabel {
+    flex: 0 0 auto; margin-top: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 4vh; font-weight: bold; color: #7fb2ff;
+    min-height: 1em;
+  }
   #barCount {
     flex: 0 0 auto; margin-top: 0;
     display: flex; align-items: center; justify-content: center;
@@ -136,6 +142,7 @@ _PAGE = """<!DOCTYPE html>
     <div id="offline">OFFLINE</div>
     <div id="scrollLine"><div id="scrollThumb"></div></div>
   </div>
+  <div id="sceneLabel"></div>
   <div id="barCount"></div>
   <div id="sceneName"></div>
   <div id="info">-- BPM</div>
@@ -298,6 +305,7 @@ async function poll() {
     document.getElementById('sceneName').textContent = data.scene_name || '';
     document.getElementById('sceneName').classList.toggle('launched', !!data.scene_launched);
     document.getElementById('barCount').textContent = data.bar_count ? ('Mes. ' + data.bar_count) : '';
+    document.getElementById('sceneLabel').textContent = data.scene_label || '';
     if (data.scene_launched && !lastSceneLaunched) {
       sceneFlashDouble();
     }
@@ -359,6 +367,7 @@ class SharedBeatState:
         self._scene_name = ""
         self._scene_launched = False
         self._bar_count: int | None = None
+        self._scene_label = ""
         self._offline = False
 
     def update(
@@ -397,6 +406,13 @@ class SharedBeatState:
         with self._lock:
             self._bar_count = bar_count
 
+    def set_scene_label(self, label: str) -> None:
+        """Texte de section (INTRO/COUPLET/REFRAIN..., voir scene_sheet.py) :
+        "collant", laissé tel quel entre deux mesures étiquetées (voir
+        beat_display._apply_scene_sheet_row)."""
+        with self._lock:
+            self._scene_label = label
+
     def set_offline(self) -> None:
         """Signale la fermeture imminente de CLIC : affiche OFFLINE sur la
         page web à la place des chiffres/de la ligne, avant même que le
@@ -411,6 +427,7 @@ class SharedBeatState:
             scene_name = self._scene_name
             scene_launched = self._scene_launched
             bar_count = self._bar_count
+            scene_label = self._scene_label
             offline = self._offline
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
@@ -429,6 +446,7 @@ class SharedBeatState:
             "scene_name": scene_name,
             "scene_launched": scene_launched,
             "bar_count": bar_count,
+            "scene_label": scene_label,
             "offline": offline,
         }
 

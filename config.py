@@ -28,10 +28,15 @@ DEFAULTS = {
     "controller_map_play": ["note", 0, 2],
     # D#-2 pour activer/désactiver le métronome de Live.
     "controller_map_metronome": ["note", 0, 3],
-    # Mapping piste Live (index) -> tranche HUI/Yamaha (valeur), 0-15.
+    # Mapping piste Live (index) -> tranche HUI/Yamaha (valeur), 0-14 (la
+    # tranche 15/canal 16 est réservée au contrôle du tempo, voir
+    # TEMPO_FADER_ZONE dans beat_display.py, donc absente du mapping).
     # Diagonale par défaut (piste 1 -> tranche 1, etc.), modifiable dans
     # l'interface ("Configurer le mapping des faders…").
-    "hui_track_mapping": list(range(16)),
+    "hui_track_mapping": [min(i, 14) for i in range(16)],
+    # Plage du fader 16 dédié au tempo : "3"/"6"/"10"/"20" (pourcentage autour
+    # du tempo de référence) ou "free" (0-500 BPM absolu, sans référence).
+    "tempo_fader_range": "6",
 }
 
 

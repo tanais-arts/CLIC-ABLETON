@@ -67,6 +67,12 @@ def _load_library() -> ctypes.CDLL:
     lib.abl_link_tempo.argtypes = [_AblLinkSessionState]
     lib.abl_link_tempo.restype = ctypes.c_double
 
+    lib.abl_link_set_tempo.argtypes = [_AblLinkSessionState, ctypes.c_double, ctypes.c_int64]
+    lib.abl_link_set_tempo.restype = None
+
+    lib.abl_link_commit_app_session_state.argtypes = [_AblLink, _AblLinkSessionState]
+    lib.abl_link_commit_app_session_state.restype = None
+
     lib.abl_link_is_playing.argtypes = [_AblLinkSessionState]
     lib.abl_link_is_playing.restype = ctypes.c_bool
 
@@ -122,6 +128,15 @@ class AbletonLink:
             beat = self._lib.abl_link_beat_at_time(self._session_state, when, quantum)
             is_playing = bool(self._lib.abl_link_is_playing(self._session_state))
         return {"bpm": bpm, "phase": phase, "beat": beat, "is_playing": is_playing}
+
+    def set_tempo(self, bpm: float) -> None:
+        """Impose un nouveau tempo à tous les pairs Link (dont Ableton Live),
+        effectif immédiatement (capture + set + commit depuis le thread appelant,
+        cf. abl_link_set_tempo/abl_link_commit_app_session_state)."""
+        with self._lock:
+            self._lib.abl_link_capture_app_session_state(self._link, self._session_state)
+            self._lib.abl_link_set_tempo(self._session_state, bpm, self.now_micros())
+            self._lib.abl_link_commit_app_session_state(self._link, self._session_state)
 
     def close(self) -> None:
         self._lib.abl_link_destroy_session_state(self._session_state)
