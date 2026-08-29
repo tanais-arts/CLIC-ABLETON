@@ -383,6 +383,10 @@ class App:
         # main sur le fader 16 (holdoff) et dernier renvoi de sa position.
         self._tempo_fader_local_time = 0.0
         self._tempo_fader_refresh_time = 0.0
+        # Dernière position brute envoyée au fader 16 (None = jamais encore) :
+        # permet de renvoyer tout de suite un vrai changement de position,
+        # sans attendre TEMPO_FADER_KEEPALIVE_INTERVAL_S (voir même fonction).
+        self._tempo_fader_last_raw_sent: int | None = None
 
         # À la reprise (connecté/en lecture après ne pas l'avoir été), on
         # n'affiche les temps qu'à partir du prochain temps 1 réel, pour ne
@@ -1129,6 +1133,14 @@ class App:
         self._tempo_last_sent_bpm = new_bpm
         self.set_tempo_var.set(round(new_bpm, 1))
         self._tempo_fader_local_time = time.monotonic()
+        # Réaffirme tout de suite la position que la main vient de donner :
+        # sans cet écho, la console reprend le fader vers la dernière cible
+        # qu'on lui avait commandée dès qu'on relâche le toucher (le moteur a
+        # besoin d'une confirmation MIDI de la nouvelle position, pas
+        # seulement de recevoir la position brute côté entrée).
+        self.hui_bridge_2.send_tempo_fader_feedback(raw)
+        self._tempo_fader_refresh_time = self._tempo_fader_local_time
+        self._tempo_fader_last_raw_sent = raw
 
     def _tempo_fader_raw_for_bpm(self, bpm: float) -> int:
         """Inverse de _apply_tempo_fader : position brute (0-16383) du fader
@@ -1144,23 +1156,27 @@ class App:
         return max(0, min(16383, round(8191.5 + frac * 8191.5)))
 
     def _poll_tempo_fader_keepalive(self) -> None:
-        """Réaffirme périodiquement au fader 16 la position correspondant au
-        tempo actuellement affiché (Live, logiciel ou fader lui-même), pour
+        """Réaffirme au fader 16 la position correspondant au tempo
+        actuellement affiché (Live, logiciel ou fader lui-même), pour
         contrer le retour automatique du moteur de la console en l'absence de
         confirmation MIDI — sans jamais lutter contre un geste récent de la
-        main (voir TEMPO_FADER_KEEPALIVE_HOLDOFF_S/INTERVAL_S)."""
+        main (voir TEMPO_FADER_KEEPALIVE_HOLDOFF_S). Un vrai changement de
+        position est renvoyé tout de suite (pas de latence à attendre la
+        prochaine réaffirmation) ; seule la réaffirmation périodique d'une
+        position inchangée est limitée à INTERVAL_S."""
         now = time.monotonic()
         if now - self._tempo_fader_local_time < self.TEMPO_FADER_KEEPALIVE_HOLDOFF_S:
-            return
-        if now - self._tempo_fader_refresh_time < self.TEMPO_FADER_KEEPALIVE_INTERVAL_S:
             return
         try:
             bpm = float(self.set_tempo_var.get())
         except (tk.TclError, ValueError):
             return
         raw = self._tempo_fader_raw_for_bpm(bpm)
+        if raw == self._tempo_fader_last_raw_sent and now - self._tempo_fader_refresh_time < self.TEMPO_FADER_KEEPALIVE_INTERVAL_S:
+            return
         self.hui_bridge_2.send_tempo_fader_feedback(raw)
         self._tempo_fader_refresh_time = now
+        self._tempo_fader_last_raw_sent = raw
 
     def _poll_tempo_reset(self) -> None:
         """Consomme les demandes de rappel du tempo d'origine (bouton Mute de
@@ -1314,6 +1330,7 @@ class App:
             # chaque lancement de scène, feuille de morceau ou tempo seul.
             self.hui_bridge_2.send_tempo_fader_feedback(self.TEMPO_FADER_CENTER_RAW)
             self._tempo_fader_refresh_time = time.monotonic()
+            self._tempo_fader_last_raw_sent = self.TEMPO_FADER_CENTER_RAW
             # Convention "tempo seul" : une scène nommée juste avec des
             # chiffres ne contient pas de clip, donc fire() ne démarre pas le
             # transport tout seul — on le déclenche explicitement. Ce n'est
