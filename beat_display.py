@@ -316,6 +316,10 @@ class App:
         # l'abonnement OSC (reflète aussi un changement fait depuis Live). --
         self._metronome_on: bool = False
         self.live_osc.start_listen_metronome()
+        # Confirmation réelle (pas juste l'instant d'envoi) de la prise en
+        # compte de la signature par Live, voir _poll_scene_replies.
+        self.live_osc.start_listen_signature_numerator()
+        self.live_osc.start_listen_signature_denominator()
 
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour les 6 boutons (nudge,
         # navigation scènes, stop, lancer la scène) --
@@ -415,14 +419,30 @@ class App:
         self._bar_count: int | None = None
         self._awaiting_bar_start = False
         self._bar_count_prev_beat: int | None = None
-        # Numéro de mesure de départ ("GO TO mesure", voir goto_bar_var) pour le
-        # prochain lancement de scène — 1 par défaut (début du morceau).
+        self._bar_count_signature_pushed_for: int | None = None
+        # Numéro de mesure de départ ("GOTO Label" + "PREROLL", voir
+        # goto_label_var/preroll_var) pour le prochain lancement de scène —
+        # 1 par défaut (début du morceau).
         self._bar_count_start = 1
+        # Saut GOTO en attente (nombre de temps), exécuté au premier vrai
+        # temps 1 détecté (voir _update_bar_count) plutôt qu'après un délai
+        # fixe : la quantification de lancement de Live (aucune, 1 mesure...)
+        # peut retarder le vrai démarrage du clip de façon imprévisible.
+        self._pending_goto_jump_beats: int | None = None
+        # Feuille de scène chargée en prévisualisation dès la SÉLECTION d'une
+        # scène (pas son lancement) pour peupler le sélecteur GOTO, voir
+        # _refresh_goto_labels — distincte de self._scene_sheet (celle-ci
+        # active/utilisée pendant la lecture), pour ne jamais perturber une
+        # scène en cours de lecture par simple navigation.
+        self._scene_sheet_preview: SceneSheet | None = None
         # Feuille de scène XLSX (scene_sheet.py) du morceau en cours, si le
         # fichier <nom de scène>.xlsx existe à côté du script ; None = aucune
         # feuille, comportement inchangé (voir _apply_scene_sheet_row).
         self._scene_sheet: SceneSheet | None = None
         self._scene_sheet_row: SceneSheetRow | None = None
+        # Dernière signature rythmique (numérateur COUNT) poussée à Live, pour
+        # ne la renvoyer que si elle change réellement (voir _apply_scene_sheet_row).
+        self._live_time_signature_sent: int | None = None
         # Dernier LABEL non vide rencontré : reste affiché tant qu'aucune
         # nouvelle valeur non vide n'arrive ("collant", voir _apply_scene_sheet_row).
         self._scene_label_sticky: str = ""
@@ -565,10 +585,21 @@ class App:
             activebackground=BG_IDLE, activeforeground=FG_TEXT,
         ).pack(side="left", padx=(16, 0))
 
-        tk.Label(settings_frame, text="  GO TO mesure :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
-        self.goto_bar_var = tk.IntVar(value=1)
+        # -- GOTO par LABEL (feuille de scène) + PREROLL, sous "Temps par
+        # mesure" : voir _refresh_goto_labels (peuplé à la sélection d'une
+        # scène) et _scene_launch (calcule le vrai saut Live). --
+        goto_frame = tk.Frame(self.root, bg=BG_IDLE)
+        goto_frame.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(goto_frame, text="GOTO :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.goto_label_var = tk.StringVar(value="")
+        self.goto_label_combo = ttk.Combobox(
+            goto_frame, textvariable=self.goto_label_var, state="readonly", width=16,
+        )
+        self.goto_label_combo.pack(side="left", padx=(6, 16))
+        tk.Label(goto_frame, text="PREROLL (mesures) :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.preroll_var = tk.IntVar(value=0)
         tk.Spinbox(
-            settings_frame, from_=1, to=999, width=5, textvariable=self.goto_bar_var,
+            goto_frame, from_=0, to=999, width=5, textvariable=self.preroll_var,
         ).pack(side="left", padx=(6, 0))
 
         # -- Affichage principal du temps : un carré, gros pour 1/3, petit pour 2/4 --
@@ -1263,6 +1294,11 @@ class App:
             self.live_osc.start_listen_metronome()
         except OSError:
             pass
+        try:
+            self.live_osc.start_listen_signature_numerator()
+            self.live_osc.start_listen_signature_denominator()
+        except OSError:
+            pass
         self._refresh_scene_state()
         try:
             self.live_osc.get_num_tracks()
@@ -1300,6 +1336,7 @@ class App:
         # doit reprendre qu'au lancement réel de la scène qui sera affichée.
         self._bar_count = None
         self._bar_count_prev_beat = None
+        self._bar_count_signature_pushed_for = None
         self._awaiting_bar_start = False
         self.bar_count_label.config(text="")
         self.shared_state.set_bar_count(None)
@@ -1359,28 +1396,45 @@ class App:
                 # suit ce lancement (voir _update_bar_count), pas à l'appui.
                 self._bar_count = None
                 self._bar_count_prev_beat = None
+                self._bar_count_signature_pushed_for = None
                 self._awaiting_bar_start = True
                 self.bar_count_label.config(text="")
                 self.shared_state.set_bar_count(None)
                 # Feuille de scène XLSX (<nom de scène>.xlsx, voir
                 # scene_sheet.py) : None si le fichier n'existe pas, aucun
-                # changement de comportement dans ce cas. "GO TO mesure"
-                # (goto_bar_var) fixe le point de départ du comptage ; on
-                # applique tout de suite la ligne correspondante (COUNT/
-                # HIGHLIGHT/LABEL) pour que le tout premier temps affiché
-                # soit déjà correct, sans attendre une mesure de retard.
+                # changement de comportement dans ce cas. "GOTO" (label
+                # choisi, moins PREROLL mesures) fixe le point de départ du
+                # comptage ; on applique tout de suite la ligne correspondante
+                # (COUNT/HIGHLIGHT/LABEL) pour que le tout premier temps
+                # affiché soit déjà correct, sans attendre une mesure de retard.
                 self._scene_sheet = load_scene_sheet(
                     self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Feuille de scène] {msg}"),
                 )
+                label_bar = (
+                    self._scene_sheet.bar_for_label(self.goto_label_var.get())
+                    if self._scene_sheet is not None else None
+                )
                 try:
-                    self._bar_count_start = max(1, int(self.goto_bar_var.get()))
+                    preroll = max(0, int(self.preroll_var.get()))
                 except (tk.TclError, ValueError):
-                    self._bar_count_start = 1
+                    preroll = 0
+                self._bar_count_start = max(1, label_bar - preroll) if label_bar is not None else 1
                 self._scene_label_sticky = (
                     self._scene_sheet.label_at_or_before(self._bar_count_start)
                     if self._scene_sheet is not None else ""
                 )
                 self._apply_scene_sheet_row(self._bar_count_start)
+                # Live ne connaît pas la notion de "mesure" : on saute réellement
+                # le clip qu'on vient de lancer du nombre de temps équivalent
+                # (somme des COUNT des mesures précédentes), pour qu'il démarre
+                # bien à self._bar_count_start plutôt qu'à son tout début.
+                # jump_in_running_session_clip n'agit que sur un clip déjà
+                # RUNNING : on attend donc le premier vrai temps 1 (voir
+                # _update_bar_count) avant d'envoyer le saut, la quantification
+                # de lancement de Live pouvant retarder le vrai démarrage du
+                # clip d'une durée variable (pas un délai fixe fiable).
+                jump_beats = sum(self._count_for_mes(m) for m in range(1, self._bar_count_start))
+                self._pending_goto_jump_beats = jump_beats or None
         except OSError as exc:
             self.scene_name_label.config(text=f"Erreur OSC : {exc}")
 
@@ -1432,6 +1486,12 @@ class App:
                     print(f"[OSC] erreur renvoyée par AbletonOSC : {args}")
             elif address == "/live/song/get/metronome":
                 self._metronome_on = bool(args[0])
+            elif address == "/live/song/get/signature_numerator":
+                # Confirmation réelle (horodatée) que Live a bien pris en
+                # compte le numérateur — à comparer avec l'instant d'envoi.
+                print(f"[Signature] Live confirme numerator={int(args[0])} t={time.monotonic():.3f}")
+            elif address == "/live/song/get/signature_denominator":
+                print(f"[Signature] Live confirme denominator={int(args[0])} t={time.monotonic():.3f}")
             elif address == "/live/song/get/num_tracks":
                 self._reset_faders_beyond(int(args[0]))
             elif address == "/live/track/get/volume":
@@ -1455,6 +1515,7 @@ class App:
                 index, name = int(args[0]), (args[1] or "")
                 if index == self._scene_index:
                     self._scene_name = name
+                    self._refresh_goto_labels()
                     # Convention du set : une scène nommée juste "84" ne fait
                     # que régler le tempo, la scène suivante contient le
                     # morceau prêt à être lancé — on affiche donc son nom
@@ -1501,6 +1562,42 @@ class App:
         web_name = f"À SUIVRE ({display_name})" if display_name else "À SUIVRE"
         self.shared_state.set_scene_name(web_name)
 
+    def _refresh_goto_labels(self) -> None:
+        """Recharge en prévisualisation la feuille de la scène SÉLECTIONNÉE
+        (pas forcément lancée) pour peupler le sélecteur GOTO, INTRO choisi
+        par défaut si présent. N'écrase jamais self._scene_sheet (celle de la
+        scène réellement en cours de lecture)."""
+        sheet = (
+            load_scene_sheet(self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: None)
+            if not self._scene_name.strip().isdigit() else None
+        )
+        self._scene_sheet_preview = sheet
+        labels = sheet.labels() if sheet is not None else []
+        self.goto_label_combo["values"] = labels
+        if "INTRO" in labels:
+            self.goto_label_var.set("INTRO")
+        elif labels:
+            self.goto_label_var.set(labels[0])
+        else:
+            self.goto_label_var.set("")
+
+    def _count_for_mes(self, mes: int) -> int:
+        """COUNT (temps par mesure) prévu pour la mesure `mes` d'après la
+        feuille de scène, ou la valeur configurée par défaut si absente/hors
+        feuille."""
+        row = self._scene_sheet.get(mes) if self._scene_sheet is not None else None
+        return row.count if row is not None and row.count else self.config["beats_per_bar"]
+
+    def _push_live_time_signature(self, count: int) -> None:
+        """Pousse `count` comme signature rythmique (numérateur) à Live, mais
+        seulement s'il diffère du dernier envoyé (Live n'a qu'une seule
+        signature globale, pas "par mesure" comme le tableur) : jamais
+        d'envoi OSC quand la valeur ne change pas."""
+        if count != self._live_time_signature_sent:
+            print(f"[Signature] envoi count={count} t={time.monotonic():.3f}")
+            self.live_osc.set_time_signature(count)
+            self._live_time_signature_sent = count
+
     def _apply_scene_sheet_row(self, mes: int) -> None:
         """Applique la ligne de la feuille de scène (scene_sheet.py) pour la
         mesure `mes` : COUNT (temps par mesure, avec retour à la valeur
@@ -1509,9 +1606,10 @@ class App:
         arrive). Sans feuille (ou mesure hors feuille), comportement normal."""
         row = self._scene_sheet.get(mes) if self._scene_sheet is not None else None
         self._scene_sheet_row = row
-        count = row.count if row is not None and row.count else self.config["beats_per_bar"]
+        count = self._count_for_mes(mes)
         self.beats_var.set(count)
         self.midi_state.beats_per_bar = count
+        self._push_live_time_signature(count)
         if row is not None and row.label:
             self._scene_label_sticky = row.label
         self.scene_label_label.config(text=self._scene_label_sticky)
@@ -1558,12 +1656,13 @@ class App:
             self._link_dialog.destroy()
             self._link_dialog = None
 
-    def _update_bar_count(self, connected: bool, beat: int) -> None:
+    def _update_bar_count(self, connected: bool, beat: int, fractional: float = 0.0) -> None:
         """Compte les mesures depuis le premier vrai temps 1 qui suit le
         lancement du morceau en cours (armé par _scene_launch pour les vraies
         scènes uniquement, jamais pour les scènes "tempo seul"/préparation)."""
         if not connected:
             self._bar_count_prev_beat = None
+            self._bar_count_signature_pushed_for = None
             return
         if self._awaiting_bar_start:
             if beat == 1:
@@ -1572,12 +1671,29 @@ class App:
                 self._bar_count_prev_beat = 1
                 self.bar_count_label.config(text=f"Mesure {self._bar_count}")
                 self.shared_state.set_bar_count(self._bar_count)
+                if self._pending_goto_jump_beats:
+                    self._jump_beats(self._pending_goto_jump_beats)
+                self._pending_goto_jump_beats = None
             return
         if self._bar_count is not None and beat == 1 and self._bar_count_prev_beat != 1:
             self._bar_count += 1
             self._apply_scene_sheet_row(self._bar_count)
             self.bar_count_label.config(text=f"Mesure {self._bar_count}")
             self.shared_state.set_bar_count(self._bar_count)
+        elif (
+            self._bar_count is not None
+            and beat == self.midi_state.beats_per_bar
+            and fractional >= 0.5
+            and self._bar_count_signature_pushed_for != self._bar_count
+        ):
+            # Anticipe le changement de signature côté Live : on le pousse à
+            # la moitié du dernier temps de la mesure en cours (pas à son
+            # tout début), pour qu'il ait le temps d'être appliqué avant le
+            # changement réel tout en restant le plus proche possible de la
+            # bascule. Ne touche ni beats_var ni la feuille/highlight
+            # locaux, qui basculent toujours exactement au temps 1 suivant.
+            self._push_live_time_signature(self._count_for_mes(self._bar_count + 1))
+            self._bar_count_signature_pushed_for = self._bar_count
         self._bar_count_prev_beat = beat
 
     def _poll(self) -> None:
@@ -1605,7 +1721,7 @@ class App:
                 self._awaiting_downbeat = False
             running = connected  # présence réelle du clock, avant masquage
             connected = connected and not self._awaiting_downbeat
-            self._update_bar_count(connected, beat)
+            self._update_bar_count(connected, beat, phase % 1.0)
             self._update_display(beat, self.midi_state.beats_per_bar, phase % 1.0, self.midi_state.bpm, connected, running)
             self.shared_state.update(
                 self.midi_state.phase(), self.midi_state.beats_per_bar,
@@ -1667,7 +1783,7 @@ class App:
                     self._link_prev_fractional = fractional
                     beat = self._link_beat_in_bar
                 connected = connected and not self._awaiting_downbeat
-                self._update_bar_count(connected, beat)
+                self._update_bar_count(connected, beat, fractional)
                 self._update_display(beat, int(quantum), fractional, snapshot["bpm"], connected, snapshot["is_playing"])
                 self._update_link_peers_label(link.num_peers)
                 self._on_link_tempo_observed(snapshot["bpm"])

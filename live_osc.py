@@ -35,13 +35,23 @@ def _osc_message(address: str, *args: float | str | bool) -> bytes:
             type_tags += "T" if arg else "F"
         elif isinstance(arg, str):
             type_tags += "s"
+        elif isinstance(arg, int):
+            # Certaines propriétés Live (ex. signature_numerator/denominator)
+            # ont un setter LOM typé int côté C++ : un tag "f" (float) fait
+            # échouer l'appel côté AbletonOSC ("did not match C++ signature").
+            type_tags += "i"
         else:
             type_tags += "f"
     message = _osc_string(address) + _osc_string(type_tags)
     for value in args:
         if isinstance(value, bool):
             continue  # les tags T/F du protocole OSC ne portent aucun octet de donnée
-        message += _osc_string(value) if isinstance(value, str) else struct.pack(">f", value)
+        elif isinstance(value, str):
+            message += _osc_string(value)
+        elif isinstance(value, int):
+            message += struct.pack(">i", value)
+        else:
+            message += struct.pack(">f", value)
     return message
 
 
@@ -144,6 +154,13 @@ class LiveOSC:
     def fire_scene(self, index: int) -> None:
         self.send("/live/scene/fire", index)
 
+    def set_time_signature(self, numerator: int, denominator: int = 4) -> None:
+        """Signature rythmique globale du Set (Song.signature_numerator/
+        denominator du LOM) — une seule valeur pour tout le projet, pas "par
+        mesure" : on la pousse à chaque bascule de COUNT dans la scene sheet."""
+        self.send("/live/song/set/signature_numerator", int(numerator))
+        self.send("/live/song/set/signature_denominator", int(denominator))
+
     def set_track_volume(self, track_index: int, value: float) -> None:
         """Position du volume d'une piste (0.0 à 1.0, cf. Track.volume du LOM)."""
         self.send("/live/track/set/volume", track_index, value)
@@ -199,6 +216,20 @@ class LiveOSC:
         /live/song/get/metronome (enabled) via poll_replies(), y compris la
         valeur actuelle immédiatement à l'abonnement."""
         self.send("/live/song/start_listen/metronome")
+
+    def start_listen_signature_numerator(self) -> None:
+        """Abonne aux changements du numérateur de la signature rythmique
+        globale (Song.signature_numerator) : Live renvoie une réponse
+        /live/song/get/signature_numerator (numerator) via poll_replies() à
+        l'abonnement PUIS à chaque fois qu'il a réellement appliqué un
+        changement (le nôtre ou un depuis Live) — sert de confirmation
+        réelle, distincte de l'instant où on l'a envoyé."""
+        self.send("/live/song/start_listen/signature_numerator")
+
+    def start_listen_signature_denominator(self) -> None:
+        """Abonne aux changements du dénominateur, cf.
+        start_listen_signature_numerator."""
+        self.send("/live/song/start_listen/signature_denominator")
 
     def set_metronome(self, enabled: bool) -> None:
         """Active/désactive le métronome de Live (Song.metronome du LOM)."""

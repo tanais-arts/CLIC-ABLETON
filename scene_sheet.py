@@ -44,6 +44,23 @@ class SceneSheet:
                 return row.label
         return ""
 
+    def labels(self) -> list[str]:
+        """LABEL non vides, dans l'ordre des mesures, sans doublon (garde la
+        première occurrence) : peuple le sélecteur GOTO."""
+        result: list[str] = []
+        for mes in sorted(self._rows):
+            label = self._rows[mes].label
+            if label and label not in result:
+                result.append(label)
+        return result
+
+    def bar_for_label(self, label: str) -> int | None:
+        """Première mesure portant ce LABEL, ou None si absent."""
+        for mes in sorted(self._rows):
+            if self._rows[mes].label == label:
+                return mes
+        return None
+
 
 def load_scene_sheet(scene_name: str, base_dir: Path, log=print) -> SceneSheet | None:
     """Charge `<base_dir>/<scene_name>.xlsx` si le fichier existe, sinon None."""
