@@ -210,13 +210,6 @@ class LiveOSC:
         n'écoute côté Live au moment de l'envoi)."""
         self.send("/live/test")
 
-    def start_listen_metronome(self) -> None:
-        """Abonne aux changements du métronome (même d'origine externe, ex.
-        souris dans Live) : chaque changement renvoie une réponse
-        /live/song/get/metronome (enabled) via poll_replies(), y compris la
-        valeur actuelle immédiatement à l'abonnement."""
-        self.send("/live/song/start_listen/metronome")
-
     def start_listen_signature_numerator(self) -> None:
         """Abonne aux changements du numérateur de la signature rythmique
         globale (Song.signature_numerator) : Live renvoie une réponse
@@ -231,9 +224,13 @@ class LiveOSC:
         start_listen_signature_numerator."""
         self.send("/live/song/start_listen/signature_denominator")
 
-    def set_metronome(self, enabled: bool) -> None:
-        """Active/désactive le métronome de Live (Song.metronome du LOM)."""
-        self.send("/live/song/set/metronome", bool(enabled))
+    def get_current_beats_song_time(self) -> None:
+        """Interroge le vrai compteur mesure.temps.sixteenth.tick de Live
+        (Song.get_current_beats_song_time du LOM) : réponse
+        /live/song/get/current_beats_song_time (symbole "bars.beats.
+        sixteenths.ticks"). Nécessite le handler ajouté côté script
+        AbletonOSC local (non exposé nativement) — diagnostic uniquement."""
+        self.send("/live/song/get/current_beats_song_time")
 
     def start_playing(self) -> None:
         """Démarre la lecture (Song.start_playing) — utilisé après le

@@ -26,8 +26,28 @@ DEFAULTS = {
     # C#-2 pour Stop, D-2 pour Lancer la scène (Play).
     "controller_map_stop": ["note", 0, 1],
     "controller_map_play": ["note", 0, 2],
-    # D#-2 pour activer/désactiver le métronome de Live.
+    # D#-2 pour activer/désactiver notre métronome audio local (voir
+    # audio_metronome.py) — ne commande plus le métronome interne de Live.
     "controller_map_metronome": ["note", 0, 3],
+    "controller_map_metronome_2": ["note", 0, 4],
+    # Carte son et nombre de canaux pour le métronome audio local.
+    # "" = périphérique de sortie par défaut du système. channels : 2 = paire
+    # stéréo, 1 = mono (toujours les premiers canaux du périphérique).
+    "metronome_audio_device": "",
+    "metronome_audio_channels": 2,
+    # Dossier de sons de clic (sounds/<kit>/click.wav + click_up.wav), voir
+    # audio_metronome.list_kits().
+    "metronome_kit": "Kit1",
+    # Compensation de latence du clic audio local (ms, +/-) : positif =
+    # déclenche le clic plus tôt (compense la latence de la carte son/de
+    # l'ampli), distinct de "latency_ms" qui ne concerne que l'affichage.
+    "metronome_audio_latency_ms": 70,
+    # Deuxième sortie métronome (2e carte son + kit + latence), jouée en
+    # parallèle de la première quand activée (2 musiciens, clics différents).
+    "metronome_audio_device_2": "",
+    "metronome_audio_channels_2": 2,
+    "metronome_kit_2": "Kit1",
+    "metronome_audio_latency_ms_2": 0,
     # Mapping piste Live (index) -> tranche HUI/Yamaha (valeur), 0-14 (la
     # tranche 15/canal 16 est réservée au contrôle du tempo, voir
     # TEMPO_FADER_ZONE dans beat_display.py, donc absente du mapping).

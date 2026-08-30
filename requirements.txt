@@ -1,2 +1,4 @@
 python-rtmidi
 openpyxl
+sounddevice
+numpy

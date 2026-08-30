@@ -231,12 +231,42 @@ muteBtn.addEventListener('click', () => {
   }
 });
 
-function playClick(beat) {
-  if (muted || !audioCtx || !clickBuffer || !clickUpBuffer) return;
+// Planification "lookahead" (horloge audio, pas le timer JS) : au lieu de
+// jouer le clic au moment où poll() détecte un changement de temps (sujet
+// aux à-coups du setInterval/réseau, cause des lags occasionnels), on
+// planifie les prochains clics un peu à l'avance via audioCtx.currentTime.
+// Une fois planifié, un clic part à l'heure pile même si le thread JS
+// bloque momentanément après coup.
+let nextClickAt = null;   // audioCtx.currentTime du prochain clic déjà planifié
+let nextClickBeat = null; // numéro de temps (1..beats_per_bar) de ce clic
+const SCHEDULE_AHEAD_S = 0.15;
+
+function scheduleClick(at, beat) {
   const source = audioCtx.createBufferSource();
   source.buffer = beat === 1 ? clickUpBuffer : clickBuffer;
   source.connect(audioCtx.destination);
-  source.start(0);
+  source.start(at);
+}
+
+function scheduleUpcomingClicks(data) {
+  if (muted || !audioCtx || !clickBuffer || !clickUpBuffer || !data.bpm) return;
+  const beatsPerBar = data.beats_per_bar || 4;
+  const secondsPerBeat = 60 / data.bpm;
+  const fractionalBeat = (data.bar_phase * beatsPerBar) % 1;
+  const now = audioCtx.currentTime;
+  const trueNextAt = now + (1 - fractionalBeat) * secondsPerBeat;
+  const trueNextBeat = (data.beat % beatsPerBar) + 1;
+  // Écart trop grand avec le planning en cours (reconnexion, changement de
+  // tempo, saut de scène) : on repart de la vraie position du serveur.
+  if (nextClickAt === null || Math.abs(trueNextAt - nextClickAt) > secondsPerBeat * 0.5) {
+    nextClickAt = trueNextAt;
+    nextClickBeat = trueNextBeat;
+  }
+  while (nextClickAt < now + SCHEDULE_AHEAD_S) {
+    scheduleClick(nextClickAt, nextClickBeat);
+    nextClickAt += secondsPerBeat;
+    nextClickBeat = (nextClickBeat % beatsPerBar) + 1;
+  }
 }
 
 function retrigger(el, cls) {
@@ -257,6 +287,7 @@ async function poll() {
       scrollLineEl.style.display = 'none';
       offlineEl.style.display = 'block';
       lastBeat = null;
+      nextClickAt = null;
       return;
     }
     offlineEl.style.display = 'none';
@@ -265,9 +296,9 @@ async function poll() {
       scrollLineEl.style.display = 'none';
       digitEl.style.display = 'block';
       digitEl.textContent = data.beat;
+      scheduleUpcomingClicks(data);
       if (data.beat !== lastBeat) {
         lastBeat = data.beat;
-        playClick(data.beat);
         if (data.beat === 1) {
           document.body.classList.remove('flash-blue');
           retrigger(document.body, 'flash');
@@ -279,6 +310,7 @@ async function poll() {
     } else {
       digitEl.style.display = 'none';
       lastBeat = null;
+      nextClickAt = null;
       if (data.bpm && !data.running) {
         // À l'arrêt (mais tempo connu) : la ligne se remplit de gauche à
         // droite, synchronisée sur le temps réel (vide au temps 1, pleine

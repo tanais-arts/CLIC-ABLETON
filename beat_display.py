@@ -13,6 +13,7 @@ compteur sur un smartphone connecté au même réseau. Voir README.md.
 from __future__ import annotations
 
 import queue
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -20,6 +21,7 @@ from tkinter import ttk
 
 import rtmidi
 
+from audio_metronome import AudioMetronome, list_kits, list_output_devices
 from config import load_config, save_config
 from hui_bridge import HuiBridge
 from link_client import AbletonLink, LinkUnavailable
@@ -270,6 +272,9 @@ class App:
     # position au tempo affiché toutes les INTERVAL_S.
     TEMPO_FADER_KEEPALIVE_HOLDOFF_S = 1.5
     TEMPO_FADER_KEEPALIVE_INTERVAL_S = 1.0
+    # Métronome audio local : libellé affiché pour "périphérique par défaut
+    # du système" (config.json stocke "" dans ce cas, voir audio_metronome.py).
+    METRONOME_DEFAULT_DEVICE_LABEL = "Par défaut (système)"
     # Options de plage du fader 16 : (libellé affiché, clé persistée en config).
     TEMPO_RANGE_OPTIONS = [
         ("± 3 %", "3"), ("± 6 %", "6"), ("± 10 %", "10"), ("± 20 %", "20"),
@@ -284,6 +289,12 @@ class App:
         self.root.minsize(520, 420)
 
         self.config = load_config()
+        # Dernières valeurs valides de beats_var/latency_var (Spinbox) : leur
+        # IntVar.get() lève TclError le temps où le champ est vidé pendant la
+        # frappe, ce qui plantait _poll() et gelait l'affichage/le métronome
+        # jusqu'à l'appui suivant (voir _safe_int_var).
+        self._beats_per_bar_cache: int = self.config["beats_per_bar"]
+        self._latency_ms_cache: int = self.config["latency_ms"]
 
         # -- Source MIDI (repli pour les logiciels sans Link) --
         self._event_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -312,23 +323,54 @@ class App:
         # arrière) et le rappel du fader 16 (bouton Mute, _reset_tempo_fader).
         self._scene_origin_tempo: float | None = None
 
-        # -- Métronome de Live (activer/désactiver) : état tenu à jour par
-        # l'abonnement OSC (reflète aussi un changement fait depuis Live). --
+        # -- Métronome audio local (clic .wav, voir audio_metronome.py) : ne
+        # commande plus le métronome interne de Live (sa signature globale
+        # ne correspond pas à notre feuille de scène à mesures variables). --
         self._metronome_on: bool = False
-        self.live_osc.start_listen_metronome()
+        self._last_played_beat: int | None = None
+        self._metronome_on_2: bool = False
+        self._audio_metronome = AudioMetronome()
+        self._audio_metronome.set_kit(self.config["metronome_kit"])
+        self._audio_metronome.configure(
+            self.config["metronome_audio_device"], self.config["metronome_audio_channels"],
+        )
+        # Deuxième sortie (voir _build_ui metronome_frame_2) : jouée en
+        # parallèle de la première quand activée, propre carte son/kit/latence.
+        self._audio_metronome_2 = AudioMetronome()
+        self._audio_metronome_2.set_kit(self.config["metronome_kit_2"])
+        self._audio_metronome_2.configure(
+            self.config["metronome_audio_device_2"], self.config["metronome_audio_channels_2"],
+        )
+        # Cache non-Tkinter du mode courant, lu par _metronome_loop (thread
+        # séparé : lire un tk.StringVar hors du thread Tk n'est pas sûr).
+        self._mode_cache: str = self.config["mode"]
+        self._metronome_latency_ms_cache: int = self.config["metronome_audio_latency_ms"]
+        self._metronome_latency_ms_cache_2: int = self.config["metronome_audio_latency_ms_2"]
+        self._last_played_beat_2: int | None = None
+        # Déclenche les clics indépendamment de _poll()/after() : sur macOS,
+        # bouger la souris sur la fenêtre peut geler les timers Tcl "after()"
+        # (limitation connue de Tk/Cocoa), ce qui rendait aussi bien le clic
+        # que l'affichage irréguliers puisque tout passait par _poll(). Ce
+        # thread ne touche à aucun widget Tk (voir _metronome_loop).
+        self._metronome_thread_stop = threading.Event()
+        self._metronome_thread = threading.Thread(target=self._metronome_loop, daemon=True)
         # Confirmation réelle (pas juste l'instant d'envoi) de la prise en
         # compte de la signature par Live, voir _poll_scene_replies.
         self.live_osc.start_listen_signature_numerator()
         self.live_osc.start_listen_signature_denominator()
+        # Diagnostic temporaire (mes5/mes10 sur Viser) : vrai compteur
+        # mesure.temps.sixteenth.tick de Live, interrogé périodiquement
+        # (voir _poll, nécessite le handler ajouté côté script AbletonOSC).
+        self._last_beats_song_time_query = 0.0
 
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour les 6 boutons (nudge,
         # navigation scènes, stop, lancer la scène) --
         self._controller_queue: "queue.Queue[list[int]]" = queue.Queue()
         self.controller = ControllerListener(self._controller_queue)
-        self._action_order = ["minus", "plus", "scene_prev", "scene_next", "stop", "play", "metronome"]
+        self._action_order = ["minus", "plus", "scene_prev", "scene_next", "stop", "play", "metronome", "metronome_2"]
         self._action_labels = {
             "minus": "−1", "plus": "+1", "scene_prev": "▲", "scene_next": "▼", "stop": "■", "play": "▶",
-            "metronome": "M",
+            "metronome": "M", "metronome_2": "M2",
         }
         self._action_commands = {
             "minus": lambda: self._jump_beats(-1),
@@ -338,6 +380,7 @@ class App:
             "stop": self._stop_return_to_start,
             "play": self._scene_launch,
             "metronome": self._toggle_metronome,
+            "metronome_2": self._toggle_metronome_2,
         }
         self.controller_map: dict[str, tuple[str, int, int] | None] = {
             action: _as_key(self.config.get(f"controller_map_{action}"))
@@ -435,6 +478,10 @@ class App:
         # active/utilisée pendant la lecture), pour ne jamais perturber une
         # scène en cours de lecture par simple navigation.
         self._scene_sheet_preview: SceneSheet | None = None
+        # Dernier GOTO choisi par scène (nom -> label), pour le retrouver en
+        # y revenant après avoir navigué ailleurs (voir _refresh_goto_labels).
+        # Vidé au redémarrage du logiciel (repart sur INTRO par défaut).
+        self._goto_label_by_scene: dict[str, str] = {}
         # Feuille de scène XLSX (scene_sheet.py) du morceau en cours, si le
         # fichier <nom de scène>.xlsx existe à côté du script ; None = aucune
         # feuille, comportement inchangé (voir _apply_scene_sheet_row).
@@ -485,6 +532,7 @@ class App:
         self._apply_mode()
         self._poll()
         self._ping_live()
+        self._metronome_thread.start()
 
     # ---------------------------------------------------------------- UI --
     def _build_ui(self) -> None:
@@ -602,9 +650,104 @@ class App:
             goto_frame, from_=0, to=999, width=5, textvariable=self.preroll_var,
         ).pack(side="left", padx=(6, 0))
 
+        # -- Métronome audio local (clic.wav, voir audio_metronome.py) : carte
+        # son + sortie (paire stéréo ou mono), activé/désactivé par le bouton
+        # "M" (_toggle_metronome), plus le métronome interne de Live. --
+        metronome_frame = tk.Frame(self.root, bg=BG_IDLE)
+        metronome_frame.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(metronome_frame, text="Métronome — Carte son :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.metronome_device_var = tk.StringVar(
+            value=self.config["metronome_audio_device"] or self.METRONOME_DEFAULT_DEVICE_LABEL,
+        )
+        self.metronome_device_combo = ttk.Combobox(
+            metronome_frame, textvariable=self.metronome_device_var, state="readonly", width=26,
+        )
+        self.metronome_device_combo.pack(side="left", padx=(6, 4))
+        self.metronome_device_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_metronome_audio_change())
+        tk.Button(
+            metronome_frame, text="Rafraîchir", command=self._refresh_metronome_devices,
+        ).pack(side="left", padx=(0, 16))
+        tk.Label(metronome_frame, text="Kit :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.metronome_kit_var = tk.StringVar(value=self.config["metronome_kit"])
+        self.metronome_kit_combo = ttk.Combobox(
+            metronome_frame, textvariable=self.metronome_kit_var, state="readonly", width=10,
+            values=list_kits(),
+        )
+        self.metronome_kit_combo.pack(side="left", padx=(6, 16))
+        self.metronome_kit_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_metronome_audio_change())
+        tk.Label(metronome_frame, text="Sortie :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.metronome_channels_var = tk.IntVar(value=self.config["metronome_audio_channels"])
+        tk.Radiobutton(
+            metronome_frame, text="Stéréo (2 canaux)", variable=self.metronome_channels_var, value=2,
+            command=self._on_metronome_audio_change, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
+            activebackground=BG_IDLE, activeforeground=FG_TEXT,
+        ).pack(side="left", padx=(6, 0))
+        tk.Radiobutton(
+            metronome_frame, text="Mono (1 canal)", variable=self.metronome_channels_var, value=1,
+            command=self._on_metronome_audio_change, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
+            activebackground=BG_IDLE, activeforeground=FG_TEXT,
+        ).pack(side="left", padx=(6, 0))
+        tk.Label(metronome_frame, text="Latence clic (ms) :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", padx=(16, 0))
+        self.metronome_latency_var = tk.IntVar(value=self.config["metronome_audio_latency_ms"])
+        tk.Spinbox(
+            metronome_frame, from_=-500, to=500, increment=5, width=6,
+            textvariable=self.metronome_latency_var, command=self._on_metronome_audio_change,
+        ).pack(side="left", padx=(6, 0))
+
+        # -- Deuxième sortie métronome (2e musicien, propre carte son/kit/
+        # latence), activée/désactivée par le bouton "M2" (_toggle_metronome_2). --
+        metronome_frame_2 = tk.Frame(self.root, bg=BG_IDLE)
+        metronome_frame_2.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(metronome_frame_2, text="Métronome 2 — Carte son :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.metronome_device_var_2 = tk.StringVar(
+            value=self.config["metronome_audio_device_2"] or self.METRONOME_DEFAULT_DEVICE_LABEL,
+        )
+        self.metronome_device_combo_2 = ttk.Combobox(
+            metronome_frame_2, textvariable=self.metronome_device_var_2, state="readonly", width=26,
+        )
+        self.metronome_device_combo_2.pack(side="left", padx=(6, 4))
+        self.metronome_device_combo_2.bind("<<ComboboxSelected>>", lambda _e: self._on_metronome_audio_change_2())
+        tk.Button(
+            metronome_frame_2, text="Rafraîchir", command=self._refresh_metronome_devices,
+        ).pack(side="left", padx=(0, 16))
+        tk.Label(metronome_frame_2, text="Kit :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.metronome_kit_var_2 = tk.StringVar(value=self.config["metronome_kit_2"])
+        self.metronome_kit_combo_2 = ttk.Combobox(
+            metronome_frame_2, textvariable=self.metronome_kit_var_2, state="readonly", width=10,
+            values=list_kits(),
+        )
+        self.metronome_kit_combo_2.pack(side="left", padx=(6, 16))
+        self.metronome_kit_combo_2.bind("<<ComboboxSelected>>", lambda _e: self._on_metronome_audio_change_2())
+        tk.Label(metronome_frame_2, text="Sortie :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.metronome_channels_var_2 = tk.IntVar(value=self.config["metronome_audio_channels_2"])
+        tk.Radiobutton(
+            metronome_frame_2, text="Stéréo (2 canaux)", variable=self.metronome_channels_var_2, value=2,
+            command=self._on_metronome_audio_change_2, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
+            activebackground=BG_IDLE, activeforeground=FG_TEXT,
+        ).pack(side="left", padx=(6, 0))
+        tk.Radiobutton(
+            metronome_frame_2, text="Mono (1 canal)", variable=self.metronome_channels_var_2, value=1,
+            command=self._on_metronome_audio_change_2, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
+            activebackground=BG_IDLE, activeforeground=FG_TEXT,
+        ).pack(side="left", padx=(6, 0))
+        tk.Label(metronome_frame_2, text="Latence clic (ms) :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", padx=(16, 0))
+        self.metronome_latency_var_2 = tk.IntVar(value=self.config["metronome_audio_latency_ms_2"])
+        tk.Spinbox(
+            metronome_frame_2, from_=-500, to=500, increment=5, width=6,
+            textvariable=self.metronome_latency_var_2, command=self._on_metronome_audio_change_2,
+        ).pack(side="left", padx=(6, 0))
+        self._refresh_metronome_devices()
+
         # -- Affichage principal du temps : un carré, gros pour 1/3, petit pour 2/4 --
         self.display = tk.Canvas(self.root, bg=BG_IDLE, highlightthickness=0)
         self.display.pack(expand=True, fill="both", padx=10, pady=4)
+        # Items persistants (créés une seule fois, puis déplacés/recolorés via
+        # coords()/itemconfig()) : recréer tous les items à chaque frame
+        # (delete("all") + create_*) au rythme du _poll (30 ms) est ce qui
+        # rend l'appli à la traîne dès qu'on bouge la souris au-dessus du
+        # canvas sous macOS/Tk (Cocoa recalcule les zones de suivi de la
+        # souris à chaque création/suppression d'item).
+        self._canvas_items: dict[str, int] = {}
 
         # -- Label de section (INTRO/COUPLET/REFRAIN..., voir scene_sheet.py) --
         self.scene_label_label = tk.Label(
@@ -645,6 +788,7 @@ class App:
         self.learn_buttons: dict[str, tk.Button] = {}
         self.clear_buttons: dict[str, tk.Button] = {}
         self.action_buttons: dict[str, tk.Frame] = {}
+        self._control_buttons: dict[str, tk.Button] = {}
         self._action_flash_after_id: dict[str, str] = {}
 
         def add_mini_button(parent: tk.Frame, text: str, command) -> tk.Button:
@@ -668,6 +812,7 @@ class App:
             btn = tk.Button(flash_holder, text=text, command=self._action_commands[action], **square_btn)
             btn.pack(padx=3, pady=3)
             self.action_buttons[action] = flash_holder
+            self._control_buttons[action] = btn
 
         add_control("minus", "−1")
         add_control("plus", "+1")
@@ -676,6 +821,7 @@ class App:
         add_control("play", "▶")
         add_control("stop", "■")
         add_control("metronome", "M")
+        add_control("metronome_2", "M2")
 
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour piloter les mêmes boutons --
         controller_row = tk.Frame(self.root, bg=BG_IDLE)
@@ -1054,9 +1200,70 @@ class App:
             return
         self.midi_state.beats_per_bar = beats
         self.config["beats_per_bar"] = beats
+        self._beats_per_bar_cache = beats
         self.config["latency_ms"] = latency
         self.config["mode"] = self.mode_var.get()
+        self._mode_cache = self.config["mode"]
         self.config["dots_only"] = self.dots_var.get()
+        save_config(self.config)
+
+    def _safe_int_var(self, var: tk.IntVar, cache_attr: str) -> int:
+        """Lit un IntVar de Spinbox sans planter _poll() quand le champ est
+        momentanément vide (pendant la frappe) : renvoie la dernière valeur
+        valide connue dans ce cas, au lieu de laisser remonter TclError."""
+        try:
+            value = int(var.get())
+        except (tk.TclError, ValueError):
+            return getattr(self, cache_attr)
+        setattr(self, cache_attr, value)
+        return value
+
+    def _refresh_metronome_devices(self) -> None:
+        devices = list_output_devices()
+        values = [self.METRONOME_DEFAULT_DEVICE_LABEL] + devices
+        self.metronome_device_combo["values"] = values
+        if self.metronome_device_var.get() not in devices:
+            self.metronome_device_var.set(self.METRONOME_DEFAULT_DEVICE_LABEL)
+        self.metronome_device_combo_2["values"] = values
+        if self.metronome_device_var_2.get() not in devices:
+            self.metronome_device_var_2.set(self.METRONOME_DEFAULT_DEVICE_LABEL)
+
+    def _on_metronome_audio_change(self) -> None:
+        device = self.metronome_device_var.get()
+        if device == self.METRONOME_DEFAULT_DEVICE_LABEL:
+            device = ""
+        try:
+            channels = 1 if int(self.metronome_channels_var.get()) == 1 else 2
+        except (tk.TclError, ValueError):
+            channels = 2
+        self._audio_metronome.set_kit(self.metronome_kit_var.get())
+        self._audio_metronome.configure(device, channels)
+        self.config["metronome_audio_device"] = device
+        self.config["metronome_audio_channels"] = channels
+        self.config["metronome_kit"] = self.metronome_kit_var.get()
+        self._metronome_latency_ms_cache = self._safe_int_var(
+            self.metronome_latency_var, "_metronome_latency_ms_cache",
+        )
+        self.config["metronome_audio_latency_ms"] = self._metronome_latency_ms_cache
+        save_config(self.config)
+
+    def _on_metronome_audio_change_2(self) -> None:
+        device = self.metronome_device_var_2.get()
+        if device == self.METRONOME_DEFAULT_DEVICE_LABEL:
+            device = ""
+        try:
+            channels = 1 if int(self.metronome_channels_var_2.get()) == 1 else 2
+        except (tk.TclError, ValueError):
+            channels = 2
+        self._audio_metronome_2.set_kit(self.metronome_kit_var_2.get())
+        self._audio_metronome_2.configure(device, channels)
+        self.config["metronome_audio_device_2"] = device
+        self.config["metronome_audio_channels_2"] = channels
+        self.config["metronome_kit_2"] = self.metronome_kit_var_2.get()
+        self._metronome_latency_ms_cache_2 = self._safe_int_var(
+            self.metronome_latency_var_2, "_metronome_latency_ms_cache_2",
+        )
+        self.config["metronome_audio_latency_ms_2"] = self._metronome_latency_ms_cache_2
         save_config(self.config)
 
     # --------------------------------------------------------- Ableton Link --
@@ -1291,10 +1498,6 @@ class App:
         if self.hui_bridge_2.port_name:
             self._set_hui_listen(8, listen=True)
         try:
-            self.live_osc.start_listen_metronome()
-        except OSError:
-            pass
-        try:
             self.live_osc.start_listen_signature_numerator()
             self.live_osc.start_listen_signature_denominator()
         except OSError:
@@ -1456,12 +1659,25 @@ class App:
             self.status_label.config(text=f"Erreur OSC : {exc}")
 
     def _toggle_metronome(self) -> None:
-        """Bascule le métronome de Live. `self._metronome_on` (mis à jour par
-        l'abonnement OSC) reflète l'état réel, pas seulement nos propres appuis."""
-        try:
-            self.live_osc.set_metronome(not self._metronome_on)
-        except OSError as exc:
-            self.status_label.config(text=f"Erreur OSC : {exc}")
+        """Bascule notre métronome audio local (clic.wav via la carte son
+        choisie, voir audio_metronome.py) — ne commande plus le métronome
+        interne de Live."""
+        self._metronome_on = not self._metronome_on
+        self._last_played_beat = None
+        self._audio_metronome.set_enabled(self._metronome_on)
+        btn = self._control_buttons.get("metronome")
+        if btn is not None:
+            btn.config(text="M ●" if self._metronome_on else "M")
+
+    def _toggle_metronome_2(self) -> None:
+        """Bascule la deuxième sortie métronome (voir _build_ui
+        metronome_frame_2), indépendante de la première (2e musicien)."""
+        self._metronome_on_2 = not self._metronome_on_2
+        self._last_played_beat_2 = None
+        self._audio_metronome_2.set_enabled(self._metronome_on_2)
+        btn = self._control_buttons.get("metronome_2")
+        if btn is not None:
+            btn.config(text="M2 ●" if self._metronome_on_2 else "M2")
 
     def _poll_scene_replies(self) -> None:
         for address, args in self.live_osc.poll_replies():
@@ -1484,14 +1700,17 @@ class App:
                 # pistes) : ce n'est pas une vraie erreur, on ne l'affiche pas.
                 if not any("Index out of range" in str(arg) for arg in args):
                     print(f"[OSC] erreur renvoyée par AbletonOSC : {args}")
-            elif address == "/live/song/get/metronome":
-                self._metronome_on = bool(args[0])
             elif address == "/live/song/get/signature_numerator":
                 # Confirmation réelle (horodatée) que Live a bien pris en
                 # compte le numérateur — à comparer avec l'instant d'envoi.
                 print(f"[Signature] Live confirme numerator={int(args[0])} t={time.monotonic():.3f}")
             elif address == "/live/song/get/signature_denominator":
                 print(f"[Signature] Live confirme denominator={int(args[0])} t={time.monotonic():.3f}")
+            elif address == "/live/song/get/current_beats_song_time":
+                # Diagnostic mes5/mes10 : vrai compteur mesure.temps.
+                # sixteenth.tick de Live (voir get_current_beats_song_time),
+                # à comparer avec notre propre compteur de mesure.
+                print(f"[LiveBeat] t={time.monotonic():.3f} pos={args[0]}")
             elif address == "/live/song/get/num_tracks":
                 self._reset_faders_beyond(int(args[0]))
             elif address == "/live/track/get/volume":
@@ -1514,6 +1733,10 @@ class App:
             elif address == "/live/scene/get/name":
                 index, name = int(args[0]), (args[1] or "")
                 if index == self._scene_index:
+                    # Mémorise le GOTO choisi pour la scène qu'on quitte, avant
+                    # qu'il ne soit écrasé par _refresh_goto_labels ci-dessous.
+                    if self._scene_name and not self._scene_name.strip().isdigit():
+                        self._goto_label_by_scene[self._scene_name] = self.goto_label_var.get()
                     self._scene_name = name
                     self._refresh_goto_labels()
                     # Convention du set : une scène nommée juste "84" ne fait
@@ -1574,7 +1797,10 @@ class App:
         self._scene_sheet_preview = sheet
         labels = sheet.labels() if sheet is not None else []
         self.goto_label_combo["values"] = labels
-        if "INTRO" in labels:
+        remembered = self._goto_label_by_scene.get(self._scene_name)
+        if remembered in labels:
+            self.goto_label_var.set(remembered)
+        elif "INTRO" in labels:
             self.goto_label_var.set("INTRO")
         elif labels:
             self.goto_label_var.set(labels[0])
@@ -1702,6 +1928,13 @@ class App:
         self._poll_tempo_fader()
         self._poll_tempo_fader_keepalive()
         self._poll_tempo_reset()
+        # Diagnostic temporaire (mes5/mes10 sur Viser), voir _poll_scene_replies.
+        if time.monotonic() - self._last_beats_song_time_query > 0.1:
+            self._last_beats_song_time_query = time.monotonic()
+            try:
+                self.live_osc.get_current_beats_song_time()
+            except OSError:
+                pass
         if self.mode_var.get() == "midi":
             try:
                 while True:
@@ -1715,7 +1948,10 @@ class App:
             if connected and not self._was_connected:
                 self._awaiting_downbeat = True
             self._was_connected = connected
-            phase = project_phase(self.midi_state.phase(), self.midi_state.bpm, connected, self.latency_var.get())
+            phase = project_phase(
+                self.midi_state.phase(), self.midi_state.bpm, connected,
+                self._safe_int_var(self.latency_var, "_latency_ms_cache"),
+            )
             beat = int(phase % self.midi_state.beats_per_bar) + 1
             if connected and self._awaiting_downbeat and beat == 1:
                 self._awaiting_downbeat = False
@@ -1737,7 +1973,7 @@ class App:
         else:
             link = self._ensure_link()
             if link is not None:
-                quantum = float(max(1, self.beats_var.get()))
+                quantum = float(max(1, self._safe_int_var(self.beats_var, "_beats_per_bar_cache")))
                 snapshot = link.snapshot(quantum=quantum)
                 # On n'affiche le comptage qu'une fois le signal START de Link
                 # reçu (is_playing) : la seule présence de pairs ne suffit pas,
@@ -1747,7 +1983,10 @@ class App:
                     self._awaiting_downbeat = True
                     self._link_prev_fractional = None
                 self._was_connected = connected
-                phase = project_phase(snapshot["phase"], snapshot["bpm"], connected, self.latency_var.get())
+                phase = project_phase(
+                    snapshot["phase"], snapshot["bpm"], connected,
+                    self._safe_int_var(self.latency_var, "_latency_ms_cache"),
+                )
                 fractional = phase % 1.0
                 if self._awaiting_downbeat or self._awaiting_bar_start:
                     # Détection du premier vrai temps 1 (reconnexion Link ou
@@ -1799,21 +2038,101 @@ class App:
 
         self.root.after(30, self._poll)
 
+    def _metronome_loop(self) -> None:
+        """Déclenche les clics (mode Link uniquement) depuis un thread séparé
+        de _poll()/after() : sur macOS, bouger la souris sur la fenêtre peut
+        geler les timers Tcl "after()" (limitation connue de Tk/Cocoa — mode
+        de suivi de la souris qui suspend les timers jusqu'à l'arrêt du
+        mouvement), ce qui rendait le clic aussi irrégulier que l'affichage
+        puisque tout passait par le même _poll(). Ne touche à aucun widget ni
+        variable Tkinter (lecture non thread-safe) : seulement à Link (déjà
+        protégé par son propre verrou, link_client.py) et à AudioMetronome
+        (play() ne fait que déposer un buffer, lu par le thread de
+        PortAudio) — le clic reste donc juste même si l'affichage se fige.
+        En mode MIDI Clock, le clic reste déclenché depuis _update_display
+        (l'état MIDI lui-même n'est mis à jour que par _poll)."""
+        last_beat: int | None = None
+        last_beat_2: int | None = None
+        while not self._metronome_thread_stop.is_set():
+            if self._mode_cache == "link" and self.link is not None:
+                if self._metronome_on:
+                    try:
+                        quantum = float(max(1, self._beats_per_bar_cache))
+                        # Latence positive = interroge Link dans le futur, donc
+                        # déclenche le clic plus tôt (compense la latence de
+                        # sortie audio, voir "Latence clic (ms)" dans l'UI).
+                        offset_micros = int(self._metronome_latency_ms_cache * 1000)
+                        snapshot = self.link.snapshot(quantum=quantum, offset_micros=offset_micros)
+                        connected = self.link.num_peers >= 1 and snapshot["is_playing"]
+                        if connected:
+                            beat = int(snapshot["phase"] % quantum) + 1
+                            if beat != last_beat:
+                                last_beat = beat
+                                self._audio_metronome.play(beat)
+                        else:
+                            last_beat = None
+                    except Exception:
+                        pass
+                else:
+                    last_beat = None
+                if self._metronome_on_2:
+                    try:
+                        quantum = float(max(1, self._beats_per_bar_cache))
+                        offset_micros_2 = int(self._metronome_latency_ms_cache_2 * 1000)
+                        snapshot_2 = self.link.snapshot(quantum=quantum, offset_micros=offset_micros_2)
+                        connected_2 = self.link.num_peers >= 1 and snapshot_2["is_playing"]
+                        if connected_2:
+                            beat_2 = int(snapshot_2["phase"] % quantum) + 1
+                            if beat_2 != last_beat_2:
+                                last_beat_2 = beat_2
+                                self._audio_metronome_2.play(beat_2)
+                        else:
+                            last_beat_2 = None
+                    except Exception:
+                        pass
+                else:
+                    last_beat_2 = None
+            else:
+                last_beat = None
+                last_beat_2 = None
+            self._metronome_thread_stop.wait(0.01)
+
     # ----------------------------------------------------------- Display --
+    def _get_canvas_item(self, key: str, create) -> tuple[int, bool]:
+        """Renvoie l'item persistant `key` (le crée une seule fois via
+        `create`) et si c'est une création (pour ne (re)configurer les
+        options coûteuses, ex. la police, qu'à la création/au changement)."""
+        item = self._canvas_items.get(key)
+        if item is not None:
+            return item, False
+        item = create()
+        self._canvas_items[key] = item
+        return item, True
+
+    def _hide_canvas_items(self, *keys: str) -> None:
+        for key in keys:
+            item = self._canvas_items.get(key)
+            if item is not None:
+                self.display.itemconfigure(item, state="hidden")
+
     def _draw_digit(self, beat: int, fill: str = FG_TEXT, size_scale: float = 1.0) -> None:
+        self._hide_canvas_items("circle_left", "circle_right", "line_track", "line_fill")
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
             return
         font_size = int(min(width, height) * 0.6 * size_scale)
-        canvas.create_text(
-            width / 2, height / 2, text=str(beat), fill=fill, font=("Helvetica", font_size, "bold"),
+        item, _ = self._get_canvas_item("digit", lambda: canvas.create_text(width / 2, height / 2))
+        canvas.itemconfigure(
+            item, text=str(beat), fill=fill, font=("Helvetica", font_size, "bold"), state="normal",
         )
+        canvas.coords(item, width / 2, height / 2)
 
     def _draw_two_circles(self, beat: int, bg: str, fill: str = FG_TEXT, size_scale: float = 1.0) -> None:
         # Deux cercles côte à côte : celui de gauche se remplit aux temps
         # impairs (1, 3...), celui de droite aux temps pairs (2, 4...) —
         # l'alternance rend le pulse visible à chaque temps.
+        self._hide_canvas_items("digit", "line_track", "line_fill")
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
@@ -1824,16 +2143,18 @@ class App:
         left_cx = width / 2 - diameter * 0.7
         right_cx = width / 2 + diameter * 0.7
         left_filled = beat % 2 == 1
-        for cx, filled in ((left_cx, left_filled), (right_cx, not left_filled)):
-            canvas.create_oval(
-                cx - radius, cy - radius, cx + radius, cy + radius,
-                fill=fill if filled else bg, outline=fill, width=3,
+        for key, cx, filled in (("circle_left", left_cx, left_filled), ("circle_right", right_cx, not left_filled)):
+            item, _ = self._get_canvas_item(key, lambda: canvas.create_oval(0, 0, 0, 0))
+            canvas.coords(item, cx - radius, cy - radius, cx + radius, cy + radius)
+            canvas.itemconfigure(
+                item, fill=fill if filled else bg, outline=fill, width=3, state="normal",
             )
 
     def _draw_scroll_line(self, beats_per_bar: int, beat: int, fractional: float) -> None:
         # À l'arrêt : la ligne se remplit de gauche à droite au milieu de
         # l'écran (façon barre de progression), synchronisée sur le temps réel
         # (vide au temps 1, pleine à la fin du dernier temps de la mesure).
+        self._hide_canvas_items("digit", "circle_left", "circle_right")
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
@@ -1842,10 +2163,17 @@ class App:
         bar_phase = ((beat - 1) + fractional) / beats_per_bar
         x0, x1 = width * 0.15, width * 0.85
         y = height / 2
-        canvas.create_line(x0, y, x1, y, fill="#3a3a3a", width=4)
+        track, _ = self._get_canvas_item("line_track", lambda: canvas.create_line(0, 0, 0, 0))
+        canvas.coords(track, x0, y, x1, y)
+        canvas.itemconfigure(track, fill="#3a3a3a", width=4, state="normal")
         fill_end = x0 + bar_phase * (x1 - x0)
+        fill_item = self._canvas_items.get("line_fill")
         if fill_end > x0:
-            canvas.create_line(x0, y, fill_end, y, fill=FG_TEXT, width=4)
+            fill_item, _ = self._get_canvas_item("line_fill", lambda: canvas.create_line(0, 0, 0, 0))
+            canvas.coords(fill_item, x0, y, fill_end, y)
+            canvas.itemconfigure(fill_item, fill=FG_TEXT, width=4, state="normal")
+        elif fill_item is not None:
+            canvas.itemconfigure(fill_item, state="hidden")
 
     def _scene_flash_bg(self, bg: str) -> str:
         """Double flash blanc (2×150 ms, séparés d'un court silence) au-dessus
@@ -1861,6 +2189,19 @@ class App:
     def _update_display(
         self, beat: int, beats_per_bar: int, fractional: float, bpm: float | None, connected: bool, running: bool,
     ) -> None:
+        # En mode Link, le clic est déclenché par _metronome_loop (thread à
+        # part, insensible aux gels de _poll/after() sous macOS) ; ici on ne
+        # s'en occupe qu'en MIDI Clock, dont l'état n'existe que via _poll.
+        if not connected:
+            self._last_played_beat = None
+            self._last_played_beat_2 = None
+        elif self._mode_cache != "link":
+            if self._metronome_on and beat != self._last_played_beat:
+                self._last_played_beat = beat
+                self._audio_metronome.play(beat)
+            if self._metronome_on_2 and beat != self._last_played_beat_2:
+                self._last_played_beat_2 = beat
+                self._audio_metronome_2.play(beat)
         # Mesure HIGHLIGHT (scene_sheet.py, valeur 1) : flash blanc du fond
         # sur TOUS les temps (pas seulement 1/3), digits/dots eux-mêmes
         # fondus du blanc vers leur couleur normale, et 50% plus grands ;
@@ -1884,7 +2225,6 @@ class App:
         bg = self._scene_flash_bg(bg)
         # Le flash reste cantonné au canvas (digits/dots), pas à toute la fenêtre.
         self.display.configure(bg=bg)
-        self.display.delete("all")
         if bpm:
             self._last_bpm = bpm
         # Sans source fiable (pas de clock MIDI / aucun pair Link), un chiffre
@@ -1896,6 +2236,8 @@ class App:
                 self._draw_digit(beat, fill=digit_fill, size_scale=size_scale)
         elif self._last_bpm and not running:
             self._draw_scroll_line(beats_per_bar, beat, fractional)
+        else:
+            self._hide_canvas_items("digit", "circle_left", "circle_right", "line_track", "line_fill")
 
         if bpm:
             self.bpm_label.config(text=f"{bpm:.1f} BPM")
@@ -1912,6 +2254,10 @@ class App:
 
     def on_close(self) -> None:
         save_config(self.config)
+        # Arrêt AVANT self.link.close() : _metronome_loop lit self.link
+        # depuis un autre thread.
+        self._metronome_thread_stop.set()
+        self._metronome_thread.join(timeout=1.0)
         self._close_link_dialog()
         self.listener.close()
         if self.link is not None:
@@ -1920,6 +2266,8 @@ class App:
         self.controller.close()
         self.hui_bridge.close()
         self.hui_bridge_2.close()
+        self._audio_metronome.close()
+        self._audio_metronome_2.close()
         # Affiche OFFLINE sur la page web avant de couper le serveur : sans
         # ça, la page reste figée sur le dernier chiffre/ligne affiché sans
         # prévenir que CLIC a quitté (la page web poll toutes les 60ms).
