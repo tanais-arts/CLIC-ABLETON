@@ -367,6 +367,11 @@ class App:
         self._metronome_on: bool = False
         self._last_played_beat: int | None = None
         self._metronome_on_2: bool = False
+        # Coupe silencieusement le clic quand le LABEL "END" (feuille de
+        # scène) apparaît, jusqu'au prochain Stop (_stop_return_to_start) :
+        # ne touche ni _metronome_on/_metronome_on_2 (état des boutons M1/M2)
+        # ni leurs LED, seulement la décision de jouer le clic.
+        self._metronome_end_muted: bool = False
         self._audio_metronome = AudioMetronome()
         self._audio_metronome.set_kit(self.config["metronome_kit"])
         self._audio_metronome.configure(
@@ -392,6 +397,24 @@ class App:
         # thread ne touche à aucun widget Tk (voir _metronome_loop).
         self._metronome_thread_stop = threading.Event()
         self._metronome_thread = threading.Thread(target=self._metronome_loop, daemon=True)
+        # Comptage continu du temps DANS la mesure pour chaque sortie
+        # métronome (même logique que self._link_beat_in_bar pour
+        # l'affichage, voir _poll) : indispensable dès qu'une feuille de
+        # scène change le COUNT d'une mesure à l'autre, sinon phase % quantum
+        # (mesuré depuis le tout début de la session Link) décale
+        # durablement le clic accentué (click_up) après la mesure irrégulière.
+        self._metronome_beat_in_bar = 1
+        self._metronome_prev_fractional: float | None = None
+        self._metronome_last_update_time: float | None = None
+        # Comme _awaiting_downbeat pour l'affichage : True tant que le vrai
+        # temps 1 (phase % quantum) n'a pas encore été observé depuis la
+        # (re)connexion, pour ne jamais forcer le clic sur un temps 1 qui ne
+        # correspond pas à la position réelle de Link (voir _metronome_next_beat).
+        self._metronome_awaiting_downbeat = True
+        self._metronome_beat_in_bar_2 = 1
+        self._metronome_prev_fractional_2: float | None = None
+        self._metronome_last_update_time_2: float | None = None
+        self._metronome_awaiting_downbeat_2 = True
         # Confirmation réelle (pas juste l'instant d'envoi) de la prise en
         # compte de la signature par Live, voir _poll_scene_replies.
         self.live_osc.start_listen_signature_numerator()
@@ -1800,6 +1823,7 @@ class App:
         """Simule un double appui sur Stop dans Live : arrête la lecture (et les
         clips en cours, comportement natif normal), puis (comme au 2e Stop) ramène
         le curseur à 1:1:1, en attente d'un start de scène."""
+        self._metronome_end_muted = False
         try:
             self.live_osc.stop_playing()
             self.root.after(120, self.live_osc.stop_playing)
@@ -1983,6 +2007,8 @@ class App:
             self._scene_label_sticky = row.label
         self.scene_label_label.config(text=self._scene_label_sticky)
         self.shared_state.set_scene_label(self._scene_label_sticky)
+        if self._scene_label_sticky.strip().upper() == "END":
+            self._metronome_end_muted = True
 
     # -------------------------------------------------------- Boucle poll --
     def _update_link_peers_label(self, num_peers: int) -> None:
@@ -2194,12 +2220,27 @@ class App:
         (play() ne fait que déposer un buffer, lu par le thread de
         PortAudio) — le clic reste donc juste même si l'affichage se fige.
         En mode MIDI Clock, le clic reste déclenché depuis _update_display
-        (l'état MIDI lui-même n'est mis à jour que par _poll)."""
+        (l'état MIDI lui-même n'est mis à jour que par _poll).
+
+        Le temps DANS la mesure (utilisé pour choisir click.wav/click_up.wav)
+        est compté en continu (mêmes principes que self._link_beat_in_bar
+        pour l'affichage), PAS via phase % quantum : cette dernière suppose
+        une mesure de longueur constante depuis le tout début de la session
+        Link, ce qui est faux dès qu'une feuille de scène change le COUNT
+        d'une mesure à l'autre (le clic accentué décale alors durablement,
+        ex. sur le temps 3 au lieu du temps 1 après une mesure à 2 temps).
+
+        Comme pour l'affichage (_awaiting_downbeat), on attend le vrai temps 1
+        (phase % quantum) avant de démarrer le comptage/le clic après chaque
+        (re)connexion : is_playing peut passer à True un instant avant que la
+        phase Link n'atteigne réellement le début de mesure, et forcer le
+        clic sur le temps 1 à cet instant-là le faisait partir en avance sur
+        l'affichage (qui, lui, attend le vrai temps 1)."""
         last_beat: int | None = None
         last_beat_2: int | None = None
         while not self._metronome_thread_stop.is_set():
             if self._mode_cache == "link" and self.link is not None:
-                if self._metronome_on:
+                if self._metronome_on and not self._metronome_end_muted:
                     try:
                         quantum = float(max(1, self._beats_per_bar_cache))
                         # Latence positive = interroge Link dans le futur, donc
@@ -2209,29 +2250,39 @@ class App:
                         snapshot = self.link.snapshot(quantum=quantum, offset_micros=offset_micros)
                         connected = self.link.num_peers >= 1 and snapshot["is_playing"]
                         if connected:
-                            beat = int(snapshot["phase"] % quantum) + 1
-                            if beat != last_beat:
+                            beat = self._metronome_next_beat(
+                                quantum, snapshot, "_metronome_beat_in_bar",
+                                "_metronome_prev_fractional", "_metronome_last_update_time",
+                                "_metronome_awaiting_downbeat",
+                            )
+                            if beat is not None and beat != last_beat:
                                 last_beat = beat
                                 self._audio_metronome.play(beat)
                         else:
                             last_beat = None
+                            self._metronome_awaiting_downbeat = True
                     except Exception:
                         pass
                 else:
                     last_beat = None
-                if self._metronome_on_2:
+                if self._metronome_on_2 and not self._metronome_end_muted:
                     try:
                         quantum = float(max(1, self._beats_per_bar_cache))
                         offset_micros_2 = int(self._metronome_latency_ms_cache_2 * 1000)
                         snapshot_2 = self.link.snapshot(quantum=quantum, offset_micros=offset_micros_2)
                         connected_2 = self.link.num_peers >= 1 and snapshot_2["is_playing"]
                         if connected_2:
-                            beat_2 = int(snapshot_2["phase"] % quantum) + 1
-                            if beat_2 != last_beat_2:
+                            beat_2 = self._metronome_next_beat(
+                                quantum, snapshot_2, "_metronome_beat_in_bar_2",
+                                "_metronome_prev_fractional_2", "_metronome_last_update_time_2",
+                                "_metronome_awaiting_downbeat_2",
+                            )
+                            if beat_2 is not None and beat_2 != last_beat_2:
                                 last_beat_2 = beat_2
                                 self._audio_metronome_2.play(beat_2)
                         else:
                             last_beat_2 = None
+                            self._metronome_awaiting_downbeat_2 = True
                     except Exception:
                         pass
                 else:
@@ -2240,6 +2291,44 @@ class App:
                 last_beat = None
                 last_beat_2 = None
             self._metronome_thread_stop.wait(0.01)
+
+    def _metronome_next_beat(
+        self, quantum: float, snapshot: dict,
+        beat_attr: str, prev_fractional_attr: str, last_update_attr: str, awaiting_attr: str,
+    ) -> int | None:
+        """Calcule le temps courant dans la mesure pour une sortie métronome
+        (voir _metronome_loop) : rattrape d'un coup le nombre exact de temps
+        écoulés depuis le dernier appel (tempo x temps réel écoulé), au lieu
+        de se contenter de détecter un seul rebouclage par itération, pour ne
+        pas prendre de retard si le thread est retardé un instant.
+
+        Tant que `awaiting_attr` est vrai (juste après une (re)connexion),
+        renvoie None (aucun clic) tant que phase % quantum n'atteint pas
+        réellement le temps 1 : comme _awaiting_downbeat pour l'affichage,
+        pour ne jamais déclencher un clic "temps 1" avant le vrai début de
+        mesure côté Link."""
+        fractional = snapshot["phase"] % 1.0
+        if getattr(self, awaiting_attr):
+            if int(snapshot["phase"] % quantum) + 1 != 1:
+                return None
+            setattr(self, awaiting_attr, False)
+            setattr(self, beat_attr, 1)
+            setattr(self, prev_fractional_attr, fractional)
+            setattr(self, last_update_attr, time.monotonic())
+            return 1
+        now = time.monotonic()
+        prev_fractional = getattr(self, prev_fractional_attr)
+        last_update = getattr(self, last_update_attr)
+        if prev_fractional is not None and last_update is not None:
+            dt = now - last_update
+            elapsed_beats = snapshot["bpm"] / 60.0 * dt
+            wraps = round(elapsed_beats - (fractional - prev_fractional))
+            if wraps > 0:
+                beat_in_bar = getattr(self, beat_attr)
+                setattr(self, beat_attr, ((beat_in_bar - 1 + wraps) % int(quantum)) + 1)
+        setattr(self, prev_fractional_attr, fractional)
+        setattr(self, last_update_attr, now)
+        return getattr(self, beat_attr)
 
     # ----------------------------------------------------------- Display --
     def _get_canvas_item(self, key: str, create) -> tuple[int, bool]:
@@ -2341,10 +2430,10 @@ class App:
             self._last_played_beat = None
             self._last_played_beat_2 = None
         elif self._mode_cache != "link":
-            if self._metronome_on and beat != self._last_played_beat:
+            if self._metronome_on and not self._metronome_end_muted and beat != self._last_played_beat:
                 self._last_played_beat = beat
                 self._audio_metronome.play(beat)
-            if self._metronome_on_2 and beat != self._last_played_beat_2:
+            if self._metronome_on_2 and not self._metronome_end_muted and beat != self._last_played_beat_2:
                 self._last_played_beat_2 = beat
                 self._audio_metronome_2.play(beat)
         # Mesure HIGHLIGHT (scene_sheet.py, valeur 1) : flash blanc du fond
