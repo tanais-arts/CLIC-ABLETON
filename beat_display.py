@@ -1151,16 +1151,19 @@ class App:
         """Fenêtre de mapping piste Live (ligne) <-> tranche HUI/Yamaha
         (colonne) : une seule tranche par piste (boutons radio par ligne,
         donc pas de doublon possible sur une même ligne), diagonale 1<->1 par
-        défaut. Tranche 16 absente (réservée au tempo, voir
-        TEMPO_FADER_ZONE). Rien n'est appliqué avant l'appui sur "Appliquer"."""
+        défaut. Colonne "—" en plus des 15 tranches : laisse la piste sans
+        tranche assignée (pas commandée par la console). Tranche 16 absente
+        (réservée au tempo, voir TEMPO_FADER_ZONE). Rien n'est appliqué avant
+        l'appui sur "Appliquer"."""
         dialog = tk.Toplevel(self.root)
         dialog.title("Mapping faders Live ↔ Yamaha")
         dialog.configure(bg=BG_IDLE)
 
         tk.Label(dialog, text="Piste \\ Tranche", bg=BG_IDLE, fg=FG_TEXT).grid(row=0, column=0, padx=(4, 6))
+        tk.Label(dialog, text="—", bg=BG_IDLE, fg=FG_TEXT, width=2).grid(row=0, column=1, padx=1, pady=(4, 2))
         for col in range(15):
             tk.Label(dialog, text=str(col + 1), bg=BG_IDLE, fg=FG_TEXT, width=2).grid(
-                row=0, column=col + 1, padx=1, pady=(4, 2)
+                row=0, column=col + 2, padx=1, pady=(4, 2)
             )
 
         row_vars: list[tk.IntVar] = []
@@ -1170,13 +1173,16 @@ class App:
             tk.Label(dialog, text=f"Piste {track + 1}", bg=BG_IDLE, fg=FG_TEXT).grid(
                 row=track + 1, column=0, sticky="w", padx=(4, 6)
             )
+            tk.Radiobutton(
+                dialog, variable=var, value=-1, bg=BG_IDLE, activebackground=BG_IDLE, selectcolor="#333333",
+            ).grid(row=track + 1, column=1)
             for col in range(15):
                 tk.Radiobutton(
                     dialog, variable=var, value=col, bg=BG_IDLE, activebackground=BG_IDLE, selectcolor="#333333",
-                ).grid(row=track + 1, column=col + 1)
+                ).grid(row=track + 1, column=col + 2)
 
         button_row = tk.Frame(dialog, bg=BG_IDLE)
-        button_row.grid(row=17, column=0, columnspan=16, pady=8)
+        button_row.grid(row=17, column=0, columnspan=17, pady=8)
         tk.Button(
             button_row, text="Appliquer", command=lambda: self._apply_track_mapping([v.get() for v in row_vars]),
         ).pack(side="left", padx=6)
