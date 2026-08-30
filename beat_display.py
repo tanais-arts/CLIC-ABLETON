@@ -150,6 +150,7 @@ class ControllerListener:
     def __init__(self, event_queue: "queue.Queue[list[int]]"):
         self._queue = event_queue
         self._midi_in: rtmidi.MidiIn | None = None
+        self._midi_out: rtmidi.MidiOut | None = None
         self._port_name: str | None = None
 
     def list_ports(self) -> list[str]:
@@ -169,15 +170,47 @@ class ControllerListener:
         self._midi_in = midi_in
         self._port_name = port_name
 
+        # Port de sortie du même nom, pour renvoyer l'état (LED) des touches
+        # USER DEFINED apprises (voir send_note_feedback) — absent si la
+        # console n'expose pas ce port en sortie (pas bloquant, juste pas de LED).
+        try:
+            midi_out = rtmidi.MidiOut()
+            out_names = midi_out.get_ports()
+            midi_out.open_port(out_names.index(port_name))
+            self._midi_out = midi_out
+            print(f"[Contrôleur MIDI] port MIDI OUT « {port_name} » ouvert (LED USER DEFINED possibles).")
+        except ValueError:
+            self._midi_out = None
+            print(
+                f"[Contrôleur MIDI] pas de port MIDI OUT « {port_name} » : "
+                "pas de retour LED possible sur les touches USER DEFINED."
+            )
+
     def close(self) -> None:
         if self._midi_in is not None:
             self._midi_in.close_port()
             self._midi_in = None
             self._port_name = None
+        if self._midi_out is not None:
+            self._midi_out.close_port()
+            self._midi_out = None
 
     @property
     def port_name(self) -> str | None:
         return self._port_name
+
+    def send_note_feedback(self, channel: int, note: int, on: bool) -> None:
+        """Allume/éteint la LED d'une touche USER DEFINED en renvoyant un Note
+        On/Note Off sur la même note/canal, sur ce même port MIDI — la
+        console boucle l'état de la LED sur ce qu'elle reçoit."""
+        if self._midi_out is None:
+            return
+        print(f"[Contrôleur MIDI] LED -> canal={channel + 1} note={note} on={on}")
+        # Note Off explicite (statut 0x80), pas juste un Note On vélocité 0 :
+        # certains appareils ne traitent pas les deux de la même façon.
+        status = 0x90 if on else 0x80
+        velocity = 127 if on else 0
+        self._midi_out.send_message([status | (channel & 0x0F), note & 0x7F, velocity])
 
     def _callback(self, event, _data=None) -> None:
         message, _delta_time = event
@@ -285,7 +318,12 @@ class App:
         self.root = root
         self.root.title("Compteur de temps - Ableton Live")
         self.root.configure(bg=BG_IDLE)
-        self.root.geometry("640x520")
+        # Taille/position fixées au lancement pour se caler à gauche de
+        # l'écran, à côté de la fenêtre Live (voir capture de référence).
+        # Les réglages AUDIO/MIDI vivent dans des fenêtres à part (voir
+        # _make_settings_window) : la fenêtre principale n'a donc plus de
+        # contenu qui grandit/rétrécit après coup, hors cette taille de départ.
+        self.root.geometry("710x1050+0+0")
         self.root.minsize(520, 420)
 
         self.config = load_config()
@@ -358,10 +396,6 @@ class App:
         # compte de la signature par Live, voir _poll_scene_replies.
         self.live_osc.start_listen_signature_numerator()
         self.live_osc.start_listen_signature_denominator()
-        # Diagnostic temporaire (mes5/mes10 sur Viser) : vrai compteur
-        # mesure.temps.sixteenth.tick de Live, interrogé périodiquement
-        # (voir _poll, nécessite le handler ajouté côté script AbletonOSC).
-        self._last_beats_song_time_query = 0.0
 
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour les 6 boutons (nudge,
         # navigation scènes, stop, lancer la scène) --
@@ -370,7 +404,7 @@ class App:
         self._action_order = ["minus", "plus", "scene_prev", "scene_next", "stop", "play", "metronome", "metronome_2"]
         self._action_labels = {
             "minus": "−1", "plus": "+1", "scene_prev": "▲", "scene_next": "▼", "stop": "■", "play": "▶",
-            "metronome": "M", "metronome_2": "M2",
+            "metronome": "M1", "metronome_2": "M2",
         }
         self._action_commands = {
             "minus": lambda: self._jump_beats(-1),
@@ -387,6 +421,12 @@ class App:
             for action in self._action_order
         }
         self._learning: str | None = None
+        # Anti-rebond : la console peut renvoyer une même touche (Note On/Off)
+        # plusieurs fois d'affilée sans appui réel (observé juste après un
+        # changement de signature rythmique), ce qui déclenchait l'action
+        # correspondante (ex. stop) plusieurs fois de suite.
+        self._controller_last_fire: dict[str, float] = {}
+        self.CONTROLLER_DEBOUNCE_S = 0.25
 
         # -- Pont HUI -> OSC (ex. Yamaha 01V96V2) pour faders/mutes des pistes --
         # La console répartit ses 16 voies sur 2 ports MIDI (8 tranches chacun).
@@ -456,6 +496,10 @@ class App:
         self._last_bpm: float | None = None
         # Flash blanc ponctuel du canvas au lancement d'une scène.
         self._scene_flash_start: float = 0.0
+        # Index de la scène pour laquelle le flash a déjà été montré : évite
+        # de reflasher si on relance la même scène après un Stop (le flash ne
+        # doit marquer que la révélation d'une scène pas encore vue).
+        self._scene_flash_shown_for: int | None = None
         # Compteur de mesures depuis le lancement du morceau en cours (voir
         # _scene_launch/_update_bar_count) : None = pas de comptage affiché.
         # Les scènes "tempo seul" (chiffres) ne déclenchent jamais ce compte.
@@ -530,6 +574,17 @@ class App:
             self._update_controller_status_label()
         self._refresh_scene_state()
         self._apply_mode()
+        # Réappliquée en tout dernier : _apply_mode() ci-dessus pack()
+        # link_frame/midi_frame, ce qui refait recalculer par Tk une taille
+        # "naturelle" (plus petite, sections repliées) et écraserait la taille
+        # fixée plus haut si on la posait avant ces pack() tardifs.
+        self.root.update_idletasks()
+        self.root.geometry("710x1050+0+0")
+        # Sur macOS, la fenêtre n'est réellement "mappée" par Aqua qu'au tout
+        # début de mainloop() (update_idletasks() ne suffit pas) : Aqua peut
+        # donc encore écraser la taille ci-dessus à ce moment-là. On la
+        # reprogramme une fois mainloop lancé pour avoir le dernier mot.
+        self.root.after(50, lambda: self.root.geometry("710x1050+0+0"))
         self._poll()
         self._ping_live()
         self._metronome_thread.start()
@@ -650,11 +705,142 @@ class App:
             goto_frame, from_=0, to=999, width=5, textvariable=self.preroll_var,
         ).pack(side="left", padx=(6, 0))
 
+        # -- Affichage principal du temps : un carré, gros pour 1/3, petit pour 2/4 --
+        self.display = tk.Canvas(self.root, bg=BG_IDLE, highlightthickness=0)
+        self.display.pack(expand=True, fill="both", padx=10, pady=4)
+        # Items persistants (créés une seule fois, puis déplacés/recolorés via
+        # coords()/itemconfig()) : recréer tous les items à chaque frame
+        # (delete("all") + create_*) au rythme du _poll (30 ms) est ce qui
+        # rend l'appli à la traîne dès qu'on bouge la souris au-dessus du
+        # canvas sous macOS/Tk (Cocoa recalcule les zones de suivi de la
+        # souris à chaque création/suppression d'item).
+        self._canvas_items: dict[str, int] = {}
+
+        # -- Label de section (INTRO/COUPLET/REFRAIN..., voir scene_sheet.py) --
+        self.scene_label_label = tk.Label(
+            self.root, text="", bg=BG_IDLE, fg="#7fb2ff", font=("Helvetica", 16, "bold"),
+        )
+        self.scene_label_label.pack(fill="x", padx=10, pady=(0, 2))
+
+        # -- Compteur de mesures depuis le lancement du morceau en cours --
+        self.bar_count_label = tk.Label(
+            self.root, text="", bg=BG_IDLE, fg=FG_TEXT, font=("Helvetica", 16, "bold"),
+        )
+        self.bar_count_label.pack(fill="x", padx=10, pady=(0, 2))
+
+        # -- Nom de la scène en cours, détaché des boutons de navigation --
+        # Jaune = scène sélectionnée mais pas encore lancée, vert = lancée.
+        self.scene_name_label = tk.Label(
+            self.root, text="…", bg=BG_IDLE, fg=SCENE_NOT_LAUNCHED, font=("Helvetica", 20, "bold"),
+            justify="center",
+        )
+        self.scene_name_label.pack(fill="x", padx=10, pady=(0, 4))
+
+        bottom = tk.Frame(self.root, bg=BG_IDLE)
+        bottom.pack(fill="x", padx=10, pady=4)
+        self.status_label = tk.Label(bottom, text="Déconnecté", bg=BG_IDLE, fg="#bbbbbb")
+        self.status_label.pack(side="left")
+        self.bpm_label = tk.Label(bottom, text="", bg=BG_IDLE, fg="#bbbbbb")
+        self.bpm_label.pack(side="right")
+
+        # -- Lecture/Stop/Métronomes puis Nudge (-1/+1)/navigation scènes
+        # (▲▼) : 2 rangées de 4 boutons carrés de même taille (modèle : le
+        # bouton +1). À gauche de chaque bouton : "A" (apprendre le code
+        # MIDI) au-dessus de "E" (effacer l'apprentissage), eux aussi carrés
+        # (taille fixe en pixels). --
+        controls_row_1 = tk.Frame(self.root, bg=BG_IDLE)
+        controls_row_1.pack(fill="x", padx=10, pady=(0, 2))
+        controls_row_2 = tk.Frame(self.root, bg=BG_IDLE)
+        controls_row_2.pack(fill="x", padx=10, pady=(0, 8))
+        MINI_SIZE = 22  # pixels : taille fixe pour que A/E soient réellement carrés
+        self.learn_buttons: dict[str, tk.Button] = {}
+        self.clear_buttons: dict[str, tk.Button] = {}
+        self.action_buttons: dict[str, tk.Frame] = {}
+        self._control_buttons: dict[str, tk.Button] = {}
+        self._action_flash_after_id: dict[str, str] = {}
+        # Fond persistant (jaune si actif) des boutons Lecture/M1/M2, distinct
+        # du flash bref MIDI ci-dessous (_flash_action_button le restaure ici
+        # plutôt que vers BG_IDLE une fois le flash terminé).
+        self._action_active_bg: dict[str, str] = {}
+
+        def add_mini_button(parent: tk.Frame, text: str, command) -> tk.Button:
+            holder = tk.Frame(parent, width=MINI_SIZE, height=MINI_SIZE, bg=BG_IDLE)
+            holder.pack_propagate(False)
+            holder.pack(side="top", pady=(0, 2) if text == "A" else (2, 0))
+            btn = tk.Button(holder, text=text, command=command, font=("Helvetica", 9), padx=0, pady=0)
+            btn.pack(fill="both", expand=True)
+            return btn
+
+        def add_control(parent_row: tk.Frame, action: str, text: str, font_size: int = 14) -> None:
+            group = tk.Frame(parent_row, bg=BG_IDLE)
+            group.pack(side="left", padx=4)
+            mini = tk.Frame(group, bg=BG_IDLE)
+            mini.pack(side="left", padx=(0, 2))
+            self.learn_buttons[action] = add_mini_button(mini, "A", lambda: self._start_learn(action))
+            self.clear_buttons[action] = add_mini_button(mini, "E", lambda: self._clear_assignment(action))
+            # macOS Aqua ignore le bg d'un tk.Button natif : on flashe ce cadre autour, pas le bouton.
+            # Taille de la boîte fixée en pixels (pack_propagate(False)) plutôt qu'en
+            # largeur/hauteur "caractères" du Button : cette dernière dépend de la
+            # taille de police, ce qui rendait la boîte de STOP plus grande que celle
+            # de PLAY dès que leurs polices de glyphe différaient (14 vs 16 pt).
+            flash_holder = tk.Frame(group, width=80, height=56, bg=BG_IDLE)
+            flash_holder.pack_propagate(False)
+            flash_holder.pack(side="left")
+            btn = tk.Button(
+                flash_holder, text=text, command=self._action_commands[action], font=("Helvetica", font_size, "bold"),
+            )
+            btn.pack(fill="both", expand=True, padx=3, pady=3)
+            self.action_buttons[action] = flash_holder
+            self._control_buttons[action] = btn
+
+        add_control(controls_row_1, "play", "▶")
+        # Glyphe ■ plus petit que ▶ à taille de police égale : agrandi.
+        add_control(controls_row_1, "stop", "■", font_size=32)
+        add_control(controls_row_1, "metronome", "M1")
+        add_control(controls_row_1, "metronome_2", "M2")
+        add_control(controls_row_2, "minus", "−1")
+        add_control(controls_row_2, "plus", "+1")
+        add_control(controls_row_2, "scene_prev", "▲")
+        add_control(controls_row_2, "scene_next", "▼")
+
+        # -- Réglages AUDIO/MIDI dans des fenêtres à part (plutôt qu'un
+        # panneau repliable dans la fenêtre principale) : sur macOS Aqua, un
+        # tk.Button natif ignore son bg dès que la fenêtre a le focus (il
+        # repasse en blanc natif), ce qui rendait le texte blanc des entêtes
+        # illisible une fois l'appli au premier plan. Une fenêtre à part
+        # évite complètement ce souci d'entête à fond personnalisé. --
+        def _make_settings_window(title: str) -> tuple[tk.Toplevel, tk.Frame]:
+            win = tk.Toplevel(self.root)
+            win.title(title)
+            win.configure(bg=BG_IDLE)
+            # On masque plutôt que détruire à la fermeture : les widgets/valeurs
+            # (Combobox, StringVar…) restent intacts pour la prochaine ouverture.
+            win.protocol("WM_DELETE_WINDOW", win.withdraw)
+            win.withdraw()
+            content = tk.Frame(win, bg=BG_IDLE)
+            content.pack(fill="both", expand=True, padx=10, pady=10)
+            return win, content
+
+        def _show_settings_window(win: tk.Toplevel) -> None:
+            win.deiconify()
+            win.lift()
+
+        settings_row = tk.Frame(self.root, bg=BG_IDLE)
+        settings_row.pack(fill="x", padx=10, pady=(0, 8))
+        self.audio_settings_win, audio_content = _make_settings_window("Réglages AUDIO")
+        self.midi_settings_win, midi_content = _make_settings_window("Réglages MIDI")
+        tk.Button(
+            settings_row, text="Réglages AUDIO", command=lambda: _show_settings_window(self.audio_settings_win),
+        ).pack(side="left", padx=(0, 6))
+        tk.Button(
+            settings_row, text="Réglages MIDI", command=lambda: _show_settings_window(self.midi_settings_win),
+        ).pack(side="left")
+
         # -- Métronome audio local (clic.wav, voir audio_metronome.py) : carte
         # son + sortie (paire stéréo ou mono), activé/désactivé par le bouton
         # "M" (_toggle_metronome), plus le métronome interne de Live. --
-        metronome_frame = tk.Frame(self.root, bg=BG_IDLE)
-        metronome_frame.pack(fill="x", padx=10, pady=(0, 8))
+        metronome_frame = tk.Frame(audio_content, bg=BG_IDLE)
+        metronome_frame.pack(fill="x")
         tk.Label(metronome_frame, text="Métronome — Carte son :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
         self.metronome_device_var = tk.StringVar(
             value=self.config["metronome_audio_device"] or self.METRONOME_DEFAULT_DEVICE_LABEL,
@@ -696,8 +882,8 @@ class App:
 
         # -- Deuxième sortie métronome (2e musicien, propre carte son/kit/
         # latence), activée/désactivée par le bouton "M2" (_toggle_metronome_2). --
-        metronome_frame_2 = tk.Frame(self.root, bg=BG_IDLE)
-        metronome_frame_2.pack(fill="x", padx=10, pady=(0, 8))
+        metronome_frame_2 = tk.Frame(audio_content, bg=BG_IDLE)
+        metronome_frame_2.pack(fill="x", pady=(6, 0))
         tk.Label(metronome_frame_2, text="Métronome 2 — Carte son :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
         self.metronome_device_var_2 = tk.StringVar(
             value=self.config["metronome_audio_device_2"] or self.METRONOME_DEFAULT_DEVICE_LABEL,
@@ -738,94 +924,9 @@ class App:
         ).pack(side="left", padx=(6, 0))
         self._refresh_metronome_devices()
 
-        # -- Affichage principal du temps : un carré, gros pour 1/3, petit pour 2/4 --
-        self.display = tk.Canvas(self.root, bg=BG_IDLE, highlightthickness=0)
-        self.display.pack(expand=True, fill="both", padx=10, pady=4)
-        # Items persistants (créés une seule fois, puis déplacés/recolorés via
-        # coords()/itemconfig()) : recréer tous les items à chaque frame
-        # (delete("all") + create_*) au rythme du _poll (30 ms) est ce qui
-        # rend l'appli à la traîne dès qu'on bouge la souris au-dessus du
-        # canvas sous macOS/Tk (Cocoa recalcule les zones de suivi de la
-        # souris à chaque création/suppression d'item).
-        self._canvas_items: dict[str, int] = {}
-
-        # -- Label de section (INTRO/COUPLET/REFRAIN..., voir scene_sheet.py) --
-        self.scene_label_label = tk.Label(
-            self.root, text="", bg=BG_IDLE, fg="#7fb2ff", font=("Helvetica", 16, "bold"),
-        )
-        self.scene_label_label.pack(fill="x", padx=10, pady=(0, 2))
-
-        # -- Compteur de mesures depuis le lancement du morceau en cours --
-        self.bar_count_label = tk.Label(
-            self.root, text="", bg=BG_IDLE, fg=FG_TEXT, font=("Helvetica", 16, "bold"),
-        )
-        self.bar_count_label.pack(fill="x", padx=10, pady=(0, 2))
-
-        # -- Nom de la scène en cours, détaché des boutons de navigation --
-        # Jaune = scène sélectionnée mais pas encore lancée, vert = lancée.
-        self.scene_name_label = tk.Label(
-            self.root, text="…", bg=BG_IDLE, fg=SCENE_NOT_LAUNCHED, font=("Helvetica", 20, "bold"),
-            justify="center",
-        )
-        self.scene_name_label.pack(fill="x", padx=10, pady=(0, 4))
-
-        bottom = tk.Frame(self.root, bg=BG_IDLE)
-        bottom.pack(fill="x", padx=10, pady=4)
-        self.status_label = tk.Label(bottom, text="Déconnecté", bg=BG_IDLE, fg="#bbbbbb")
-        self.status_label.pack(side="left")
-        self.bpm_label = tk.Label(bottom, text="", bg=BG_IDLE, fg="#bbbbbb")
-        self.bpm_label.pack(side="right")
-
-        # -- Nudge (-1/+1), navigation scènes (▲▼), Lecture (▶) et Stop (■) :
-        # boutons carrés de même taille (modèle : le bouton +1), alignés sur
-        # une seule ligne sous Lecture/Tempo. À gauche de chaque bouton : "A"
-        # (apprendre le code MIDI) au-dessus de "E" (effacer l'apprentissage),
-        # eux aussi carrés (taille fixe en pixels). --
-        controls_row = tk.Frame(self.root, bg=BG_IDLE)
-        controls_row.pack(fill="x", padx=10, pady=(0, 8))
-        square_btn = dict(width=4, height=2, font=("Helvetica", 14, "bold"))
-        MINI_SIZE = 22  # pixels : taille fixe pour que A/E soient réellement carrés
-        self.learn_buttons: dict[str, tk.Button] = {}
-        self.clear_buttons: dict[str, tk.Button] = {}
-        self.action_buttons: dict[str, tk.Frame] = {}
-        self._control_buttons: dict[str, tk.Button] = {}
-        self._action_flash_after_id: dict[str, str] = {}
-
-        def add_mini_button(parent: tk.Frame, text: str, command) -> tk.Button:
-            holder = tk.Frame(parent, width=MINI_SIZE, height=MINI_SIZE, bg=BG_IDLE)
-            holder.pack_propagate(False)
-            holder.pack(side="top", pady=(0, 2) if text == "A" else (2, 0))
-            btn = tk.Button(holder, text=text, command=command, font=("Helvetica", 9), padx=0, pady=0)
-            btn.pack(fill="both", expand=True)
-            return btn
-
-        def add_control(action: str, text: str) -> None:
-            group = tk.Frame(controls_row, bg=BG_IDLE)
-            group.pack(side="left", padx=4)
-            mini = tk.Frame(group, bg=BG_IDLE)
-            mini.pack(side="left", padx=(0, 2))
-            self.learn_buttons[action] = add_mini_button(mini, "A", lambda: self._start_learn(action))
-            self.clear_buttons[action] = add_mini_button(mini, "E", lambda: self._clear_assignment(action))
-            # macOS Aqua ignore le bg d'un tk.Button natif : on flashe ce cadre autour, pas le bouton.
-            flash_holder = tk.Frame(group, bg=BG_IDLE)
-            flash_holder.pack(side="left")
-            btn = tk.Button(flash_holder, text=text, command=self._action_commands[action], **square_btn)
-            btn.pack(padx=3, pady=3)
-            self.action_buttons[action] = flash_holder
-            self._control_buttons[action] = btn
-
-        add_control("minus", "−1")
-        add_control("plus", "+1")
-        add_control("scene_prev", "▲")
-        add_control("scene_next", "▼")
-        add_control("play", "▶")
-        add_control("stop", "■")
-        add_control("metronome", "M")
-        add_control("metronome_2", "M2")
-
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour piloter les mêmes boutons --
-        controller_row = tk.Frame(self.root, bg=BG_IDLE)
-        controller_row.pack(fill="x", padx=10, pady=(0, 4))
+        controller_row = tk.Frame(midi_content, bg=BG_IDLE)
+        controller_row.pack(fill="x", pady=(0, 4))
         tk.Label(controller_row, text="MIDI IN OSC Boutons :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
         self.controller_port_var = tk.StringVar()
         self.controller_port_combo = ttk.Combobox(
@@ -839,8 +940,8 @@ class App:
         self.controller_connect_btn.pack(side="left", padx=2)
 
         # -- Pont HUI -> OSC (ex. Yamaha 01V96V2), 16 voies réparties sur 2 ports --
-        controller_row_2 = tk.Frame(self.root, bg=BG_IDLE)
-        controller_row_2.pack(fill="x", padx=10, pady=(0, 4))
+        controller_row_2 = tk.Frame(midi_content, bg=BG_IDLE)
+        controller_row_2.pack(fill="x", pady=(0, 4))
         tk.Label(controller_row_2, text="MIDI IN Faders and Mutes (voies 1-8) :", bg=BG_IDLE, fg=FG_TEXT).pack(
             side="left"
         )
@@ -857,8 +958,8 @@ class App:
         )
         self.hui_connect_btn.pack(side="left", padx=2)
 
-        controller_row_3 = tk.Frame(self.root, bg=BG_IDLE)
-        controller_row_3.pack(fill="x", padx=10, pady=(0, 4))
+        controller_row_3 = tk.Frame(midi_content, bg=BG_IDLE)
+        controller_row_3.pack(fill="x", pady=(0, 4))
         tk.Label(controller_row_3, text="MIDI IN Faders and Mutes (voies 9-16) :", bg=BG_IDLE, fg=FG_TEXT).pack(
             side="left"
         )
@@ -875,8 +976,8 @@ class App:
         )
         self.hui_connect_btn_2.pack(side="left", padx=2)
 
-        hui_mapping_row = tk.Frame(self.root, bg=BG_IDLE)
-        hui_mapping_row.pack(fill="x", padx=10, pady=(0, 4))
+        hui_mapping_row = tk.Frame(midi_content, bg=BG_IDLE)
+        hui_mapping_row.pack(fill="x", pady=(0, 4))
         tk.Button(
             hui_mapping_row, text="Configurer le mapping des faders…", command=self._open_hui_mapping_dialog,
         ).pack(side="left")
@@ -884,13 +985,13 @@ class App:
             hui_mapping_row, text="  (fader 16 dédié au tempo, voir plus haut)", bg=BG_IDLE, fg="#888888",
         ).pack(side="left")
 
-        status_row = tk.Frame(self.root, bg=BG_IDLE)
-        status_row.pack(fill="x", padx=10, pady=(0, 4))
+        status_row = tk.Frame(midi_content, bg=BG_IDLE)
+        status_row.pack(fill="x", pady=(0, 4))
         self.controller_status_label = tk.Label(status_row, text="", bg=BG_IDLE, fg="#bbbbbb")
         self.controller_status_label.pack(side="left")
 
-        table_row = tk.Frame(self.root, bg=BG_IDLE)
-        table_row.pack(fill="x", padx=10, pady=(0, 8))
+        table_row = tk.Frame(midi_content, bg=BG_IDLE)
+        table_row.pack(fill="x", pady=(0, 4))
         header_font = ("Helvetica", 9, "bold")
         tk.Label(table_row, text="Bouton", bg=BG_IDLE, fg="#888888", font=header_font).grid(
             row=0, column=0, sticky="w", padx=(0, 16),
@@ -1129,6 +1230,10 @@ class App:
         self.config["controller_port"] = port_name
         save_config(self.config)
         self._update_controller_status_label()
+        # Repositionne les LED métronome sur leur véritable état dès la
+        # (re)connexion, sinon la console repart LED éteinte quel que soit l'état réel.
+        self._send_controller_led("metronome", self._metronome_on)
+        self._send_controller_led("metronome_2", self._metronome_on_2)
 
     def _start_learn(self, action: str) -> None:
         self._learning = action
@@ -1164,7 +1269,25 @@ class App:
         if pending is not None:
             self.root.after_cancel(pending)
         holder.config(bg="#2f6fed")
-        self._action_flash_after_id[action] = self.root.after(200, lambda: holder.config(bg=BG_IDLE))
+
+        def _restore() -> None:
+            self._action_flash_after_id.pop(action, None)
+            holder.config(bg=self._action_active_bg.get(action, BG_IDLE))
+
+        self._action_flash_after_id[action] = self.root.after(200, _restore)
+
+    def _set_action_active(self, action: str, active: bool) -> None:
+        """Fond jaune persistant tant que l'action reste "active" (lecture en
+        cours, métronome allumé) — au lieu du point/texte utilisé avant."""
+        holder = self.action_buttons.get(action)
+        if holder is None:
+            return
+        bg = FLASH_YELLOW if active else BG_IDLE
+        if self._action_active_bg.get(action) == bg:
+            return
+        self._action_active_bg[action] = bg
+        if action not in self._action_flash_after_id:
+            holder.config(bg=bg)
 
     def _poll_controller(self) -> None:
         try:
@@ -1183,9 +1306,19 @@ class App:
                     save_config(self.config)
                     self._learning = None
                     self._update_controller_status_label()
+                    # Touche fraîchement apprise : reflète tout de suite l'état
+                    # courant sur sa LED (utile si le métronome était déjà actif).
+                    if action == "metronome":
+                        self._send_controller_led("metronome", self._metronome_on)
+                    elif action == "metronome_2":
+                        self._send_controller_led("metronome_2", self._metronome_on_2)
                     continue
                 for action, mapped_key in self.controller_map.items():
                     if key == mapped_key:
+                        now = time.monotonic()
+                        if now - self._controller_last_fire.get(action, 0.0) < self.CONTROLLER_DEBOUNCE_S:
+                            break
+                        self._controller_last_fire[action] = now
                         self._flash_action_button(action)
                         self._action_commands[action]()
                         break
@@ -1594,7 +1727,9 @@ class App:
                 # spoiler avant l'appui) : À SUIVRE jusqu'ici, nom révélé ici.
                 self.shared_state.set_scene_name(self._scene_name)
                 self.shared_state.set_scene_launched(True)
-                self._scene_flash_start = time.monotonic()
+                if self._scene_flash_shown_for != self._scene_index:
+                    self._scene_flash_shown_for = self._scene_index
+                    self._scene_flash_start = time.monotonic()
                 # Le compteur de mesures démarre au premier vrai temps 1 qui
                 # suit ce lancement (voir _update_bar_count), pas à l'appui.
                 self._bar_count = None
@@ -1658,6 +1793,15 @@ class App:
         except OSError as exc:
             self.status_label.config(text=f"Erreur OSC : {exc}")
 
+    def _send_controller_led(self, action: str, on: bool) -> None:
+        """Renvoie l'état on/off d'une action au contrôleur MIDI (ex. LED des
+        touches USER DEFINED de la console), si elle est mappée sur une note."""
+        mapping = self.controller_map.get(action)
+        if not mapping or mapping[0] != "note":
+            return
+        _kind, channel, note = mapping
+        self.controller.send_note_feedback(channel, note, on)
+
     def _toggle_metronome(self) -> None:
         """Bascule notre métronome audio local (clic.wav via la carte son
         choisie, voir audio_metronome.py) — ne commande plus le métronome
@@ -1665,9 +1809,8 @@ class App:
         self._metronome_on = not self._metronome_on
         self._last_played_beat = None
         self._audio_metronome.set_enabled(self._metronome_on)
-        btn = self._control_buttons.get("metronome")
-        if btn is not None:
-            btn.config(text="M ●" if self._metronome_on else "M")
+        self._set_action_active("metronome", self._metronome_on)
+        self._send_controller_led("metronome", self._metronome_on)
 
     def _toggle_metronome_2(self) -> None:
         """Bascule la deuxième sortie métronome (voir _build_ui
@@ -1675,9 +1818,8 @@ class App:
         self._metronome_on_2 = not self._metronome_on_2
         self._last_played_beat_2 = None
         self._audio_metronome_2.set_enabled(self._metronome_on_2)
-        btn = self._control_buttons.get("metronome_2")
-        if btn is not None:
-            btn.config(text="M2 ●" if self._metronome_on_2 else "M2")
+        self._set_action_active("metronome_2", self._metronome_on_2)
+        self._send_controller_led("metronome_2", self._metronome_on_2)
 
     def _poll_scene_replies(self) -> None:
         for address, args in self.live_osc.poll_replies():
@@ -1700,17 +1842,6 @@ class App:
                 # pistes) : ce n'est pas une vraie erreur, on ne l'affiche pas.
                 if not any("Index out of range" in str(arg) for arg in args):
                     print(f"[OSC] erreur renvoyée par AbletonOSC : {args}")
-            elif address == "/live/song/get/signature_numerator":
-                # Confirmation réelle (horodatée) que Live a bien pris en
-                # compte le numérateur — à comparer avec l'instant d'envoi.
-                print(f"[Signature] Live confirme numerator={int(args[0])} t={time.monotonic():.3f}")
-            elif address == "/live/song/get/signature_denominator":
-                print(f"[Signature] Live confirme denominator={int(args[0])} t={time.monotonic():.3f}")
-            elif address == "/live/song/get/current_beats_song_time":
-                # Diagnostic mes5/mes10 : vrai compteur mesure.temps.
-                # sixteenth.tick de Live (voir get_current_beats_song_time),
-                # à comparer avec notre propre compteur de mesure.
-                print(f"[LiveBeat] t={time.monotonic():.3f} pos={args[0]}")
             elif address == "/live/song/get/num_tracks":
                 self._reset_faders_beyond(int(args[0]))
             elif address == "/live/track/get/volume":
@@ -1820,7 +1951,6 @@ class App:
         signature globale, pas "par mesure" comme le tableur) : jamais
         d'envoi OSC quand la valeur ne change pas."""
         if count != self._live_time_signature_sent:
-            print(f"[Signature] envoi count={count} t={time.monotonic():.3f}")
             self.live_osc.set_time_signature(count)
             self._live_time_signature_sent = count
 
@@ -1928,13 +2058,6 @@ class App:
         self._poll_tempo_fader()
         self._poll_tempo_fader_keepalive()
         self._poll_tempo_reset()
-        # Diagnostic temporaire (mes5/mes10 sur Viser), voir _poll_scene_replies.
-        if time.monotonic() - self._last_beats_song_time_query > 0.1:
-            self._last_beats_song_time_query = time.monotonic()
-            try:
-                self.live_osc.get_current_beats_song_time()
-            except OSError:
-                pass
         if self.mode_var.get() == "midi":
             try:
                 while True:
@@ -2189,6 +2312,7 @@ class App:
     def _update_display(
         self, beat: int, beats_per_bar: int, fractional: float, bpm: float | None, connected: bool, running: bool,
     ) -> None:
+        self._set_action_active("play", connected and running)
         # En mode Link, le clic est déclenché par _metronome_loop (thread à
         # part, insensible aux gels de _poll/after() sous macOS) ; ici on ne
         # s'en occupe qu'en MIDI Clock, dont l'état n'existe que via _poll.
