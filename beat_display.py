@@ -2067,7 +2067,15 @@ class App:
                 self.bar_count_label.config(text=f"Mesure {self._bar_count}")
                 self.shared_state.set_bar_count(self._bar_count)
                 if self._pending_goto_jump_beats:
-                    self._jump_beats(self._pending_goto_jump_beats)
+                    # Léger délai : une piste dont le clip démarre tout juste
+                    # à cet instant précis (pas déjà en lecture depuis une
+                    # scène précédente) peut ne pas encore être "is_playing"
+                    # côté Live au moment même du vrai temps 1, et
+                    # jump_in_running_session_clip échoue alors silencieusement
+                    # (pas d'erreur OSC) pour cette piste seulement, qui
+                    # redémarre donc du tout début à chaque lancement.
+                    jump_beats = self._pending_goto_jump_beats
+                    self.root.after(50, lambda b=jump_beats: self._jump_beats(b))
                 self._pending_goto_jump_beats = None
             return
         if self._bar_count is not None and beat == 1 and self._bar_count_prev_beat != 1:
