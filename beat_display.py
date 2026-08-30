@@ -484,6 +484,13 @@ class App:
         # le COUNT d'une mesure à l'autre, ex. 2 temps puis 4 temps).
         self._link_beat_in_bar = 1
         self._link_prev_fractional: float | None = None
+        # Horodatage (monotonic) associé à _link_prev_fractional : sert à
+        # calculer le nombre RÉEL de temps écoulés depuis la dernière mise à
+        # jour (voir _poll, branche "comptage en continu") plutôt que de se
+        # contenter de détecter un seul rebouclage par appel, ce qui faisait
+        # durablement prendre du retard au compteur après un gel de _poll()
+        # (déplacement de souris sur macOS/Tk, voir _metronome_loop).
+        self._link_last_update_time: float | None = None
         # Avertissement "0 pair Link" (voir _update_link_peers_label) : une
         # boîte de dialogue s'ouvre après 5s sans pair, et se referme toute
         # seule dès qu'un pair est détecté (ou reste fermée si l'utilisateur
@@ -2111,6 +2118,7 @@ class App:
                 if connected and not self._was_connected:
                     self._awaiting_downbeat = True
                     self._link_prev_fractional = None
+                    self._link_last_update_time = None
                 self._was_connected = connected
                 phase = project_phase(
                     snapshot["phase"], snapshot["bpm"], connected,
@@ -2131,24 +2139,31 @@ class App:
                     if beat == 1:
                         self._link_beat_in_bar = 1
                         self._link_prev_fractional = fractional
+                        self._link_last_update_time = time.monotonic()
                 else:
-                    # Comptage en continu, indépendant du modulo Link : un
-                    # rebouclage de la partie fractionnaire du temps (0.95 ->
-                    # 0.05 par exemple, détecté ici) fait avancer notre PROPRE
-                    # compteur de temps dans la mesure, qui reboucle sur le
-                    # COUNT courant (self.beats_var) — donc correct même
-                    # quand ce COUNT change d'une mesure à l'autre (feuille de
-                    # scène, ex. 2 temps puis 4 temps), ce que ne permet pas
-                    # phase % quantum (aligné sur la session Link depuis son
-                    # tout début, pas sur le début de la mesure courante).
-                    if (
-                        self._link_prev_fractional is not None
-                        and fractional < self._link_prev_fractional - 0.5
-                    ):
-                        self._link_beat_in_bar += 1
-                        if self._link_beat_in_bar > int(quantum):
-                            self._link_beat_in_bar = 1
+                    # Comptage en continu, indépendant du modulo Link : le
+                    # nombre de temps réellement écoulés depuis la dernière
+                    # mise à jour est calculé à partir du tempo et du temps
+                    # réel écoulé (pas seulement "un rebouclage détecté = +1"),
+                    # pour rattraper d'un coup plusieurs temps sautés si
+                    # _poll() a été gelé un moment (déplacement de souris sur
+                    # macOS/Tk, voir _metronome_loop) — sinon le compteur
+                    # prenait durablement du retard sur l'audio après un gel.
+                    # Reboucle sur le COUNT courant (self.beats_var), donc
+                    # correct même quand ce COUNT change d'une mesure à
+                    # l'autre (feuille de scène, ex. 2 temps puis 4 temps), ce
+                    # que ne permet pas phase % quantum (aligné sur la session
+                    # Link depuis son tout début, pas sur le début de la
+                    # mesure en cours).
+                    now = time.monotonic()
+                    if self._link_prev_fractional is not None and self._link_last_update_time is not None:
+                        dt = now - self._link_last_update_time
+                        elapsed_beats = snapshot["bpm"] / 60.0 * dt
+                        wraps = round(elapsed_beats - (fractional - self._link_prev_fractional))
+                        if wraps > 0:
+                            self._link_beat_in_bar = ((self._link_beat_in_bar - 1 + wraps) % int(quantum)) + 1
                     self._link_prev_fractional = fractional
+                    self._link_last_update_time = now
                     beat = self._link_beat_in_bar
                 connected = connected and not self._awaiting_downbeat
                 self._update_bar_count(connected, beat, fractional)
