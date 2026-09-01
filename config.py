@@ -57,6 +57,12 @@ DEFAULTS = {
     # Plage du fader 16 dédié au tempo : "3"/"6"/"10"/"20"/"100" (pourcentage
     # autour du tempo de référence).
     "tempo_fader_range": "6",
+    # Affichage réduit (points uniquement, sans chiffres).
+    "dots_only": False,
+    "offline_bpm": 120.0,
+    # Réduit de 50% et remonte en haut les chiffres/points pour laisser de
+    # la place au défilement des paroles (voir beat_display._update_display).
+    "lyrics_enabled": False,
 }
 
 

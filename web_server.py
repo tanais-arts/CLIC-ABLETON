@@ -72,6 +72,15 @@ _PAGE = """<!DOCTYPE html>
     font-size: 40vh; font-weight: bold; color: #f5f5f5;
     -webkit-user-select: none; user-select: none;
   }
+  #dotsPair {
+    display: none;
+    gap: 6vw;
+  }
+  #dotsPair .circle {
+    width: 18vh; height: 18vh; border-radius: 50%;
+    border: 3px solid #f5f5f5; box-sizing: border-box;
+  }
+  #dotsPair .circle.filled { background: #f5f5f5; }
   #scrollLine {
     display: none;
     position: absolute; left: 15%; right: 15%; top: 50%;
@@ -125,6 +134,25 @@ _PAGE = """<!DOCTYPE html>
     -webkit-user-select: none; user-select: none;
   }
   #muteBtn.unmuted { background: #2b7a2b; }
+  #lyricsBtn {
+    margin-top: 8px; padding: 6px 16px; font-size: 2.4vh;
+    background: #333333; color: #f5f5f5; border: none; border-radius: 6px;
+    -webkit-user-select: none; user-select: none;
+  }
+  #lyricsBtn.active { background: #2b7a2b; }
+  #dotsBtn {
+    margin-top: 8px; padding: 6px 16px; font-size: 2.4vh;
+    background: #333333; color: #f5f5f5; border: none; border-radius: 6px;
+    -webkit-user-select: none; user-select: none;
+  }
+  #dotsBtn.active { background: #2b7a2b; }
+  #lyricsLine {
+    display: none;
+    flex: 0 0 auto; margin-top: 0;
+    align-items: center; justify-content: center;
+    font-size: 4.5vh; font-weight: bold; color: #f5f5f5;
+    min-height: 1.2em; text-align: center; padding: 0 4vw;
+  }
 </style>
 </head>
 <body>
@@ -135,16 +163,20 @@ _PAGE = """<!DOCTYPE html>
     </div>
     <div class="ticks"><span>Retard</span><span>Référence</span><span>Avance</span></div>
     <button id="muteBtn">🔇 Son coupé</button>
+    <button id="lyricsBtn">📝 Paroles masquées</button>
+    <button id="dotsBtn">🔢 Chiffres</button>
   </div>
   <div id="beat">
     <div id="dot">•</div>
     <div id="digit"></div>
+    <div id="dotsPair"><div id="dotLeft" class="circle"></div><div id="dotRight" class="circle"></div></div>
     <div id="offline">OFFLINE</div>
     <div id="scrollLine"><div id="scrollThumb"></div></div>
   </div>
   <div id="sceneLabel"></div>
   <div id="barCount"></div>
   <div id="sceneName"></div>
+  <div id="lyricsLine"></div>
   <div id="info">-- BPM</div>
 <script>
 const KEY = 'beatDisplayLatencyMs';
@@ -171,8 +203,29 @@ function sceneFlashDouble() {
 const beatEl = document.getElementById('beat');
 const dotEl = document.getElementById('dot');
 const digitEl = document.getElementById('digit');
+const dotsPairEl = document.getElementById('dotsPair');
+const dotLeftEl = document.getElementById('dotLeft');
+const dotRightEl = document.getElementById('dotRight');
 const scrollLineEl = document.getElementById('scrollLine');
 const scrollThumbEl = document.getElementById('scrollThumb');
+
+// Chiffres/points : préférence propre à cet appareil (comme le son et les
+// paroles), indépendante du réglage équivalent du grand écran.
+const DOTS_KEY = 'beatDisplayShowDots';
+const dotsBtn = document.getElementById('dotsBtn');
+let showDots = localStorage.getItem(DOTS_KEY) === '1';
+
+function updateDotsBtn() {
+  dotsBtn.textContent = showDots ? '⚫ Points' : '🔢 Chiffres';
+  dotsBtn.classList.toggle('active', showDots);
+}
+updateDotsBtn();
+
+dotsBtn.addEventListener('click', () => {
+  showDots = !showDots;
+  localStorage.setItem(DOTS_KEY, showDots ? '1' : '0');
+  updateDotsBtn();
+});
 
 const MUTE_KEY = 'beatDisplayMuted';
 const muteBtn = document.getElementById('muteBtn');
@@ -231,6 +284,26 @@ muteBtn.addEventListener('click', () => {
   }
 });
 
+// Affichage des paroles : préférence propre à cet appareil (indépendante de
+// la case «Afficher les paroles» du grand écran), désactivée par défaut.
+const LYRICS_KEY = 'beatDisplayShowLyrics';
+const lyricsBtn = document.getElementById('lyricsBtn');
+const lyricsLineEl = document.getElementById('lyricsLine');
+let showLyrics = localStorage.getItem(LYRICS_KEY) === '1';
+
+function updateLyricsBtn() {
+  lyricsBtn.textContent = showLyrics ? '📝 Paroles affichées' : '📝 Paroles masquées';
+  lyricsBtn.classList.toggle('active', showLyrics);
+  lyricsLineEl.style.display = showLyrics ? 'flex' : 'none';
+}
+updateLyricsBtn();
+
+lyricsBtn.addEventListener('click', () => {
+  showLyrics = !showLyrics;
+  localStorage.setItem(LYRICS_KEY, showLyrics ? '1' : '0');
+  updateLyricsBtn();
+});
+
 // Planification "lookahead" (horloge audio, pas le timer JS) : au lieu de
 // jouer le clic au moment où poll() détecte un changement de temps (sujet
 // aux à-coups du setInterval/réseau, cause des lags occasionnels), on
@@ -284,6 +357,7 @@ async function poll() {
     if (data.offline) {
       dotEl.style.display = 'none';
       digitEl.style.display = 'none';
+      dotsPairEl.style.display = 'none';
       scrollLineEl.style.display = 'none';
       offlineEl.style.display = 'block';
       lastBeat = null;
@@ -294,8 +368,17 @@ async function poll() {
     if (data.connected) {
       dotEl.style.display = 'none';
       scrollLineEl.style.display = 'none';
-      digitEl.style.display = 'block';
-      digitEl.textContent = data.beat;
+      if (showDots) {
+        digitEl.style.display = 'none';
+        dotsPairEl.style.display = 'flex';
+        const leftFilled = data.beat % 2 === 1;
+        dotLeftEl.classList.toggle('filled', leftFilled);
+        dotRightEl.classList.toggle('filled', !leftFilled);
+      } else {
+        dotsPairEl.style.display = 'none';
+        digitEl.style.display = 'block';
+        digitEl.textContent = data.beat;
+      }
       scheduleUpcomingClicks(data);
       if (data.beat !== lastBeat) {
         lastBeat = data.beat;
@@ -309,6 +392,7 @@ async function poll() {
       }
     } else {
       digitEl.style.display = 'none';
+      dotsPairEl.style.display = 'none';
       lastBeat = null;
       nextClickAt = null;
       if (data.bpm && !data.running) {
@@ -338,6 +422,9 @@ async function poll() {
     document.getElementById('sceneName').classList.toggle('launched', !!data.scene_launched);
     document.getElementById('barCount').textContent = data.bar_count ? ('Mes. ' + data.bar_count) : '';
     document.getElementById('sceneLabel').textContent = data.scene_label || '';
+    if (showLyrics) {
+      lyricsLineEl.textContent = data.lyrics_line || '';
+    }
     if (data.scene_launched && !lastSceneLaunched) {
       sceneFlashDouble();
     }
@@ -401,6 +488,7 @@ class SharedBeatState:
         self._bar_count: int | None = None
         self._scene_label = ""
         self._offline = False
+        self._lyrics_line = ""
 
     def update(
         self, phase: float, beats_per_bar: float, bpm: float | None,
@@ -452,6 +540,14 @@ class SharedBeatState:
         with self._lock:
             self._offline = True
 
+    def set_lyrics_line(self, text: str) -> None:
+        """Ligne de paroles (lyrics.py) actuellement due (voir
+        beat_display._push_lyrics_line), indépendante de la case «Afficher
+        les paroles» du grand écran : chaque appareil choisit lui-même de
+        l'afficher ou non (bouton côté page web)."""
+        with self._lock:
+            self._lyrics_line = text
+
     def compute(self, latency_ms: float = 0.0) -> dict:
         """Calcule {beat, bpm, connected, running, mode} pour un décalage donné."""
         with self._lock:
@@ -461,6 +557,7 @@ class SharedBeatState:
             bar_count = self._bar_count
             scene_label = self._scene_label
             offline = self._offline
+            lyrics_line = self._lyrics_line
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
         elapsed_ms = (time.monotonic() - data["ref_monotonic"]) * 1000.0
@@ -480,6 +577,7 @@ class SharedBeatState:
             "bar_count": bar_count,
             "scene_label": scene_label,
             "offline": offline,
+            "lyrics_line": lyrics_line,
         }
 
 
