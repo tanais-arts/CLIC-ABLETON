@@ -45,6 +45,7 @@ HIGHLIGHT_SIZE_SCALE = 1.5  # chiffres/dots 50% plus grands sur une mesure HIGHL
 LYRICS_SCROLL_BEATS = 48  # nombre de temps pour traverser toute la zone de paroles
 LYRICS_BEATS_PER_LINE = 8  # chaque ligne du CSV mesure exactement 8 temps (positionnement du défilement)
 LYRICS_FONT = ("Helvetica", 25, "bold")  # titre du morceau (20) + 25%
+LYRICS_MIN_FONT_SIZE = 12  # taille plancher si une ligne est vraiment trop longue (voir _compute_lyrics_line_fonts)
 # Position de lecture (calage du défilement), fraction (0..1) depuis le haut
 # de la zone de paroles : valeur calibrée manuellement, figée.
 LYRICS_READING_POSITION_RATIO = 0.28
@@ -585,6 +586,11 @@ class App:
         # Demi-hauteur de ligne (métrique réelle de LYRICS_FONT), calculée une
         # seule fois au premier affichage (voir _draw_lyrics_scroll).
         self._lyrics_line_half_height: float | None = None
+        # Taille de police réduite par ligne trop large pour le canvas (index
+        # -> (famille, taille, graisse)), précalculée au chargement du morceau
+        # (voir _compute_lyrics_line_fonts) : concerne uniquement le grand
+        # écran, jamais la page web (qui reçoit le texte brut).
+        self._lyrics_line_fonts: dict[int, tuple] = {}
         # Dernière signature rythmique (numérateur COUNT) poussée à Live, pour
         # ne la renvoyer que si elle change réellement (voir _apply_scene_sheet_row).
         self._live_time_signature_sent: int | None = None
@@ -1178,6 +1184,7 @@ class App:
         )
         self.shared_state.set_lyrics_lines(self._lyrics_sheet.lines if self._lyrics_sheet is not None else [])
         self._lyrics_bar_beats = []
+        self._compute_lyrics_line_fonts()
         label_bar = self._scene_sheet.bar_for_label(self.goto_label_var.get())
         try:
             preroll = max(0, int(self.preroll_var.get()))
@@ -1862,6 +1869,7 @@ class App:
         self.shared_state.set_scene_label("")
         self._lyrics_sheet = None
         self._lyrics_bar_beats = []
+        self._lyrics_line_fonts = {}
         self._hide_lyrics_scroll_items()
         try:
             self.live_osc.set_selected_scene(new_index)
@@ -1900,6 +1908,7 @@ class App:
                 self.shared_state.set_scene_label("")
                 self._lyrics_sheet = None
                 self._lyrics_bar_beats = []
+                self._lyrics_line_fonts = {}
                 self._hide_lyrics_scroll_items()
                 # 2s après le lancement d'une scène "tempo seul", on
                 # sélectionne automatiquement la scène suivante (comme un
@@ -1938,6 +1947,7 @@ class App:
                 )
                 self.shared_state.set_lyrics_lines(self._lyrics_sheet.lines if self._lyrics_sheet is not None else [])
                 self._lyrics_bar_beats = []
+                self._compute_lyrics_line_fonts()
                 label_bar = (
                     self._scene_sheet.bar_for_label(self.goto_label_var.get())
                     if self._scene_sheet is not None else None
@@ -2594,6 +2604,35 @@ class App:
         canvas.itemconfigure(item, fill=top_bg, outline=top_bg, state="normal")
         canvas.tag_lower(item)
 
+    def _compute_lyrics_line_fonts(self) -> None:
+        """Précalcule, pour chaque ligne trop large pour tenir dans le canvas
+        à la taille normale (LYRICS_FONT), une taille de police réduite qui
+        tient dans la largeur disponible (voir _draw_lyrics_scroll) : ne
+        concerne que l'affichage du grand écran, jamais la page web (qui
+        reçoit le texte brut, voir set_lyrics_lines)."""
+        self._lyrics_line_fonts = {}
+        sheet = self._lyrics_sheet
+        if sheet is None:
+            return
+        width = self.display.winfo_width()
+        if width <= 1:
+            width = 690
+        available = max(1, width - 10)
+        probe = tkfont.Font(font=LYRICS_FONT)
+        for index, text in enumerate(sheet.lines):
+            if not text:
+                continue
+            probe.configure(size=LYRICS_FONT[1])
+            if probe.measure(text) <= available:
+                continue
+            size = LYRICS_FONT[1] - 1
+            while size > LYRICS_MIN_FONT_SIZE:
+                probe.configure(size=size)
+                if probe.measure(text) <= available:
+                    break
+                size -= 1
+            self._lyrics_line_fonts[index] = (LYRICS_FONT[0], size, LYRICS_FONT[2])
+
     def _draw_lyrics_scroll(self, beat: int, fractional: float) -> None:
         """Fait défiler les paroles (lyrics.py) dans la moitié basse du
         canvas, façon générique de fin : chaque ligne du CSV mesure
@@ -2634,7 +2673,8 @@ class App:
                 key, lambda: canvas.create_text(width / 2, 0, font=LYRICS_FONT, fill=FG_TEXT),
             )
             canvas.coords(item, width / 2, y)
-            canvas.itemconfigure(item, text=text, fill=FG_TEXT, state="normal")
+            font = self._lyrics_line_fonts.get(index, LYRICS_FONT)
+            canvas.itemconfigure(item, text=text, fill=FG_TEXT, font=font, state="normal")
             visible[index] = item
         for index in self._lyrics_visible_indices - visible.keys():
             item = self._canvas_items.get(f"lyrics_line_{index}")
