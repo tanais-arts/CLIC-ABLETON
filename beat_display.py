@@ -17,7 +17,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import font as tkfont, ttk
 
 import rtmidi
 
@@ -26,6 +26,7 @@ from config import load_config, save_config
 from hui_bridge import HuiBridge
 from link_client import AbletonLink, LinkUnavailable
 from live_osc import LiveOSC
+from lyrics import LyricsSheet, load_lyrics
 from scene_sheet import SceneSheet, SceneSheetRow, load_scene_sheet
 from web_server import BeatWebServer, SharedBeatState, project_phase
 
@@ -41,6 +42,13 @@ FLASH_YELLOW = "#f5c518"
 FLASH_BLUE = "#2b4bff"  # bleu outremer
 FLASH_HIGHLIGHT = "#ff2b2b"  # fond ET chiffres/dots : mesure HIGHLIGHT (scene_sheet.py)
 HIGHLIGHT_SIZE_SCALE = 1.5  # chiffres/dots 50% plus grands sur une mesure HIGHLIGHT
+LYRICS_SCROLL_BEATS = 48  # nombre de temps pour traverser toute la zone de paroles
+LYRICS_BEATS_PER_LINE = 8  # chaque ligne du CSV mesure exactement 8 temps (positionnement du défilement)
+LYRICS_FONT = ("Helvetica", 25, "bold")  # titre du morceau (20) + 25%
+LYRICS_MIN_FONT_SIZE = 12  # taille plancher si une ligne est vraiment trop longue (voir _compute_lyrics_line_fonts)
+# Position de lecture (calage du défilement), fraction (0..1) depuis le haut
+# de la zone de paroles : valeur calibrée manuellement, figée.
+LYRICS_READING_POSITION_RATIO = 0.28
 SCENE_NOT_LAUNCHED = "#ff4d4d"  # rouge : scène sélectionnée, pas encore lancée (identique au web)
 SCENE_LAUNCHED = "#3ddc57"  # vert : scène lancée
 SCENE_FLASH_WHITE = "#ffffff"
@@ -415,6 +423,10 @@ class App:
         self._metronome_prev_fractional_2: float | None = None
         self._metronome_last_update_time_2: float | None = None
         self._metronome_awaiting_downbeat_2 = True
+        # -- Mode Offline (test sans Live/MIDI) --
+        self._offline_playing: bool = False
+        self._offline_beat_in_bar: int = 1
+        self._offline_last_beat_time: float = 0.0
         # Confirmation réelle (pas juste l'instant d'envoi) de la prise en
         # compte de la signature par Live, voir _poll_scene_replies.
         self.live_osc.start_listen_signature_numerator()
@@ -561,6 +573,24 @@ class App:
         # feuille, comportement inchangé (voir _apply_scene_sheet_row).
         self._scene_sheet: SceneSheet | None = None
         self._scene_sheet_row: SceneSheetRow | None = None
+        # Paroles (lyrics.py) du morceau en cours, si <nom de scène>.csv
+        # existe dans Lyrics/ ; None = aucune parole (voir _draw_lyrics_scroll).
+        self._lyrics_sheet: LyricsSheet | None = None
+        # Temps écoulés (depuis la mesure 1) au début de chaque mesure déjà
+        # rencontrée, tient compte du COUNT (voir _cumulative_beats_at_bar) :
+        # complété au fil de l'eau, jamais recalculé depuis le début.
+        self._lyrics_bar_beats: list[float] = []
+        # Index des lignes de paroles actuellement affichées (voir
+        # _draw_lyrics_scroll), pour cacher celles qui sortent du cadre.
+        self._lyrics_visible_indices: set[int] = set()
+        # Demi-hauteur de ligne (métrique réelle de LYRICS_FONT), calculée une
+        # seule fois au premier affichage (voir _draw_lyrics_scroll).
+        self._lyrics_line_half_height: float | None = None
+        # Taille de police réduite par ligne trop large pour le canvas (index
+        # -> (famille, taille, graisse)), précalculée au chargement du morceau
+        # (voir _compute_lyrics_line_fonts) : concerne uniquement le grand
+        # écran, jamais la page web (qui reçoit le texte brut).
+        self._lyrics_line_fonts: dict[int, tuple] = {}
         # Dernière signature rythmique (numérateur COUNT) poussée à Live, pour
         # ne la renvoyer que si elle change réellement (voir _apply_scene_sheet_row).
         self._live_time_signature_sent: int | None = None
@@ -638,6 +668,11 @@ class App:
             command=self._apply_mode, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
             activebackground=BG_IDLE, activeforeground=FG_TEXT,
         ).pack(side="left", padx=4)
+        tk.Radiobutton(
+            mode_row, text="Offline", value="offline", variable=self.mode_var,
+            command=self._apply_mode, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
+            activebackground=BG_IDLE, activeforeground=FG_TEXT,
+        ).pack(side="left", padx=4)
 
         # -- Bloc Link --
         self.link_frame = tk.Frame(top, bg=BG_IDLE)
@@ -693,6 +728,22 @@ class App:
         self.connect_btn = tk.Button(button_row, text="Connecter", command=self._toggle_connect)
         self.connect_btn.pack(side="left", padx=4)
 
+        # -- Bloc Offline --
+        self.offline_frame = tk.Frame(top, bg=BG_IDLE)
+        tk.Label(self.offline_frame, text="Morceau :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", pady=(6, 0))
+        self.offline_song_var = tk.StringVar(value="")
+        self.offline_song_combo = ttk.Combobox(
+            self.offline_frame, textvariable=self.offline_song_var, state="readonly", width=24,
+        )
+        self.offline_song_combo.pack(side="left", padx=(6, 12), pady=(6, 0))
+        self.offline_song_combo.bind("<<ComboboxSelected>>", self._on_offline_song_selected)
+        tk.Label(self.offline_frame, text="BPM :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", pady=(6, 0))
+        self.offline_tempo_var = tk.DoubleVar(value=self.config.get("offline_bpm", 120.0))
+        tk.Spinbox(
+            self.offline_frame, from_=20.0, to=300.0, increment=1.0, width=6,
+            textvariable=self.offline_tempo_var,
+        ).pack(side="left", padx=(4, 0), pady=(6, 0))
+
         # -- Réglages communs --
         settings_frame = tk.Frame(self.root, bg=BG_IDLE)
         settings_frame.pack(fill="x", padx=10, pady=(0, 8))
@@ -713,7 +764,7 @@ class App:
 
         self.dots_var = tk.BooleanVar(value=self.config["dots_only"])
         tk.Checkbutton(
-            settings_frame, text="Points au lieu des chiffres", variable=self.dots_var,
+            settings_frame, text="Points", variable=self.dots_var,
             command=self._on_settings_change, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
             activebackground=BG_IDLE, activeforeground=FG_TEXT,
         ).pack(side="left", padx=(16, 0))
@@ -865,6 +916,23 @@ class App:
         tk.Button(
             settings_row, text="Réglages MIDI", command=lambda: _show_settings_window(self.midi_settings_win),
         ).pack(side="left")
+        # Paroles défilantes (module à venir) : réduit de moitié la taille des
+        # chiffres/points et les remonte en haut du canvas, pour laisser 50%
+        # de l'espace libre en bas (voir _update_display/_draw_digit).
+        self.lyrics_var = tk.BooleanVar(value=self.config["lyrics_enabled"])
+        tk.Checkbutton(
+            settings_row, text="Afficher les paroles", variable=self.lyrics_var,
+            command=self._on_settings_change, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
+            activebackground=BG_IDLE, activeforeground=FG_TEXT,
+        ).pack(side="left", padx=(16, 0))
+        self.lyrics_reading_ratio_var = tk.DoubleVar(
+            value=self.config.get("lyrics_reading_position_ratio", LYRICS_READING_POSITION_RATIO)
+        )
+        tk.Scale(
+            settings_row, from_=0.0, to=1.0, resolution=0.01, orient="horizontal", length=100,
+            variable=self.lyrics_reading_ratio_var, showvalue=False, command=lambda _v: self._on_settings_change(),
+            bg=BG_IDLE, fg=FG_TEXT, troughcolor="#333333", highlightthickness=0,
+        ).pack(side="left", padx=(4, 0))
 
         # -- Métronome audio local (clic.wav, voir audio_metronome.py) : carte
         # son + sortie (paire stéréo ou mono), activé/désactivé par le bouton
@@ -1059,13 +1127,90 @@ class App:
 
     def _apply_mode(self) -> None:
         mode = self.mode_var.get()
+        if mode != "offline" and self._offline_playing:
+            self._offline_playing = False
+            self._offline_last_beat_time = 0.0
+        self.link_frame.pack_forget()
+        self.midi_frame.pack_forget()
+        self.offline_frame.pack_forget()
         if mode == "link":
-            self.midi_frame.pack_forget()
             self.link_frame.pack(fill="x")
-        else:
-            self.link_frame.pack_forget()
+        elif mode == "midi":
             self.midi_frame.pack(fill="x")
+        else:
+            self._refresh_offline_songs()
+            self.offline_frame.pack(fill="x")
         self._on_settings_change()
+
+    def _refresh_offline_songs(self) -> None:
+        songs = sorted(path.stem for path in self.SCENE_SHEET_DIR.glob("*.xlsx"))
+        self.offline_song_combo["values"] = songs
+        if self.offline_song_var.get() not in songs:
+            self.offline_song_var.set(songs[0] if songs else "")
+        self._on_offline_song_selected()
+
+    def _on_offline_song_selected(self, _event=None) -> None:
+        if self._offline_playing:
+            self._stop_return_to_start()
+        self._scene_name = self.offline_song_var.get()
+        self._scene_sheet_preview = load_scene_sheet(
+            self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Feuille de scène] {msg}"),
+        )
+        labels = self._scene_sheet_preview.labels() if self._scene_sheet_preview is not None else []
+        self.goto_label_combo["values"] = labels
+        remembered = self._goto_label_by_scene.get(self._scene_name)
+        if remembered in labels:
+            self.goto_label_var.set(remembered)
+        elif "INTRO" in labels:
+            self.goto_label_var.set("INTRO")
+        elif labels:
+            self.goto_label_var.set(labels[0])
+        else:
+            self.goto_label_var.set("")
+        self.scene_name_label.config(text=self._scene_name or "Aucun morceau", fg=SCENE_NOT_LAUNCHED)
+
+    def _launch_offline_song(self) -> None:
+        if not self._scene_name:
+            self.status_label.config(text="Aucun fichier XLSX disponible")
+            return
+        self._scene_sheet = load_scene_sheet(
+            self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Feuille de scène] {msg}"),
+        )
+        if self._scene_sheet is None:
+            self.status_label.config(text=f"Feuille {self._scene_name}.xlsx illisible")
+            return
+        self._lyrics_sheet = load_lyrics(
+            self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Paroles] {msg}"),
+        )
+        self.shared_state.set_lyrics_lines(self._lyrics_sheet.lines if self._lyrics_sheet is not None else [])
+        self._lyrics_bar_beats = []
+        self._compute_lyrics_line_fonts()
+        label_bar = self._scene_sheet.bar_for_label(self.goto_label_var.get())
+        try:
+            preroll = max(0, int(self.preroll_var.get()))
+            bpm = max(20.0, min(300.0, float(self.offline_tempo_var.get())))
+        except (tk.TclError, ValueError):
+            preroll = 0
+            bpm = 120.0
+        self.config["offline_bpm"] = bpm
+        save_config(self.config)
+        self._bar_count_start = max(1, label_bar - preroll) if label_bar is not None else 1
+        self._scene_label_sticky = self._scene_sheet.label_at_or_before(self._bar_count_start)
+        self._bar_count = None
+        self._bar_count_prev_beat = None
+        self._bar_count_signature_pushed_for = None
+        self._awaiting_bar_start = True
+        self._pending_goto_jump_beats = None
+        self._metronome_end_muted = False
+        self._offline_beat_in_bar = 1
+        self._offline_last_beat_time = 0.0
+        self._offline_playing = True
+        self._apply_scene_sheet_row(self._bar_count_start)
+        self.bar_count_label.config(text="")
+        self.scene_name_label.config(text=self._scene_name, fg=SCENE_LAUNCHED)
+        self.shared_state.set_scene_name(self._scene_name)
+        self.shared_state.set_scene_launched(True)
+        self.status_label.config(text="Lecture Offline")
 
     # --------------------------------------------------------- MIDI ports --
     def _refresh_ports(self) -> None:
@@ -1374,6 +1519,8 @@ class App:
         self.config["mode"] = self.mode_var.get()
         self._mode_cache = self.config["mode"]
         self.config["dots_only"] = self.dots_var.get()
+        self.config["lyrics_enabled"] = self.lyrics_var.get()
+        self.config["lyrics_reading_position_ratio"] = self.lyrics_reading_ratio_var.get()
         save_config(self.config)
 
     def _safe_int_var(self, var: tk.IntVar, cache_attr: str) -> int:
@@ -1720,6 +1867,10 @@ class App:
         self._scene_label_sticky = ""
         self.scene_label_label.config(text="")
         self.shared_state.set_scene_label("")
+        self._lyrics_sheet = None
+        self._lyrics_bar_beats = []
+        self._lyrics_line_fonts = {}
+        self._hide_lyrics_scroll_items()
         try:
             self.live_osc.set_selected_scene(new_index)
             self.live_osc.get_scene_name(new_index)
@@ -1727,6 +1878,9 @@ class App:
             self.scene_name_label.config(text=f"Erreur OSC : {exc}")
 
     def _scene_launch(self) -> None:
+        if self.mode_var.get() == "offline":
+            self._launch_offline_song()
+            return
         # fire_selected (Scene.fire_as_selected) avance aussi la sélection vers
         # la scène suivante côté Live : on utilise fire(index) pour ne lancer
         # que la scène affichée, sans bouger la sélection.
@@ -1752,6 +1906,10 @@ class App:
                 self._scene_label_sticky = ""
                 self.scene_label_label.config(text="")
                 self.shared_state.set_scene_label("")
+                self._lyrics_sheet = None
+                self._lyrics_bar_beats = []
+                self._lyrics_line_fonts = {}
+                self._hide_lyrics_scroll_items()
                 # 2s après le lancement d'une scène "tempo seul", on
                 # sélectionne automatiquement la scène suivante (comme un
                 # appui sur ▼), prête à être lancée avec le bouton ▶.
@@ -1784,6 +1942,12 @@ class App:
                 self._scene_sheet = load_scene_sheet(
                     self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Feuille de scène] {msg}"),
                 )
+                self._lyrics_sheet = load_lyrics(
+                    self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Paroles] {msg}"),
+                )
+                self.shared_state.set_lyrics_lines(self._lyrics_sheet.lines if self._lyrics_sheet is not None else [])
+                self._lyrics_bar_beats = []
+                self._compute_lyrics_line_fonts()
                 label_bar = (
                     self._scene_sheet.bar_for_label(self.goto_label_var.get())
                     if self._scene_sheet is not None else None
@@ -1824,6 +1988,18 @@ class App:
         clips en cours, comportement natif normal), puis (comme au 2e Stop) ramène
         le curseur à 1:1:1, en attente d'un start de scène."""
         self._metronome_end_muted = False
+        if self.mode_var.get() == "offline":
+            self._offline_playing = False
+            self._offline_last_beat_time = 0.0
+            self._bar_count = None
+            self._bar_count_prev_beat = None
+            self._awaiting_bar_start = False
+            self.bar_count_label.config(text="")
+            self.scene_name_label.config(text=self._scene_name or "Aucun morceau", fg=SCENE_NOT_LAUNCHED)
+            self.shared_state.set_bar_count(None)
+            self.shared_state.set_scene_launched(False)
+            self.status_label.config(text="Arrêté (Offline)")
+            return
         try:
             self.live_osc.stop_playing()
             self.root.after(120, self.live_osc.stop_playing)
@@ -1982,12 +2158,37 @@ class App:
         row = self._scene_sheet.get(mes) if self._scene_sheet is not None else None
         return row.count if row is not None and row.count else self.config["beats_per_bar"]
 
+    def _cumulative_beats_at_bar(self, mes: int) -> float:
+        """Temps écoulés (depuis la mesure 1) au tout début de la mesure
+        `mes` (mes=1 -> 0.0), en tenant compte du COUNT de chaque mesure
+        (feuille de scène) : complété au fil de l'eau dans
+        self._lyrics_bar_beats (jamais recalculé depuis le début à chaque
+        frame), voir _draw_lyrics_scroll."""
+        cache = self._lyrics_bar_beats
+        if not cache:
+            cache.append(0.0)
+        while len(cache) < mes:
+            bar_just_started = len(cache)  # mesure dont le début vient d'être ajouté
+            cache.append(cache[-1] + self._count_for_mes(bar_just_started))
+        return cache[mes - 1]
+
+    def _push_lyrics_state(self, beat: int, fractional: float) -> None:
+        """Pousse vers la page web la position continue dans le morceau (même
+        calcul que _draw_lyrics_scroll) : elle fait ainsi défiler les paroles
+        à la même vitesse que le grand écran (le texte lui-même est poussé
+        une seule fois par morceau, voir set_lyrics_lines)."""
+        if self._lyrics_sheet is None or self._bar_count is None:
+            self.shared_state.set_lyrics_position(None)
+            return
+        song_beat = self._cumulative_beats_at_bar(self._bar_count) + (beat - 1) + fractional
+        self.shared_state.set_lyrics_position(song_beat)
+
     def _push_live_time_signature(self, count: int) -> None:
         """Pousse `count` comme signature rythmique (numérateur) à Live, mais
         seulement s'il diffère du dernier envoyé (Live n'a qu'une seule
         signature globale, pas "par mesure" comme le tableur) : jamais
         d'envoi OSC quand la valeur ne change pas."""
-        if count != self._live_time_signature_sent:
+        if self.mode_var.get() != "offline" and count != self._live_time_signature_sent:
             self.live_osc.set_time_signature(count)
             self._live_time_signature_sent = count
 
@@ -2133,6 +2334,7 @@ class App:
                 self.midi_state.phase(), self.midi_state.beats_per_bar,
                 self.midi_state.bpm, connected, running, "midi",
             )
+            self._push_lyrics_state(beat, phase % 1.0)
             # Le fader 16 pilote le tempo via Link indépendamment du mode
             # d'affichage choisi (comme les boutons -1/+1) : on garde le tempo
             # de référence et le champ de tempo à jour même si l'affichage
@@ -2140,6 +2342,38 @@ class App:
             tempo_link = self._ensure_link()
             if tempo_link is not None:
                 self._on_link_tempo_observed(tempo_link.snapshot(quantum=1.0)["bpm"])
+        elif self.mode_var.get() == "offline":
+            try:
+                bpm = max(20.0, min(300.0, float(self.offline_tempo_var.get())))
+            except (tk.TclError, ValueError):
+                bpm = 120.0
+            quantum = float(max(1, self._safe_int_var(self.beats_var, "_beats_per_bar_cache")))
+            if self._offline_playing:
+                now = time.monotonic()
+                if self._offline_last_beat_time == 0.0:
+                    self._offline_last_beat_time = now
+                    self._offline_beat_in_bar = 1
+                    fractional = 0.0
+                else:
+                    beat_duration = 60.0 / bpm
+                    elapsed = now - self._offline_last_beat_time
+                    fractional = (elapsed % beat_duration) / beat_duration
+                    full_beats = int(elapsed / beat_duration)
+                    if full_beats > 0:
+                        self._offline_beat_in_bar = (
+                            (self._offline_beat_in_bar - 1 + full_beats) % int(quantum)
+                        ) + 1
+                        self._offline_last_beat_time += full_beats * beat_duration
+                self._update_bar_count(True, self._offline_beat_in_bar, fractional)
+                self._update_display(
+                    self._offline_beat_in_bar, int(quantum), fractional, bpm, True, True,
+                )
+                self.shared_state.update(fractional + (self._offline_beat_in_bar - 1), quantum, bpm, True, True, "offline")
+                self._push_lyrics_state(self._offline_beat_in_bar, fractional)
+            else:
+                self._update_display(1, int(quantum), 0.0, None, False, False)
+                self.shared_state.update(0.0, quantum, None, False, False, "offline")
+                self._push_lyrics_state(1, 0.0)
         else:
             link = self._ensure_link()
             if link is not None:
@@ -2213,6 +2447,7 @@ class App:
                 self.shared_state.update(
                     bar_relative_phase, quantum, snapshot["bpm"], connected, snapshot["is_playing"], "link",
                 )
+                self._push_lyrics_state(beat, fractional)
 
         self.root.after(30, self._poll)
 
@@ -2356,20 +2591,123 @@ class App:
             if item is not None:
                 self.display.itemconfigure(item, state="hidden")
 
-    def _draw_digit(self, beat: int, fill: str = FG_TEXT, size_scale: float = 1.0) -> None:
+    def _draw_lyrics_zone_split(self, top_bg: str) -> None:
+        """Rectangle couvrant la moitié haute du canvas (zone chiffres/points)
+        à sa couleur de flash normale, par-dessus le fond noir du canvas
+        (moitié basse, zone des paroles, jamais flashée)."""
+        canvas = self.display
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        item, _ = self._get_canvas_item("lyrics_zone_bg", lambda: canvas.create_rectangle(0, 0, 0, 0))
+        canvas.coords(item, 0, 0, width, height / 2)
+        canvas.itemconfigure(item, fill=top_bg, outline=top_bg, state="normal")
+        canvas.tag_lower(item)
+
+    def _compute_lyrics_line_fonts(self) -> None:
+        """Précalcule, pour chaque ligne trop large pour tenir dans le canvas
+        à la taille normale (LYRICS_FONT), une taille de police réduite qui
+        tient dans la largeur disponible (voir _draw_lyrics_scroll) : ne
+        concerne que l'affichage du grand écran, jamais la page web (qui
+        reçoit le texte brut, voir set_lyrics_lines)."""
+        self._lyrics_line_fonts = {}
+        sheet = self._lyrics_sheet
+        if sheet is None:
+            return
+        width = self.display.winfo_width()
+        if width <= 1:
+            width = 690
+        available = max(1, width - 10)
+        probe = tkfont.Font(font=LYRICS_FONT)
+        for index, text in enumerate(sheet.lines):
+            if not text:
+                continue
+            probe.configure(size=LYRICS_FONT[1])
+            if probe.measure(text) <= available:
+                continue
+            size = LYRICS_FONT[1] - 1
+            while size > LYRICS_MIN_FONT_SIZE:
+                probe.configure(size=size)
+                if probe.measure(text) <= available:
+                    break
+                size -= 1
+            self._lyrics_line_fonts[index] = (LYRICS_FONT[0], size, LYRICS_FONT[2])
+
+    def _draw_lyrics_scroll(self, beat: int, fractional: float) -> None:
+        """Fait défiler les paroles (lyrics.py) dans la moitié basse du
+        canvas, façon générique de fin : chaque ligne du CSV mesure
+        exactement LYRICS_BEATS_PER_LINE temps (indépendant des mesures/COUNT
+        de la feuille de scène), et traverse toute la zone réservée en
+        LYRICS_SCROLL_BEATS temps."""
+        sheet = self._lyrics_sheet
+        if sheet is None or not sheet.lines or self._bar_count is None:
+            self._hide_lyrics_scroll_items()
+            return
+        canvas = self.display
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        top = height / 2
+        reserved_height = height - top
+        pixels_per_beat = reserved_height / LYRICS_SCROLL_BEATS
+        reading_y = top + reserved_height * self.lyrics_reading_ratio_var.get()
+        song_beat = self._cumulative_beats_at_bar(self._bar_count) + (beat - 1) + fractional
+        # Demi-hauteur de ligne (métrique réelle de la police, mise en cache) :
+        # une ligne n'est montrée que si elle tient entièrement sous `top`, pour
+        # ne jamais déborder visuellement sur la zone chiffres/points (rognage
+        # net à la frontière plutôt que de déplacer la position de lecture).
+        if self._lyrics_line_half_height is None:
+            self._lyrics_line_half_height = tkfont.Font(font=LYRICS_FONT).metrics("linespace") / 2
+        top_cutoff = top + self._lyrics_line_half_height
+        buffer_px = LYRICS_BEATS_PER_LINE * pixels_per_beat
+        visible: dict[int, int] = {}
+        for index, text in enumerate(sheet.lines):
+            if not text:
+                continue
+            line_beat = index * LYRICS_BEATS_PER_LINE
+            y = reading_y + (line_beat - song_beat) * pixels_per_beat
+            if y < top_cutoff or y > height + buffer_px:
+                continue
+            key = f"lyrics_line_{index}"
+            item, _ = self._get_canvas_item(
+                key, lambda: canvas.create_text(width / 2, 0, font=LYRICS_FONT, fill=FG_TEXT),
+            )
+            canvas.coords(item, width / 2, y)
+            font = self._lyrics_line_fonts.get(index, LYRICS_FONT)
+            canvas.itemconfigure(item, text=text, fill=FG_TEXT, font=font, state="normal")
+            visible[index] = item
+        for index in self._lyrics_visible_indices - visible.keys():
+            item = self._canvas_items.get(f"lyrics_line_{index}")
+            if item is not None:
+                canvas.itemconfigure(item, state="hidden")
+        self._lyrics_visible_indices = set(visible)
+
+    def _hide_lyrics_scroll_items(self) -> None:
+        for index in self._lyrics_visible_indices:
+            item = self._canvas_items.get(f"lyrics_line_{index}")
+            if item is not None:
+                self.display.itemconfigure(item, state="hidden")
+        self._lyrics_visible_indices = set()
+
+    def _draw_digit(
+        self, beat: int, fill: str = FG_TEXT, size_scale: float = 1.0, top_aligned: bool = False,
+    ) -> None:
         self._hide_canvas_items("circle_left", "circle_right", "line_track", "line_fill")
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
             return
         font_size = int(min(width, height) * 0.6 * size_scale)
+        cy = height * 0.25 if top_aligned else height / 2
         item, _ = self._get_canvas_item("digit", lambda: canvas.create_text(width / 2, height / 2))
         canvas.itemconfigure(
             item, text=str(beat), fill=fill, font=("Helvetica", font_size, "bold"), state="normal",
         )
-        canvas.coords(item, width / 2, height / 2)
+        canvas.coords(item, width / 2, cy)
 
-    def _draw_two_circles(self, beat: int, bg: str, fill: str = FG_TEXT, size_scale: float = 1.0) -> None:
+    def _draw_two_circles(
+        self, beat: int, bg: str, fill: str = FG_TEXT, size_scale: float = 1.0, top_aligned: bool = False,
+    ) -> None:
         # Deux cercles côte à côte : celui de gauche se remplit aux temps
         # impairs (1, 3...), celui de droite aux temps pairs (2, 4...) —
         # l'alternance rend le pulse visible à chaque temps.
@@ -2380,7 +2718,7 @@ class App:
             return
         diameter = min(width, height) * 0.6 * 0.8 * size_scale
         radius = diameter / 2
-        cy = height / 2
+        cy = height * 0.25 if top_aligned else height / 2
         left_cx = width / 2 - diameter * 0.7
         right_cx = width / 2 + diameter * 0.7
         left_filled = beat % 2 == 1
@@ -2391,10 +2729,14 @@ class App:
                 item, fill=fill if filled else bg, outline=fill, width=3, state="normal",
             )
 
-    def _draw_scroll_line(self, beats_per_bar: int, beat: int, fractional: float) -> None:
+    def _draw_scroll_line(
+        self, beats_per_bar: int, beat: int, fractional: float, top_aligned: bool = False,
+    ) -> None:
         # À l'arrêt : la ligne se remplit de gauche à droite au milieu de
         # l'écran (façon barre de progression), synchronisée sur le temps réel
         # (vide au temps 1, pleine à la fin du dernier temps de la mesure).
+        # Remontée en haut (top_aligned) comme les chiffres/points quand les
+        # paroles sont activées, pour ne jamais empiéter sur leur zone.
         self._hide_canvas_items("digit", "circle_left", "circle_right")
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
@@ -2403,7 +2745,7 @@ class App:
         beats_per_bar = max(1, beats_per_bar)
         bar_phase = ((beat - 1) + fractional) / beats_per_bar
         x0, x1 = width * 0.15, width * 0.85
-        y = height / 2
+        y = height * 0.25 if top_aligned else height / 2
         track, _ = self._get_canvas_item("line_track", lambda: canvas.create_line(0, 0, 0, 0))
         canvas.coords(track, x0, y, x1, y)
         canvas.itemconfigure(track, fill="#3a3a3a", width=4, state="normal")
@@ -2465,21 +2807,38 @@ class App:
             digit_fill = FG_TEXT
             size_scale = 1.0
         bg = self._scene_flash_bg(bg)
-        # Le flash reste cantonné au canvas (digits/dots), pas à toute la fenêtre.
-        self.display.configure(bg=bg)
+        # Paroles activées : chiffres/points réduits de moitié et remontés en
+        # haut du canvas, pour laisser 50% de l'espace libre en bas (futur
+        # défilement des paroles, façon générique de fin) — cette zone reste
+        # noire, sans flash, la moitié haute (chiffres/points) gardant le
+        # flash normal.
+        lyrics_enabled = self.lyrics_var.get()
+        if lyrics_enabled:
+            size_scale *= 0.5
+            self.display.configure(bg="#000000")
+            self._draw_lyrics_zone_split(bg)
+        else:
+            self._hide_canvas_items("lyrics_zone_bg")
+            self.display.configure(bg=bg)
         if bpm:
             self._last_bpm = bpm
         # Sans source fiable (pas de clock MIDI / aucun pair Link), un chiffre
         # affiché au hasard serait trompeur pour le batteur : rien du tout.
         if connected:
             if self.dots_var.get():
-                self._draw_two_circles(beat, bg, fill=digit_fill, size_scale=size_scale)
+                self._draw_two_circles(beat, bg, fill=digit_fill, size_scale=size_scale, top_aligned=lyrics_enabled)
             else:
-                self._draw_digit(beat, fill=digit_fill, size_scale=size_scale)
+                self._draw_digit(beat, fill=digit_fill, size_scale=size_scale, top_aligned=lyrics_enabled)
+            if lyrics_enabled:
+                self._draw_lyrics_scroll(beat, fractional)
+            else:
+                self._hide_lyrics_scroll_items()
         elif self._last_bpm and not running:
-            self._draw_scroll_line(beats_per_bar, beat, fractional)
+            self._draw_scroll_line(beats_per_bar, beat, fractional, top_aligned=lyrics_enabled)
+            self._hide_lyrics_scroll_items()
         else:
             self._hide_canvas_items("digit", "circle_left", "circle_right", "line_track", "line_fill")
+            self._hide_lyrics_scroll_items()
 
         if bpm:
             self.bpm_label.config(text=f"{bpm:.1f} BPM")
