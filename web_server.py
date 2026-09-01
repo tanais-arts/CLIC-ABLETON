@@ -52,10 +52,6 @@ _PAGE = """<!DOCTYPE html>
   }
   #latency .row { display: flex; align-items: center; gap: 12px; }
   #latency input[type=range] { width: 60vw; }
-  #latency .ticks {
-    width: 60vw; display: flex; justify-content: space-between;
-    font-size: 2vh; color: #555555; padding: 0 2px;
-  }
   #beat {
     flex: 1 1 auto; min-height: 0;
     position: relative;
@@ -128,30 +124,27 @@ _PAGE = """<!DOCTYPE html>
   body.flash { animation: flashYellow 300ms ease-out; }
   body.flash-blue { animation: flashBlue 300ms ease-out; }
   body.flash-white { animation: flashWhite 150ms ease-out; }
-  #muteBtn {
-    margin-top: 8px; padding: 6px 16px; font-size: 2.4vh;
+  #btnRow {
+    display: flex; flex-direction: row; justify-content: center;
+    gap: 8px; margin-top: 8px;
+  }
+  #btnRow button {
+    padding: 6px 14px; font-size: 2.2vh;
     background: #333333; color: #f5f5f5; border: none; border-radius: 6px;
     -webkit-user-select: none; user-select: none;
   }
-  #muteBtn.unmuted { background: #2b7a2b; }
-  #lyricsBtn {
-    margin-top: 8px; padding: 6px 16px; font-size: 2.4vh;
-    background: #333333; color: #f5f5f5; border: none; border-radius: 6px;
-    -webkit-user-select: none; user-select: none;
-  }
-  #lyricsBtn.active { background: #2b7a2b; }
-  #dotsBtn {
-    margin-top: 8px; padding: 6px 16px; font-size: 2.4vh;
-    background: #333333; color: #f5f5f5; border: none; border-radius: 6px;
-    -webkit-user-select: none; user-select: none;
-  }
-  #dotsBtn.active { background: #2b7a2b; }
-  #lyricsLine {
+  #btnRow button.active { background: #2b7a2b; }
+  #lyricsScroll {
     display: none;
-    flex: 0 0 auto; margin-top: 0;
-    align-items: center; justify-content: center;
+    flex: 0 0 auto; position: relative; overflow: hidden;
+    width: 100%; height: 30vh;
+    background: #000000;
+  }
+  #lyricsScroll .lyricsLineText {
+    position: absolute; left: 0; right: 0;
+    text-align: center; padding: 0 4vw;
     font-size: 4.5vh; font-weight: bold; color: #f5f5f5;
-    min-height: 1.2em; text-align: center; padding: 0 4vw;
+    transform: translateY(-50%);
   }
 </style>
 </head>
@@ -161,10 +154,15 @@ _PAGE = """<!DOCTYPE html>
       <span>Délai</span>
       <input type="range" id="latencySlider" min="-120" max="120" step="1" value="0">
     </div>
-    <div class="ticks"><span>Retard</span><span>Référence</span><span>Avance</span></div>
-    <button id="muteBtn">🔇 Son coupé</button>
-    <button id="lyricsBtn">📝 Paroles masquées</button>
-    <button id="dotsBtn">🔢 Chiffres</button>
+    <div class="row">
+      <span>Paroles</span>
+      <input type="range" id="lyricsHeightSlider" min="0" max="100" step="1" value="50">
+    </div>
+    <div id="btnRow">
+      <button id="muteBtn">Son coupé</button>
+      <button id="lyricsBtn">Paroles masquées</button>
+      <button id="dotsBtn">Chiffres</button>
+    </div>
   </div>
   <div id="beat">
     <div id="dot">•</div>
@@ -176,7 +174,7 @@ _PAGE = """<!DOCTYPE html>
   <div id="sceneLabel"></div>
   <div id="barCount"></div>
   <div id="sceneName"></div>
-  <div id="lyricsLine"></div>
+  <div id="lyricsScroll"></div>
   <div id="info">-- BPM</div>
 <script>
 const KEY = 'beatDisplayLatencyMs';
@@ -184,6 +182,15 @@ const slider = document.getElementById('latencySlider');
 slider.value = localStorage.getItem(KEY) || 0;
 slider.addEventListener('input', () => {
   localStorage.setItem(KEY, slider.value);
+});
+
+// Hauteur du défilement des paroles : préférence propre à cet appareil
+// (chacun règle la sienne), indépendante du curseur équivalent du grand écran.
+const LYRICS_HEIGHT_KEY = 'beatDisplayLyricsHeight';
+const lyricsHeightSlider = document.getElementById('lyricsHeightSlider');
+lyricsHeightSlider.value = localStorage.getItem(LYRICS_HEIGHT_KEY) || 50;
+lyricsHeightSlider.addEventListener('input', () => {
+  localStorage.setItem(LYRICS_HEIGHT_KEY, lyricsHeightSlider.value);
 });
 
 let lastBeat = null;
@@ -216,7 +223,7 @@ const dotsBtn = document.getElementById('dotsBtn');
 let showDots = localStorage.getItem(DOTS_KEY) === '1';
 
 function updateDotsBtn() {
-  dotsBtn.textContent = showDots ? '⚫ Points' : '🔢 Chiffres';
+  dotsBtn.textContent = showDots ? 'Points' : 'Chiffres';
   dotsBtn.classList.toggle('active', showDots);
 }
 updateDotsBtn();
@@ -255,8 +262,8 @@ async function initAudio() {
 }
 
 function updateMuteBtn() {
-  muteBtn.textContent = muted ? '🔇 Son coupé' : '🔊 Son actif';
-  muteBtn.classList.toggle('unmuted', !muted);
+  muteBtn.textContent = muted ? 'Son coupé' : 'Son actif';
+  muteBtn.classList.toggle('active', !muted);
 }
 updateMuteBtn();
 if (!muted) {
@@ -286,15 +293,24 @@ muteBtn.addEventListener('click', () => {
 
 // Affichage des paroles : préférence propre à cet appareil (indépendante de
 // la case «Afficher les paroles» du grand écran), désactivée par défaut.
+// Retire aussi le nom du morceau et le numéro de mesure pour libérer de la
+// place à l'écran (le défilement des paroles les remplace).
 const LYRICS_KEY = 'beatDisplayShowLyrics';
+const LYRICS_BEATS_PER_LINE = 8;
+const LYRICS_VISIBLE_LINES = 4;
 const lyricsBtn = document.getElementById('lyricsBtn');
-const lyricsLineEl = document.getElementById('lyricsLine');
+const lyricsScrollEl = document.getElementById('lyricsScroll');
+const sceneNameEl = document.getElementById('sceneName');
+const barCountEl = document.getElementById('barCount');
+const lyricsLineEls = new Map();
 let showLyrics = localStorage.getItem(LYRICS_KEY) === '1';
 
 function updateLyricsBtn() {
-  lyricsBtn.textContent = showLyrics ? '📝 Paroles affichées' : '📝 Paroles masquées';
+  lyricsBtn.textContent = showLyrics ? 'Paroles affichées' : 'Paroles masquées';
   lyricsBtn.classList.toggle('active', showLyrics);
-  lyricsLineEl.style.display = showLyrics ? 'flex' : 'none';
+  sceneNameEl.style.display = showLyrics ? 'none' : '';
+  barCountEl.style.display = showLyrics ? 'none' : '';
+  if (!showLyrics) lyricsScrollEl.style.display = 'none';
 }
 updateLyricsBtn();
 
@@ -303,6 +319,48 @@ lyricsBtn.addEventListener('click', () => {
   localStorage.setItem(LYRICS_KEY, showLyrics ? '1' : '0');
   updateLyricsBtn();
 });
+
+// Fait défiler les paroles à la même vitesse que le grand écran (voir
+// beat_display._draw_lyrics_scroll) : chaque ligne du CSV équivaut à
+// LYRICS_BEATS_PER_LINE temps, positionnée selon lyrics_song_beat (position
+// continue depuis le début du morceau), avec LYRICS_VISIBLE_LINES lignes
+// visibles à la fois (éléments DOM réutilisés, comme les items du canvas
+// côté bureau).
+function updateLyricsScroll(data) {
+  if (!showLyrics) return;
+  const lines = Array.isArray(data.lyrics_lines) ? data.lyrics_lines : [];
+  const songBeat = data.lyrics_song_beat;
+  if (!lines.length || typeof songBeat !== 'number') {
+    lyricsScrollEl.style.display = 'none';
+    return;
+  }
+  lyricsScrollEl.style.display = 'block';
+  const boxHeight = lyricsScrollEl.clientHeight || 1;
+  const pixelsPerBeat = boxHeight / (LYRICS_VISIBLE_LINES * LYRICS_BEATS_PER_LINE);
+  // Hauteur réglée par lyricsHeightSlider (0..100%), propre à cet appareil.
+  const centerY = boxHeight * (parseFloat(lyricsHeightSlider.value) / 100);
+  const bufferPx = LYRICS_BEATS_PER_LINE * pixelsPerBeat;
+  const visible = new Set();
+  lines.forEach((text, index) => {
+    if (!text) return;
+    const y = centerY + (index * LYRICS_BEATS_PER_LINE - songBeat) * pixelsPerBeat;
+    if (y < -bufferPx || y > boxHeight + bufferPx) return;
+    let el = lyricsLineEls.get(index);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'lyricsLineText';
+      lyricsScrollEl.appendChild(el);
+      lyricsLineEls.set(index, el);
+    }
+    el.textContent = text;
+    el.style.top = y + 'px';
+    el.style.display = 'block';
+    visible.add(index);
+  });
+  for (const [index, el] of lyricsLineEls) {
+    if (!visible.has(index)) el.style.display = 'none';
+  }
+}
 
 // Planification "lookahead" (horloge audio, pas le timer JS) : au lieu de
 // jouer le clic au moment où poll() détecte un changement de temps (sujet
@@ -422,9 +480,7 @@ async function poll() {
     document.getElementById('sceneName').classList.toggle('launched', !!data.scene_launched);
     document.getElementById('barCount').textContent = data.bar_count ? ('Mes. ' + data.bar_count) : '';
     document.getElementById('sceneLabel').textContent = data.scene_label || '';
-    if (showLyrics) {
-      lyricsLineEl.textContent = data.lyrics_line || '';
-    }
+    updateLyricsScroll(data);
     if (data.scene_launched && !lastSceneLaunched) {
       sceneFlashDouble();
     }
@@ -488,7 +544,8 @@ class SharedBeatState:
         self._bar_count: int | None = None
         self._scene_label = ""
         self._offline = False
-        self._lyrics_line = ""
+        self._lyrics_lines: list[str] = []
+        self._lyrics_song_beat: float | None = None
 
     def update(
         self, phase: float, beats_per_bar: float, bpm: float | None,
@@ -540,13 +597,22 @@ class SharedBeatState:
         with self._lock:
             self._offline = True
 
-    def set_lyrics_line(self, text: str) -> None:
-        """Ligne de paroles (lyrics.py) actuellement due (voir
-        beat_display._push_lyrics_line), indépendante de la case «Afficher
-        les paroles» du grand écran : chaque appareil choisit lui-même de
-        l'afficher ou non (bouton côté page web)."""
+    def set_lyrics_lines(self, lines: list[str]) -> None:
+        """Texte complet des paroles (lyrics.py) du morceau en cours, poussé
+        une seule fois par chargement (voir beat_display._scene_launch) :
+        la page web calcule elle-même quelles lignes afficher/faire défiler
+        à partir de set_lyrics_position, indépendamment de la case «Afficher
+        les paroles» du grand écran."""
         with self._lock:
-            self._lyrics_line = text
+            self._lyrics_lines = lines
+
+    def set_lyrics_position(self, song_beat: float | None) -> None:
+        """Position continue (en temps, depuis le début du morceau) utilisée
+        par la page web pour faire défiler les paroles à la même vitesse que
+        le grand écran (voir beat_display._push_lyrics_state) ; None = pas de
+        position fiable (paroles masquées côté page web)."""
+        with self._lock:
+            self._lyrics_song_beat = song_beat
 
     def compute(self, latency_ms: float = 0.0) -> dict:
         """Calcule {beat, bpm, connected, running, mode} pour un décalage donné."""
@@ -557,7 +623,8 @@ class SharedBeatState:
             bar_count = self._bar_count
             scene_label = self._scene_label
             offline = self._offline
-            lyrics_line = self._lyrics_line
+            lyrics_lines = self._lyrics_lines
+            lyrics_song_beat = self._lyrics_song_beat
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
         elapsed_ms = (time.monotonic() - data["ref_monotonic"]) * 1000.0
@@ -577,7 +644,8 @@ class SharedBeatState:
             "bar_count": bar_count,
             "scene_label": scene_label,
             "offline": offline,
-            "lyrics_line": lyrics_line,
+            "lyrics_lines": lyrics_lines,
+            "lyrics_song_beat": lyrics_song_beat,
         }
 
 

@@ -63,6 +63,9 @@ DEFAULTS = {
     # Réduit de 50% et remonte en haut les chiffres/points pour laisser de
     # la place au défilement des paroles (voir beat_display._update_display).
     "lyrics_enabled": False,
+    # Hauteur du défilement des paroles (fraction 0..1 depuis le haut de sa
+    # zone), réglable en direct via le curseur de l'interface.
+    "lyrics_reading_position_ratio": 0.28,
 }
 
 

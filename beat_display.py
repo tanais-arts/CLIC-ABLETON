@@ -758,7 +758,7 @@ class App:
 
         self.dots_var = tk.BooleanVar(value=self.config["dots_only"])
         tk.Checkbutton(
-            settings_frame, text="Points au lieu des chiffres", variable=self.dots_var,
+            settings_frame, text="Points", variable=self.dots_var,
             command=self._on_settings_change, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
             activebackground=BG_IDLE, activeforeground=FG_TEXT,
         ).pack(side="left", padx=(16, 0))
@@ -919,6 +919,14 @@ class App:
             command=self._on_settings_change, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
             activebackground=BG_IDLE, activeforeground=FG_TEXT,
         ).pack(side="left", padx=(16, 0))
+        self.lyrics_reading_ratio_var = tk.DoubleVar(
+            value=self.config.get("lyrics_reading_position_ratio", LYRICS_READING_POSITION_RATIO)
+        )
+        tk.Scale(
+            settings_row, from_=0.0, to=1.0, resolution=0.01, orient="horizontal", length=100,
+            variable=self.lyrics_reading_ratio_var, showvalue=False, command=lambda _v: self._on_settings_change(),
+            bg=BG_IDLE, fg=FG_TEXT, troughcolor="#333333", highlightthickness=0,
+        ).pack(side="left", padx=(4, 0))
 
         # -- Métronome audio local (clic.wav, voir audio_metronome.py) : carte
         # son + sortie (paire stéréo ou mono), activé/désactivé par le bouton
@@ -1168,6 +1176,7 @@ class App:
         self._lyrics_sheet = load_lyrics(
             self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Paroles] {msg}"),
         )
+        self.shared_state.set_lyrics_lines(self._lyrics_sheet.lines if self._lyrics_sheet is not None else [])
         self._lyrics_bar_beats = []
         label_bar = self._scene_sheet.bar_for_label(self.goto_label_var.get())
         try:
@@ -1504,6 +1513,7 @@ class App:
         self._mode_cache = self.config["mode"]
         self.config["dots_only"] = self.dots_var.get()
         self.config["lyrics_enabled"] = self.lyrics_var.get()
+        self.config["lyrics_reading_position_ratio"] = self.lyrics_reading_ratio_var.get()
         save_config(self.config)
 
     def _safe_int_var(self, var: tk.IntVar, cache_attr: str) -> int:
@@ -1926,6 +1936,7 @@ class App:
                 self._lyrics_sheet = load_lyrics(
                     self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Paroles] {msg}"),
                 )
+                self.shared_state.set_lyrics_lines(self._lyrics_sheet.lines if self._lyrics_sheet is not None else [])
                 self._lyrics_bar_beats = []
                 label_bar = (
                     self._scene_sheet.bar_for_label(self.goto_label_var.get())
@@ -2151,18 +2162,16 @@ class App:
             cache.append(cache[-1] + self._count_for_mes(bar_just_started))
         return cache[mes - 1]
 
-    def _push_lyrics_line(self) -> None:
-        """Pousse vers la page web (shared_state) la ligne de paroles
-        actuellement due, indépendamment de la case "Afficher les paroles" du
-        grand écran (chaque appareil choisit lui-même de l'afficher ou non,
-        bouton côté page web). Utilise le vrai découpage du CSV (8 mesures
-        par ligne, voir lyrics.py), pas l'échelle de vitesse expérimentale du
-        défilement du grand écran (voir _draw_lyrics_scroll, découplée)."""
-        sheet = self._lyrics_sheet
-        if sheet is None or self._bar_count is None:
-            self.shared_state.set_lyrics_line("")
+    def _push_lyrics_state(self, beat: int, fractional: float) -> None:
+        """Pousse vers la page web la position continue dans le morceau (même
+        calcul que _draw_lyrics_scroll) : elle fait ainsi défiler les paroles
+        à la même vitesse que le grand écran (le texte lui-même est poussé
+        une seule fois par morceau, voir set_lyrics_lines)."""
+        if self._lyrics_sheet is None or self._bar_count is None:
+            self.shared_state.set_lyrics_position(None)
             return
-        self.shared_state.set_lyrics_line(sheet.text_for_bar(self._bar_count))
+        song_beat = self._cumulative_beats_at_bar(self._bar_count) + (beat - 1) + fractional
+        self.shared_state.set_lyrics_position(song_beat)
 
     def _push_live_time_signature(self, count: int) -> None:
         """Pousse `count` comme signature rythmique (numérateur) à Live, mais
@@ -2315,7 +2324,7 @@ class App:
                 self.midi_state.phase(), self.midi_state.beats_per_bar,
                 self.midi_state.bpm, connected, running, "midi",
             )
-            self._push_lyrics_line()
+            self._push_lyrics_state(beat, phase % 1.0)
             # Le fader 16 pilote le tempo via Link indépendamment du mode
             # d'affichage choisi (comme les boutons -1/+1) : on garde le tempo
             # de référence et le champ de tempo à jour même si l'affichage
@@ -2350,11 +2359,11 @@ class App:
                     self._offline_beat_in_bar, int(quantum), fractional, bpm, True, True,
                 )
                 self.shared_state.update(fractional + (self._offline_beat_in_bar - 1), quantum, bpm, True, True, "offline")
-                self._push_lyrics_line()
+                self._push_lyrics_state(self._offline_beat_in_bar, fractional)
             else:
                 self._update_display(1, int(quantum), 0.0, None, False, False)
                 self.shared_state.update(0.0, quantum, None, False, False, "offline")
-                self._push_lyrics_line()
+                self._push_lyrics_state(1, 0.0)
         else:
             link = self._ensure_link()
             if link is not None:
@@ -2428,7 +2437,7 @@ class App:
                 self.shared_state.update(
                     bar_relative_phase, quantum, snapshot["bpm"], connected, snapshot["is_playing"], "link",
                 )
-                self._push_lyrics_line()
+                self._push_lyrics_state(beat, fractional)
 
         self.root.after(30, self._poll)
 
@@ -2602,7 +2611,7 @@ class App:
         top = height / 2
         reserved_height = height - top
         pixels_per_beat = reserved_height / LYRICS_SCROLL_BEATS
-        reading_y = top + reserved_height * LYRICS_READING_POSITION_RATIO
+        reading_y = top + reserved_height * self.lyrics_reading_ratio_var.get()
         song_beat = self._cumulative_beats_at_bar(self._bar_count) + (beat - 1) + fractional
         # Demi-hauteur de ligne (métrique réelle de la police, mise en cache) :
         # une ligne n'est montrée que si elle tient entièrement sous `top`, pour
