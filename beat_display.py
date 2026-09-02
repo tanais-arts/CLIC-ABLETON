@@ -215,7 +215,6 @@ class ControllerListener:
         console boucle l'état de la LED sur ce qu'elle reçoit."""
         if self._midi_out is None:
             return
-        print(f"[Contrôleur MIDI] LED -> canal={channel + 1} note={note} on={on}")
         # Note Off explicite (statut 0x80), pas juste un Note On vélocité 0 :
         # certains appareils ne traitent pas les deux de la même façon.
         status = 0x90 if on else 0x80
@@ -298,8 +297,9 @@ class BeatState:
 
 
 class App:
-    # Dossier où chercher <nom de scène>.xlsx (voir scene_sheet.py) : à côté du
-    # script, comme le fichier d'exemple Viser.xlsx.
+    # Racine des feuilles de scène/paroles (voir scene_sheet.py qui cherche
+    # dans <SCENE_SHEET_DIR>/Feuilles/, lyrics.py dans <...>/Lyrics/) : à
+    # côté du script.
     SCENE_SHEET_DIR = Path(__file__).resolve().parent
     # Tranche HUI (0-7) réservée au tempo sur le 2e port MIDI (channel_offset=8),
     # donc canal physique 16 = 8 + 7 + 1. Voir _apply_tempo_fader.
@@ -571,7 +571,7 @@ class App:
         # Vidé au redémarrage du logiciel (repart sur INTRO par défaut).
         self._goto_label_by_scene: dict[str, str] = {}
         # Feuille de scène XLSX (scene_sheet.py) du morceau en cours, si le
-        # fichier <nom de scène>.xlsx existe à côté du script ; None = aucune
+        # fichier Feuilles/<nom de scène>.xlsx existe ; None = aucune
         # feuille, comportement inchangé (voir _apply_scene_sheet_row).
         self._scene_sheet: SceneSheet | None = None
         self._scene_sheet_row: SceneSheetRow | None = None
@@ -1176,7 +1176,7 @@ class App:
         self._on_settings_change()
 
     def _refresh_offline_songs(self) -> None:
-        songs = sorted(path.stem for path in self.SCENE_SHEET_DIR.glob("*.xlsx"))
+        songs = sorted(path.stem for path in (self.SCENE_SHEET_DIR / "Feuilles").glob("*.xlsx"))
         self.offline_song_combo["values"] = songs
         if self.offline_song_var.get() not in songs:
             self.offline_song_var.set(songs[0] if songs else "")
@@ -1978,7 +1978,7 @@ class App:
                 self._awaiting_bar_start = True
                 self.bar_count_label.config(text="")
                 self.shared_state.set_bar_count(None)
-                # Feuille de scène XLSX (<nom de scène>.xlsx, voir
+                # Feuille de scène XLSX (Feuilles/<nom de scène>.xlsx, voir
                 # scene_sheet.py) : None si le fichier n'existe pas, aucun
                 # changement de comportement dans ce cas. "GOTO" (label
                 # choisi, moins PREROLL mesures) fixe le point de départ du

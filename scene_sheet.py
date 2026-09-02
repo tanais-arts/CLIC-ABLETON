@@ -85,10 +85,10 @@ class SceneSheet:
 
 
 def load_scene_sheet(scene_name: str, base_dir: Path, log=print) -> SceneSheet | None:
-    """Charge `<base_dir>/<scene_name>.xlsx` si le fichier existe, sinon None."""
+    """Charge `<base_dir>/Feuilles/<scene_name>.xlsx` si le fichier existe, sinon None."""
     if not scene_name:
         return None
-    path = base_dir / f"{scene_name}.xlsx"
+    path = base_dir / "Feuilles" / f"{scene_name}.xlsx"
     if not path.is_file():
         return None
     try:

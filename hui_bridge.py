@@ -221,12 +221,7 @@ class HuiBridge:
                 # Poignée de main du ping (Note On canal 0 note 0) : bruit attendu, pas de log.
                 return
             # Boutons +/-1, stop/play, navigation de scène, USER SEL, etc. --
-            # déjà traités ailleurs (controller_map) si mappés ; journalisé ici
-            # aussi pour repérer les notes non encore mappées sur ce port.
-            self._log(
-                f"HUI : Note {'On' if status == 0x90 else 'Off'} canal={channel + 1} note={note} "
-                f"vélocité={velocity} (ignoré ici, voir MIDI IN OSC Boutons)"
-            )
+            # déjà traités ailleurs (controller_map) si mappés, rien à faire ici.
             return
         if len(message) < 3 or status != 0xB0:
             self._log(f"HUI : message non reconnu {[hex(b) for b in message]}")
@@ -239,7 +234,6 @@ class HuiBridge:
             return
 
         if self._pending_zone is None:
-            self._log(f"HUI : CC{cc}={value} reçu sans zone en attente")
             return
         zone = self._pending_zone
         track = self._zone_to_track.get(zone)
@@ -257,16 +251,12 @@ class HuiBridge:
                     # sans risque ici, un déclenchement en trop ne fait que
                     # reprogrammer le même rappel (voir _schedule_tempo_reset
                     # dans beat_display.py, idempotent).
-                    self._log(f"HUI : mute fader tempo (valeur={value}) -> rappel du tempo d'origine au prochain temps")
                     if self._on_tempo_reset is not None:
                         self._on_tempo_reset()
                 elif pressed and track is not None:  # bascule à l'appui, pas au relâchement
                     muted = not self._mute_toggle_state.get(track, False)
                     self._mute_toggle_state[track] = muted
-                    self._log(f"HUI : mute piste {track + 1} -> {muted}")
                     self._live_osc.set_track_mute(track, muted)
-            elif port != FADER_PORT:
-                self._log(f"HUI : zone={zone} port={port} pressed={pressed} (non géré pour l'instant)")
             return
 
         if cc == zone:  # poids fort (coarse) de la position du fader
@@ -286,15 +276,11 @@ class HuiBridge:
                 return
             volume = raw / 16383.0
             if track is None:
-                self._log(f"HUI : zone {zone} sans piste Live assignée (volume {volume:.3f} ignoré)")
                 return
-            self._log(f"HUI : volume piste {track + 1} -> {volume:.3f}")
             self._track_volume_local[track] = volume
             self._track_volume_local_time[track] = time.monotonic()
             self._live_osc.set_track_volume(track, volume)
             return
-
-        self._log(f"HUI : zone={zone} CC{cc}={value} (non géré pour l'instant)")
 
     def send_volume_feedback(self, track_index: int, volume: float) -> None:
         """Renvoie vers la console la position de fader réelle d'Ableton pour

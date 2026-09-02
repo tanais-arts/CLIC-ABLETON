@@ -73,8 +73,8 @@ pip install -r requirements.txt
    ne pas couper le rythme en cours de temps. Ce tempo d'origine est lu dans
    le nom de la scène qui précède la scène du morceau, selon la convention du
    set (ex. le morceau "OVLM" est précédé d'une scène nommée "100" = 100 BPM).
-8. **Feuille de scène (fichier `<nom de la scène>.xlsx`, ex. `Viser.xlsx` à
-   côté de `beat_display.py`)** : optionnelle — si le fichier n'existe pas
+8. **Feuille de scène (fichier `Feuilles/<nom de la scène>.xlsx`, ex.
+   `Feuilles/Viser.xlsx`)** : optionnelle — si le fichier n'existe pas
    pour la scène en cours, rien ne change par rapport au comportement normal.
    Quand il existe, il permet de faire varier, mesure par mesure, le
    comptage/l'affichage sans y toucher à la main pendant le morceau. Colonnes
