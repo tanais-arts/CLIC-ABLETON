@@ -53,6 +53,7 @@ LYRICS_READING_POSITION_RATIO = 0.28
 SCENE_NOT_LAUNCHED = "#ff4d4d"  # rouge : scène sélectionnée, pas encore lancée (identique au web)
 SCENE_LAUNCHED = "#3ddc57"  # vert : scène lancée
 SCENE_FLASH_WHITE = "#ffffff"
+NEXT_LABEL_ANNOUNCE_BEATS = 8  # n'annonce (clignotement) le label suivant qu'à partir de ce nombre de TEMPS (pas mesures) avant son arrivée
 SCENE_FLASH_PULSE = 0.15  # secondes par flash
 SCENE_FLASH_GAP = 0.1  # secondes entre les deux flashs
 FG_TEXT = "#f5f5f5"
@@ -598,6 +599,10 @@ class App:
         # Dernier LABEL non vide rencontré : reste affiché tant qu'aucune
         # nouvelle valeur non vide n'arrive ("collant", voir _apply_scene_sheet_row).
         self._scene_label_sticky: str = ""
+        # Prochain LABEL non vide à venir (scene_sheet.SceneSheet.label_after),
+        # annoncé en rouge clignotant à côté du label courant (voir
+        # _apply_scene_sheet_row / _update_display).
+        self._next_scene_label_sticky: str = ""
         # Détection de la présence de Live/AbletonOSC (voir _ping_live) : si
         # CLIC démarre avant Live, les abonnements OSC envoyés au tout début
         # (start_listen_track_*, métronome) se perdent (personne n'écoute
@@ -799,10 +804,24 @@ class App:
         self._canvas_items: dict[str, int] = {}
 
         # -- Label de section (INTRO/COUPLET/REFRAIN..., voir scene_sheet.py) --
+        # Groupe centré dans son ensemble (label courant + label suivant),
+        # pas un simple ajout collé à droite : la ligne fait toute la largeur
+        # (fill="x") mais le groupe intérieur n'est packé qu'à sa largeur
+        # propre, centré (anchor="center").
+        scene_label_row = tk.Frame(self.root, bg=BG_IDLE)
+        scene_label_row.pack(fill="x", padx=10, pady=(0, 2))
+        scene_label_group = tk.Frame(scene_label_row, bg=BG_IDLE)
+        scene_label_group.pack(anchor="center")
         self.scene_label_label = tk.Label(
-            self.root, text="", bg=BG_IDLE, fg="#7fb2ff", font=("Helvetica", 16, "bold"),
+            scene_label_group, text="", bg=BG_IDLE, fg="#7fb2ff", font=("Helvetica", 16, "bold"),
         )
-        self.scene_label_label.pack(fill="x", padx=10, pady=(0, 2))
+        self.scene_label_label.pack(side="left")
+        self.next_scene_label_label = tk.Label(
+            scene_label_group, text="", bg=BG_IDLE, fg="#ffffff", font=("Helvetica", 16, "bold"),
+        )
+        # Pas de pack() ici : le label n'est packé (voir _apply_scene_sheet_row)
+        # que lorsqu'une annonce existe, pour que le label courant reste seul
+        # au centre du groupe sinon (padx du next décentrerait la mesure sans lui).
 
         # -- Compteur de mesures depuis le lancement du morceau en cours --
         self.bar_count_label = tk.Label(
@@ -1874,6 +1893,10 @@ class App:
         self._scene_label_sticky = ""
         self.scene_label_label.config(text="")
         self.shared_state.set_scene_label("")
+        self._next_scene_label_sticky = ""
+        self.next_scene_label_label.config(text="")
+        self.next_scene_label_label.pack_forget()
+        self.shared_state.set_next_scene_label("")
         self._lyrics_sheet = None
         self._lyrics_bar_beats = []
         self._lyrics_line_fonts = {}
@@ -1913,6 +1936,10 @@ class App:
                 self._scene_label_sticky = ""
                 self.scene_label_label.config(text="")
                 self.shared_state.set_scene_label("")
+                self._next_scene_label_sticky = ""
+                self.next_scene_label_label.config(text="")
+                self.next_scene_label_label.pack_forget()
+                self.shared_state.set_next_scene_label("")
                 self._lyrics_sheet = None
                 self._lyrics_bar_beats = []
                 self._lyrics_line_fonts = {}
@@ -2225,6 +2252,19 @@ class App:
             self._scene_label_sticky = row.label
         self.scene_label_label.config(text=self._scene_label_sticky)
         self.shared_state.set_scene_label(self._scene_label_sticky)
+        self._next_scene_label_sticky = ""
+        next_label_bar = self._scene_sheet.next_label_bar(mes) if self._scene_sheet is not None else None
+        if next_label_bar is not None:
+            # Écart en TEMPS (pas mesures) jusqu'au début de cette mesure : tient
+            # compte du COUNT propre à chaque mesure entre mes et next_label_bar.
+            beats_until = self._cumulative_beats_at_bar(next_label_bar) - self._cumulative_beats_at_bar(mes)
+            if beats_until <= NEXT_LABEL_ANNOUNCE_BEATS:
+                self._next_scene_label_sticky = self._scene_sheet.get(next_label_bar).label
+        self.shared_state.set_next_scene_label(self._next_scene_label_sticky)
+        if self._next_scene_label_sticky:
+            self.next_scene_label_label.pack(side="left", padx=(10, 0))
+        else:
+            self.next_scene_label_label.pack_forget()
         if self._scene_label_sticky.strip().upper() == "END":
             self._metronome_end_muted = True
             self.shared_state.set_metronome_end_muted(True)
@@ -2831,6 +2871,17 @@ class App:
             if self._metronome_on_2 and not self._metronome_end_muted and beat != self._last_played_beat_2:
                 self._last_played_beat_2 = beat
                 self._audio_metronome_2.play(beat)
+        # Label suivant (scene_sheet.py, voir _apply_scene_sheet_row) : blanc
+        # clignotant SANS fade (bascule nette, pas d'interpolation), sur une
+        # demi-temps, à CHAQUE temps (2x plus vite que le "un temps sur deux"
+        # précédent), fixe (pas de clignotement) si pas connecté.
+        if self._next_scene_label_sticky:
+            next_label_fg = (
+                ("#ffffff" if fractional < 0.5 else BG_IDLE) if connected else "#ffffff"
+            )
+            self.next_scene_label_label.config(text=self._next_scene_label_sticky, fg=next_label_fg)
+        else:
+            self.next_scene_label_label.config(text="")
         # Mesure HIGHLIGHT (scene_sheet.py, valeur 1) : flash blanc du fond
         # sur TOUS les temps (pas seulement 1/3), digits/dots eux-mêmes
         # fondus du blanc vers leur couleur normale, et 50% plus grands ;

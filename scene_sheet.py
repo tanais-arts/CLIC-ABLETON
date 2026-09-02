@@ -44,6 +44,28 @@ class SceneSheet:
                 return row.label
         return ""
 
+    def next_label_bar(self, mes: int) -> int | None:
+        """Mesure de la prochaine mesure porteuse d'un LABEL non vide,
+        strictement après `mes`, ou None si aucune (voir label_after ;
+        beat_display._apply_scene_sheet_row s'en sert pour convertir cet
+        écart en temps, le COUNT pouvant varier d'une mesure à l'autre)."""
+        for candidate in sorted(m for m in self._rows if m > mes):
+            if self._rows[candidate].label:
+                return candidate
+        return None
+
+    def label_after(self, mes: int, within_bars: int | None = None) -> str:
+        """Premier LABEL non vide à une mesure strictement après `mes`, ou ""
+        si aucun (annonce du label suivant, voir beat_display._apply_scene_sheet_row).
+        Si `within_bars` est précisé, "" est aussi renvoyé si ce label est à
+        plus de `within_bars` mesures de `mes` (n'annonce que peu avant l'arrivée)."""
+        bar = self.next_label_bar(mes)
+        if bar is None:
+            return ""
+        if within_bars is not None and bar - mes > within_bars:
+            return ""
+        return self._rows[bar].label
+
     def labels(self) -> list[str]:
         """LABEL non vides, dans l'ordre des mesures, sans doublon (garde la
         première occurrence) : peuple le sélecteur GOTO."""

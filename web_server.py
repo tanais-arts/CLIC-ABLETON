@@ -113,6 +113,25 @@ _PAGE = """<!DOCTYPE html>
     font-size: 4vh; font-weight: bold; color: #7fb2ff;
     min-height: 1em;
   }
+  /* Label suivant (scene_sheet.py, voir _apply_scene_sheet_row) : annoncé à
+     droite du label courant, dans le même groupe centré (justify-content sur
+     le parent #sceneLabel ci-dessus centre les deux ensemble ; margin-left
+     appliqué seulement via .hasNext pour que le label courant reste centré
+     seul quand il n'y a pas d'annonce). Blanc clignotant SANS fade
+     (steps(1,end) : bascule nette, pas d'interpolation), durée calée sur une
+     demi-temps au tempo courant, retriggé à CHAQUE temps (classe .pulse
+     propre à l'élément, pas les classes body.flash/flash-blue qui suivent
+     un rythme différent), jamais recréé au poll (seul le textContent
+     change) pour ne pas interrompre l'animation en cours. */
+  #sceneLabelNext { color: transparent; }
+  #sceneLabelNext.hasNext { margin-left: 0.5em; }
+  #sceneLabelNext.pulse {
+    animation: sceneLabelNextPulse 300ms steps(1, end);
+  }
+  @keyframes sceneLabelNextPulse {
+    from { color: #ffffff; }
+    to { color: transparent; }
+  }
   #barCount {
     flex: 0 0 auto; margin-top: 0;
     display: flex; align-items: center; justify-content: center;
@@ -165,7 +184,7 @@ _PAGE = """<!DOCTYPE html>
   #lyricsScroll .lyricsLineText {
     position: absolute; left: 0; right: 0;
     text-align: center; padding: 0 4vw;
-    font-size: 4.5vh; font-weight: bold; color: #f5f5f5;
+    font-size: 2.9vw; font-weight: bold; color: #f5f5f5;
     transform: translateY(-50%);
     /* Autorise le retour à la ligne, plafonné à 4 lignes visuelles par
        entrée CSV (au-delà, tronqué avec … plutôt que de déborder). */
@@ -174,9 +193,12 @@ _PAGE = """<!DOCTYPE html>
     -webkit-line-clamp: 4;
     overflow: hidden;
   }
-  /* Portrait : police réduite, calibrée pour que toutes les paroles tiennent
-     dans la limite de 4 lignes sans déborder de la fente réservée (voir
-     LYRICS_VISIBLE_LINES). Le paysage garde 4.5vh (jamais touché). */
+  /* Paysage : taille basée sur la largeur (2.9vw, mesuré pour que les lignes
+     les plus fournies remplissent l'écran quel que soit le format, un vh
+     seul donnait du texte minuscule sur un écran large et bas). Portrait :
+     police (vh) calibrée pour que toutes les paroles tiennent dans la
+     limite de 4 lignes sans déborder de la fente réservée (voir
+     LYRICS_VISIBLE_LINES). */
   @media (orientation: portrait) {
     #lyricsScroll .lyricsLineText { font-size: 3.4vh; }
   }
@@ -260,7 +282,7 @@ _PAGE = """<!DOCTYPE html>
     <div id="offline">OFFLINE</div>
     <div id="scrollLine"><div id="scrollThumb"></div></div>
   </div>
-  <div id="sceneLabel"></div>
+  <div id="sceneLabel"><span id="sceneLabelCurrent"></span><span id="sceneLabelNext"></span></div>
   <div id="barCount"></div>
   <div id="sceneName"></div>
   <div id="lyricsScroll"></div>
@@ -631,6 +653,11 @@ async function poll() {
           document.body.classList.remove('flash');
           retrigger(document.body, 'flash-blue');
         }
+        const nextLabelPulseEl = document.getElementById('sceneLabelNext');
+        // 2x plus vite que l'ancien "un temps sur deux" : retrigger à CHAQUE
+        // temps désormais.
+        if (data.bpm) nextLabelPulseEl.style.animationDuration = (30000 / data.bpm) + 'ms';
+        retrigger(nextLabelPulseEl, 'pulse');
       }
     } else {
       digitEl.style.display = 'none';
@@ -663,7 +690,10 @@ async function poll() {
     document.getElementById('sceneName').textContent = data.scene_name || '';
     document.getElementById('sceneName').classList.toggle('launched', !!data.scene_launched);
     document.getElementById('barCount').textContent = data.bar_count ? ('Mes. ' + data.bar_count) : '';
-    document.getElementById('sceneLabel').textContent = data.scene_label || '';
+    document.getElementById('sceneLabelCurrent').textContent = data.scene_label || '';
+    const nextLabelEl = document.getElementById('sceneLabelNext');
+    nextLabelEl.textContent = data.next_scene_label ? (' ' + data.next_scene_label) : '';
+    nextLabelEl.classList.toggle('hasNext', !!data.next_scene_label);
     lyricsLinesCache = Array.isArray(data.lyrics_lines) ? data.lyrics_lines : [];
     if (typeof data.lyrics_song_beat === 'number') {
       lyricsBaseSongBeat = data.lyrics_song_beat;
@@ -780,6 +810,13 @@ _LEGACY_PAGE = """<!DOCTYPE html>
   #sceneName { font-size: 3.5vh; color: #ff4d4d; }
   #sceneName.launched { color: #3ddc57; }
   #sceneLabel { font-size: 4vh; font-weight: bold; color: #7fb2ff; }
+  #sceneLabelNext { color: transparent; }
+  #sceneLabelNext.hasNext { margin-left: 0.5em; }
+  @-webkit-keyframes sceneLabelNextPulse { from { color: #ffffff; } to { color: transparent; } }
+  @keyframes sceneLabelNextPulse { from { color: #ffffff; } to { color: transparent; } }
+  #sceneLabelNext.pulse {
+    -webkit-animation: sceneLabelNextPulse 300ms steps(1, end); animation: sceneLabelNextPulse 300ms steps(1, end);
+  }
   #barCount { font-size: 5vh; font-weight: bold; color: #bbbbbb; }
   #info {
     -webkit-flex: 0 0 auto; flex: 0 0 auto;
@@ -801,6 +838,12 @@ _LEGACY_PAGE = """<!DOCTYPE html>
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 4;
     overflow: hidden;
+  }
+  /* Paysage : taille basée sur la largeur (voir page principale) pour que
+     les lignes les plus fournies remplissent l'écran ; le portrait garde
+     3.6vh (comportement historique, non modifié). */
+  @media (orientation: landscape) {
+    #lyricsScroll .lyricsLineText { font-size: 2.9vw; }
   }
   body.lyrics-mode #info { display: none; }
   body.lyrics-mode #lyricsScroll { height: 50vh; }
@@ -861,7 +904,7 @@ _LEGACY_PAGE = """<!DOCTYPE html>
     <div id="offline">OFFLINE</div>
     <div id="scrollLine"><div id="scrollThumb"></div></div>
   </div>
-  <div id="sceneLabel"></div>
+  <div id="sceneLabel"><span id="sceneLabelCurrent"></span><span id="sceneLabelNext"></span></div>
   <div id="barCount"></div>
   <div id="sceneName"></div>
   <div id="lyricsScroll"></div>
@@ -887,7 +930,8 @@ var offlineEl = document.getElementById('offline');
 var infoEl = document.getElementById('info');
 var sceneNameEl = document.getElementById('sceneName');
 var barCountEl = document.getElementById('barCount');
-var sceneLabelEl = document.getElementById('sceneLabel');
+var sceneLabelCurrentEl = document.getElementById('sceneLabelCurrent');
+var sceneLabelNextEl = document.getElementById('sceneLabelNext');
 var lastBeat = null;
 var lastBarPhase = 0;
 
@@ -900,6 +944,16 @@ function retrigger(className) {
   document.body.className = base;
   void document.body.offsetWidth;
   document.body.className = (base ? base + ' ' : '') + className;
+}
+
+// Comme retrigger() ci-dessus mais pour un élément quelconque (pas de
+// classes "collantes" à préserver) : sert au pulse du label suivant, appelé
+// à chaque temps (voir render()) pour son propre rythme,
+// indépendant de body.flash/flash-blue.
+function retriggerEl(el, className) {
+  el.classList.remove(className);
+  void el.offsetWidth;
+  el.classList.add(className);
 }
 
 var STICKY_CLASSES = ['lyrics-mode', 'prompter-mode', 'is-offline'];
@@ -1192,6 +1246,10 @@ function render(data) {
       lastBeat = data.beat;
       if (data.beat === 1) { retrigger('flash'); }
       else if (data.beat === 3) { retrigger('flash-blue'); }
+      // 2x plus vite que l'ancien "un temps sur deux" : retrigger à CHAQUE
+      // temps désormais.
+      if (data.bpm) sceneLabelNextEl.style.animationDuration = (30000 / data.bpm) + 'ms';
+      retriggerEl(sceneLabelNextEl, 'pulse');
     }
   } else {
     digitEl.style.display = 'none';
@@ -1215,7 +1273,11 @@ function render(data) {
   sceneNameEl.innerHTML = data.scene_name ? data.scene_name : '';
   sceneNameEl.className = data.scene_launched ? 'launched' : '';
   barCountEl.innerHTML = data.bar_count ? ('Mes. ' + data.bar_count) : '';
-  sceneLabelEl.innerHTML = data.scene_label ? data.scene_label : '';
+  sceneLabelCurrentEl.innerHTML = data.scene_label ? data.scene_label : '';
+  sceneLabelNextEl.innerHTML = data.next_scene_label ? (' ' + data.next_scene_label) : '';
+  // classList.toggle (pas une réaffectation de className) : préserve la
+  // classe "pulse" qui vient d'être (re)posée juste au-dessus par retriggerEl.
+  sceneLabelNextEl.classList.toggle('hasNext', !!data.next_scene_label);
   lyricsLinesCache = (data.lyrics_lines && data.lyrics_lines.length) ? data.lyrics_lines : [];
   if (typeof data.lyrics_song_beat === 'number') {
     lyricsBaseSongBeat = data.lyrics_song_beat;
@@ -1291,6 +1353,7 @@ class SharedBeatState:
         self._scene_launched = False
         self._bar_count: int | None = None
         self._scene_label = ""
+        self._next_scene_label = ""
         self._offline = False
         self._lyrics_lines: list[str] = []
         self._lyrics_song_beat: float | None = None
@@ -1340,6 +1403,13 @@ class SharedBeatState:
         with self._lock:
             self._scene_label = label
 
+    def set_next_scene_label(self, label: str) -> None:
+        """Prochain LABEL non vide à venir (voir scene_sheet.SceneSheet.label_after) :
+        affiché en rouge clignotant à côté du label courant, pour l'annoncer
+        à l'avance (voir beat_display._apply_scene_sheet_row)."""
+        with self._lock:
+            self._next_scene_label = label
+
     def set_offline(self) -> None:
         """Signale la fermeture imminente de CLIC : affiche OFFLINE sur la
         page web à la place des chiffres/de la ligne, avant même que le
@@ -1386,6 +1456,7 @@ class SharedBeatState:
             scene_launched = self._scene_launched
             bar_count = self._bar_count
             scene_label = self._scene_label
+            next_scene_label = self._next_scene_label
             offline = self._offline
             lyrics_lines = self._lyrics_lines
             lyrics_song_beat = self._lyrics_song_beat
@@ -1409,6 +1480,7 @@ class SharedBeatState:
             "scene_launched": scene_launched,
             "bar_count": bar_count,
             "scene_label": scene_label,
+            "next_scene_label": next_scene_label,
             "offline": offline,
             "lyrics_lines": lyrics_lines,
             "lyrics_song_beat": lyrics_song_beat,
