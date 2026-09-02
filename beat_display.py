@@ -1208,6 +1208,7 @@ class App:
         self._awaiting_bar_start = True
         self._pending_goto_jump_beats = None
         self._metronome_end_muted = False
+        self.shared_state.set_metronome_end_muted(False)
         self._offline_beat_in_bar = 1
         self._offline_last_beat_time = 0.0
         self._offline_playing = True
@@ -1994,6 +1995,16 @@ class App:
         clips en cours, comportement natif normal), puis (comme au 2e Stop) ramène
         le curseur à 1:1:1, en attente d'un start de scène."""
         self._metronome_end_muted = False
+        self.shared_state.set_metronome_end_muted(False)
+        # Remet le temps par mesure à la valeur par défaut : une feuille de
+        # scène peut l'avoir modifié (COUNT) pour son dernier temps joué, et
+        # rien ne le réinitialise sinon (ex. scène "tempo seul" suivante, qui
+        # ne charge aucune feuille, voir _scene_launch) — le métronome tapait
+        # alors en boucle sur le temps 1 (modulo d'un temps par mesure resté à 1).
+        default_beats = self.config["beats_per_bar"]
+        self.beats_var.set(default_beats)
+        self.midi_state.beats_per_bar = default_beats
+        self._beats_per_bar_cache = default_beats
         if self.mode_var.get() == "offline":
             self._offline_playing = False
             self._offline_last_beat_time = 0.0
@@ -2216,6 +2227,7 @@ class App:
         self.shared_state.set_scene_label(self._scene_label_sticky)
         if self._scene_label_sticky.strip().upper() == "END":
             self._metronome_end_muted = True
+            self.shared_state.set_metronome_end_muted(True)
 
     # -------------------------------------------------------- Boucle poll --
     def _update_link_peers_label(self, num_peers: int) -> None:

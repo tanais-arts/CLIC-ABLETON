@@ -496,7 +496,7 @@ function scheduleClick(at, beat) {
 }
 
 function scheduleUpcomingClicks(data) {
-  if (muted || !audioCtx || !clickBuffer || !clickUpBuffer || !data.bpm) return;
+  if (muted || data.metronome_end_muted || !audioCtx || !clickBuffer || !clickUpBuffer || !data.bpm) return;
   const beatsPerBar = data.beats_per_bar || 4;
   const secondsPerBeat = 60 / data.bpm;
   const fractionalBeat = (data.bar_phase * beatsPerBar) % 1;
@@ -874,7 +874,7 @@ function scheduleClick(at, beat) {
 }
 
 function scheduleUpcomingClicks(data) {
-  if (muted || !audioCtx || !clickBuffer || !clickUpBuffer || !data.bpm) { return; }
+  if (muted || data.metronome_end_muted || !audioCtx || !clickBuffer || !clickUpBuffer || !data.bpm) { return; }
   var beatsPerBar = data.beats_per_bar || 4;
   var secondsPerBeat = 60 / data.bpm;
   var fractionalBeat = (data.bar_phase * beatsPerBar) % 1;
@@ -1143,6 +1143,7 @@ class SharedBeatState:
         self._lyrics_lines: list[str] = []
         self._lyrics_song_beat: float | None = None
         self._highlighted = False
+        self._metronome_end_muted = False
 
     def update(
         self, phase: float, beats_per_bar: float, bpm: float | None,
@@ -1219,6 +1220,12 @@ class SharedBeatState:
         with self._lock:
             self._highlighted = highlighted
 
+    def set_metronome_end_muted(self, muted: bool) -> None:
+        """Coupe le clic audio de la page web pendant le label END, comme les
+        métronomes M1/M2 (voir beat_display._metronome_end_muted)."""
+        with self._lock:
+            self._metronome_end_muted = muted
+
     def compute(self, latency_ms: float = 0.0) -> dict:
         """Calcule {beat, bpm, connected, running, mode} pour un décalage donné."""
         with self._lock:
@@ -1231,6 +1238,7 @@ class SharedBeatState:
             lyrics_lines = self._lyrics_lines
             lyrics_song_beat = self._lyrics_song_beat
             highlighted = self._highlighted
+            metronome_end_muted = self._metronome_end_muted
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
         elapsed_ms = (time.monotonic() - data["ref_monotonic"]) * 1000.0
@@ -1253,6 +1261,7 @@ class SharedBeatState:
             "lyrics_lines": lyrics_lines,
             "lyrics_song_beat": lyrics_song_beat,
             "highlighted": highlighted,
+            "metronome_end_muted": metronome_end_muted,
         }
 
 
