@@ -33,9 +33,15 @@ _PAGE = """<!DOCTYPE html>
   html, body {
     margin: 0; padding: 0; width: 100%;
     height: 100vh; height: 100dvh;
+    /* 1px de plus que l'écran : rend la page "défilante" (voir le script en
+       bas de page) pour que Safari accepte de replier sa barre d'adresse,
+       comme sur un site normal — invisible, aucun contenu ne bouge. */
+    min-height: calc(100dvh + 1px);
     background: #1e1e1e; color: #f5f5f5;
     font-family: -apple-system, Helvetica, Arial, sans-serif;
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: none;
     box-sizing: border-box;
   }
   body {
@@ -52,6 +58,11 @@ _PAGE = """<!DOCTYPE html>
   }
   #latency .row { display: flex; align-items: center; gap: 12px; }
   #latency input[type=range] { width: 60vw; }
+  /* Paysage : hauteur d'écran trop réduite pour se permettre cette rangée en
+     plus des boutons (voir #btnRow, gardé). */
+  @media (orientation: landscape) {
+    #latency .row { display: none; }
+  }
   #beat {
     flex: 1 1 auto; min-height: 0;
     position: relative;
@@ -139,12 +150,56 @@ _PAGE = """<!DOCTYPE html>
     flex: 0 0 auto; position: relative; overflow: hidden;
     width: 100%; height: 30vh;
     background: #000000;
+    /* Étend le fond noir jusqu'au vrai bas d'écran, par-dessus la marge de
+       sécurité réservée par le body (sinon le fond gris du métronome
+       apparaît sous les paroles) : le body coupe (overflow hidden) pile au
+       bord de l'écran, donc ce débordement négatif ne dépasse jamais. */
+    margin-bottom: calc(-1 * max(14px, env(safe-area-inset-bottom)));
+    /* pan-y (et non "none") : le geste vertical reste dispo pour Safari
+       (replie sa barre d'adresse comme sur les autres pages), tout en
+       bloquant zoom/pan horizontal. Le calage de hauteur (voir pointermove)
+       fonctionne pareil, les événements pointer ne dépendent pas de ceci. */
+    touch-action: pan-y;
+    -webkit-user-select: none; user-select: none;
   }
   #lyricsScroll .lyricsLineText {
     position: absolute; left: 0; right: 0;
     text-align: center; padding: 0 4vw;
     font-size: 4.5vh; font-weight: bold; color: #f5f5f5;
     transform: translateY(-50%);
+    /* Autorise le retour à la ligne, plafonné à 4 lignes visuelles par
+       entrée CSV (au-delà, tronqué avec … plutôt que de déborder). */
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 4;
+    overflow: hidden;
+  }
+  /* Portrait : police réduite, calibrée pour que toutes les paroles tiennent
+     dans la limite de 4 lignes sans déborder de la fente réservée (voir
+     LYRICS_VISIBLE_LINES). Le paysage garde 4.5vh (jamais touché). */
+  @media (orientation: portrait) {
+    #lyricsScroll .lyricsLineText { font-size: 3.4vh; }
+  }
+  /* Mode paroles affichées : zone de défilement à 50% de l'écran, BPM
+     masqué. Le chiffre/les points ne sont réduits qu'en portrait (voir plus
+     bas) : en paysage, ils gardent leur taille normale. */
+  body.lyrics-mode #info { display: none; }
+  body.lyrics-mode #lyricsScroll { height: 50vh; }
+  @media (orientation: portrait) {
+    body.lyrics-mode #digit { font-size: 30vh; }
+    body.lyrics-mode #dotsPair .circle { width: 13.5vh; height: 13.5vh; }
+  }
+  /* Mesure HIGHLIGHT (scene_sheet.py) : chiffre/points 50% plus grands,
+     comme le grand écran (HIGHLIGHT_SIZE_SCALE) — jamais en mode paroles,
+     où la place est déjà réduite pour le défilement. */
+  body.highlighted:not(.lyrics-mode) #digit { font-size: 60vh; }
+  body.highlighted:not(.lyrics-mode) #dotsPair .circle { width: 27vh; height: 27vh; }
+  /* Paysage + paroles affichées : le chiffre à 40vh débordait sur le label de
+     section et les boutons (hauteur d'écran bien plus petite qu'en portrait)
+     — réduit de 50%, uniquement dans ce cas précis. */
+  @media (orientation: landscape) {
+    body.lyrics-mode #digit { font-size: 20vh; }
+    body.lyrics-mode #dotsPair .circle { width: 9vh; height: 9vh; }
   }
 </style>
 </head>
@@ -154,14 +209,10 @@ _PAGE = """<!DOCTYPE html>
       <span>Délai</span>
       <input type="range" id="latencySlider" min="-120" max="120" step="1" value="0">
     </div>
-    <div class="row">
-      <span>Paroles</span>
-      <input type="range" id="lyricsHeightSlider" min="0" max="100" step="1" value="50">
-    </div>
     <div id="btnRow">
       <button id="muteBtn">Son coupé</button>
       <button id="lyricsBtn">Paroles masquées</button>
-      <button id="dotsBtn">Chiffres</button>
+      <button id="dotsBtn">Points</button>
     </div>
   </div>
   <div id="beat">
@@ -177,20 +228,21 @@ _PAGE = """<!DOCTYPE html>
   <div id="lyricsScroll"></div>
   <div id="info">-- BPM</div>
 <script>
+// Repliement de la barre d'adresse Safari : la page est rendue "défilante"
+// de 1px (voir min-height en CSS) juste pour ça ; ce petit scroll forcé
+// suffit en général à convaincre Safari de la replier, comme sur un site
+// normal, sans que rien ne bouge visuellement à l'écran.
+function nudgeScrollForSafariChrome() {
+  window.scrollTo(0, 1);
+}
+window.addEventListener('load', () => setTimeout(nudgeScrollForSafariChrome, 50));
+window.addEventListener('orientationchange', () => setTimeout(nudgeScrollForSafariChrome, 300));
+
 const KEY = 'beatDisplayLatencyMs';
 const slider = document.getElementById('latencySlider');
 slider.value = localStorage.getItem(KEY) || 0;
 slider.addEventListener('input', () => {
   localStorage.setItem(KEY, slider.value);
-});
-
-// Hauteur du défilement des paroles : préférence propre à cet appareil
-// (chacun règle la sienne), indépendante du curseur équivalent du grand écran.
-const LYRICS_HEIGHT_KEY = 'beatDisplayLyricsHeight';
-const lyricsHeightSlider = document.getElementById('lyricsHeightSlider');
-lyricsHeightSlider.value = localStorage.getItem(LYRICS_HEIGHT_KEY) || 50;
-lyricsHeightSlider.addEventListener('input', () => {
-  localStorage.setItem(LYRICS_HEIGHT_KEY, lyricsHeightSlider.value);
 });
 
 let lastBeat = null;
@@ -223,7 +275,7 @@ const dotsBtn = document.getElementById('dotsBtn');
 let showDots = localStorage.getItem(DOTS_KEY) === '1';
 
 function updateDotsBtn() {
-  dotsBtn.textContent = showDots ? 'Points' : 'Chiffres';
+  dotsBtn.textContent = showDots ? 'Chiffres' : 'Points';
   dotsBtn.classList.toggle('active', showDots);
 }
 updateDotsBtn();
@@ -297,7 +349,11 @@ muteBtn.addEventListener('click', () => {
 // place à l'écran (le défilement des paroles les remplace).
 const LYRICS_KEY = 'beatDisplayShowLyrics';
 const LYRICS_BEATS_PER_LINE = 8;
-const LYRICS_VISIBLE_LINES = 4;
+// LYRICS_VISIBLE_LINES réduit (était 4) : interligne plus grand entre les
+// entrées CSV, pour laisser la place au retour à la ligne (jusqu'à 4 lignes,
+// voir -webkit-line-clamp) sans chevaucher l'entrée voisine — fait aussi
+// défiler le texte plus vite (même distance à parcourir en moins de "cases").
+const LYRICS_VISIBLE_LINES = 3;
 const lyricsBtn = document.getElementById('lyricsBtn');
 const lyricsScrollEl = document.getElementById('lyricsScroll');
 const sceneNameEl = document.getElementById('sceneName');
@@ -308,6 +364,7 @@ let showLyrics = localStorage.getItem(LYRICS_KEY) === '1';
 function updateLyricsBtn() {
   lyricsBtn.textContent = showLyrics ? 'Paroles affichées' : 'Paroles masquées';
   lyricsBtn.classList.toggle('active', showLyrics);
+  document.body.classList.toggle('lyrics-mode', showLyrics);
   sceneNameEl.style.display = showLyrics ? 'none' : '';
   barCountEl.style.display = showLyrics ? 'none' : '';
   if (!showLyrics) lyricsScrollEl.style.display = 'none';
@@ -320,25 +377,73 @@ lyricsBtn.addEventListener('click', () => {
   updateLyricsBtn();
 });
 
+// Hauteur du défilement des paroles : préférence propre à cet appareil
+// (chacun règle la sienne), réglée en glissant le doigt directement sur la
+// zone de paroles (au lieu d'un curseur séparé), pour recaler à la volée.
+const LYRICS_HEIGHT_KEY = 'beatDisplayLyricsHeight';
+let lyricsHeightRatio = parseFloat(localStorage.getItem(LYRICS_HEIGHT_KEY)) || 0.5;
+
+let lyricsDragStartY = null;
+let lyricsDragStartRatio = 0.5;
+
+lyricsScrollEl.addEventListener('pointerdown', (event) => {
+  lyricsDragStartY = event.clientY;
+  lyricsDragStartRatio = lyricsHeightRatio;
+  lyricsScrollEl.setPointerCapture(event.pointerId);
+});
+
+lyricsScrollEl.addEventListener('pointermove', (event) => {
+  if (lyricsDragStartY === null) return;
+  const boxHeight = lyricsScrollEl.clientHeight || 1;
+  const deltaRatio = (event.clientY - lyricsDragStartY) / boxHeight;
+  lyricsHeightRatio = Math.min(1, Math.max(0, lyricsDragStartRatio + deltaRatio));
+  localStorage.setItem(LYRICS_HEIGHT_KEY, lyricsHeightRatio);
+});
+
+function endLyricsDrag(event) {
+  if (lyricsDragStartY === null) return;
+  lyricsDragStartY = null;
+  lyricsScrollEl.releasePointerCapture(event.pointerId);
+}
+lyricsScrollEl.addEventListener('pointerup', endLyricsDrag);
+lyricsScrollEl.addEventListener('pointercancel', endLyricsDrag);
+
+// Molette de souris (navigateur desktop) : même effet que le glisser du doigt.
+lyricsScrollEl.addEventListener('wheel', (event) => {
+  event.preventDefault();
+  const boxHeight = lyricsScrollEl.clientHeight || 1;
+  const deltaRatio = event.deltaY / boxHeight;
+  lyricsHeightRatio = Math.min(1, Math.max(0, lyricsHeightRatio + deltaRatio));
+  localStorage.setItem(LYRICS_HEIGHT_KEY, lyricsHeightRatio);
+}, { passive: false });
+
 // Fait défiler les paroles à la même vitesse que le grand écran (voir
 // beat_display._draw_lyrics_scroll) : chaque ligne du CSV équivaut à
-// LYRICS_BEATS_PER_LINE temps, positionnée selon lyrics_song_beat (position
-// continue depuis le début du morceau), avec LYRICS_VISIBLE_LINES lignes
-// visibles à la fois (éléments DOM réutilisés, comme les items du canvas
-// côté bureau).
-function updateLyricsScroll(data) {
-  if (!showLyrics) return;
-  const lines = Array.isArray(data.lyrics_lines) ? data.lyrics_lines : [];
-  const songBeat = data.lyrics_song_beat;
-  if (!lines.length || typeof songBeat !== 'number') {
+// LYRICS_BEATS_PER_LINE temps, positionnée selon songBeat (position continue
+// depuis le début du morceau), avec LYRICS_VISIBLE_LINES lignes visibles à la
+// fois (éléments DOM réutilisés, comme les items du canvas côté bureau).
+//
+// Rendu via requestAnimationFrame (comme foenix7777-player-deploy/player.html
+// pour son propre défilement), pas dans poll() : poll() n'arrive que toutes
+// les ~60ms par le réseau, avec une gigue (latence fetch/JSON variable) qui
+// rendait le texte saccadé. Ici, chaque frame extrapole localement songBeat
+// depuis le dernier échantillon serveur + le temps écoulé réel (lyricsBaseBpm),
+// exactement comme scheduleUpcomingClicks extrapole déjà les clics audio.
+let lyricsBaseSongBeat = null; // dernier songBeat connu (voir poll)
+let lyricsBaseBpm = null;      // tempo au moment de cet échantillon ; null = ne pas extrapoler (arrêté/inconnu)
+let lyricsBaseAt = 0;          // performance.now() de l'échantillon
+let lyricsLinesCache = [];
+
+function renderLyricsScroll(lines, songBeat) {
+  if (!showLyrics || !lines.length || typeof songBeat !== 'number') {
     lyricsScrollEl.style.display = 'none';
     return;
   }
   lyricsScrollEl.style.display = 'block';
   const boxHeight = lyricsScrollEl.clientHeight || 1;
   const pixelsPerBeat = boxHeight / (LYRICS_VISIBLE_LINES * LYRICS_BEATS_PER_LINE);
-  // Hauteur réglée par lyricsHeightSlider (0..100%), propre à cet appareil.
-  const centerY = boxHeight * (parseFloat(lyricsHeightSlider.value) / 100);
+  // Hauteur réglée en glissant le doigt sur la zone (lyricsHeightRatio, 0..1), propre à cet appareil.
+  const centerY = boxHeight * lyricsHeightRatio;
   const bufferPx = LYRICS_BEATS_PER_LINE * pixelsPerBeat;
   const visible = new Set();
   lines.forEach((text, index) => {
@@ -361,6 +466,17 @@ function updateLyricsScroll(data) {
     if (!visible.has(index)) el.style.display = 'none';
   }
 }
+
+function lyricsAnimationLoop() {
+  let songBeat = lyricsBaseSongBeat;
+  if (songBeat !== null && lyricsBaseBpm) {
+    const elapsedS = (performance.now() - lyricsBaseAt) / 1000;
+    songBeat += elapsedS * (lyricsBaseBpm / 60);
+  }
+  renderLyricsScroll(lyricsLinesCache, songBeat);
+  requestAnimationFrame(lyricsAnimationLoop);
+}
+requestAnimationFrame(lyricsAnimationLoop);
 
 // Planification "lookahead" (horloge audio, pas le timer JS) : au lieu de
 // jouer le clic au moment où poll() détecte un changement de temps (sujet
@@ -412,6 +528,7 @@ async function poll() {
     const data = await res.json();
     const infoEl = document.getElementById('info');
     const offlineEl = document.getElementById('offline');
+    document.body.classList.toggle('highlighted', !!data.highlighted);
     if (data.offline) {
       dotEl.style.display = 'none';
       digitEl.style.display = 'none';
@@ -480,7 +597,18 @@ async function poll() {
     document.getElementById('sceneName').classList.toggle('launched', !!data.scene_launched);
     document.getElementById('barCount').textContent = data.bar_count ? ('Mes. ' + data.bar_count) : '';
     document.getElementById('sceneLabel').textContent = data.scene_label || '';
-    updateLyricsScroll(data);
+    lyricsLinesCache = Array.isArray(data.lyrics_lines) ? data.lyrics_lines : [];
+    if (typeof data.lyrics_song_beat === 'number') {
+      lyricsBaseSongBeat = data.lyrics_song_beat;
+      // N'extrapole (voir lyricsAnimationLoop) que si la lecture avance
+      // vraiment : sinon (arrêté/inconnu) la position reste figée pile sur
+      // le dernier échantillon, comme avant.
+      lyricsBaseBpm = (data.connected && typeof data.bpm === 'number') ? data.bpm : null;
+      lyricsBaseAt = performance.now();
+    } else {
+      lyricsBaseSongBeat = null;
+      lyricsBaseBpm = null;
+    }
     if (data.scene_launched && !lastSceneLaunched) {
       sceneFlashDouble();
     }
@@ -546,6 +674,7 @@ class SharedBeatState:
         self._offline = False
         self._lyrics_lines: list[str] = []
         self._lyrics_song_beat: float | None = None
+        self._highlighted = False
 
     def update(
         self, phase: float, beats_per_bar: float, bpm: float | None,
@@ -614,6 +743,14 @@ class SharedBeatState:
         with self._lock:
             self._lyrics_song_beat = song_beat
 
+    def set_highlighted(self, highlighted: bool) -> None:
+        """Mesure HIGHLIGHT (scene_sheet.py) en cours (voir
+        beat_display._update_display, HIGHLIGHT_SIZE_SCALE) : la page web
+        grossit le chiffre/les points pareil que le grand écran, sauf en mode
+        paroles (voir body.lyrics-mode dans _PAGE)."""
+        with self._lock:
+            self._highlighted = highlighted
+
     def compute(self, latency_ms: float = 0.0) -> dict:
         """Calcule {beat, bpm, connected, running, mode} pour un décalage donné."""
         with self._lock:
@@ -625,6 +762,7 @@ class SharedBeatState:
             offline = self._offline
             lyrics_lines = self._lyrics_lines
             lyrics_song_beat = self._lyrics_song_beat
+            highlighted = self._highlighted
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
         elapsed_ms = (time.monotonic() - data["ref_monotonic"]) * 1000.0
@@ -646,6 +784,7 @@ class SharedBeatState:
             "offline": offline,
             "lyrics_lines": lyrics_lines,
             "lyrics_song_beat": lyrics_song_beat,
+            "highlighted": highlighted,
         }
 
 
@@ -688,6 +827,12 @@ def _make_handler(shared_state: SharedBeatState):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                # Sans ceci, un téléphone garde parfois en cache une ancienne
+                # version de la page (HTML+JS embarqué) même après un
+                # changement côté serveur : on force un rechargement à chaque
+                # visite (comme /state, jamais de cache pour du contenu qui
+                # change avec le code).
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
 

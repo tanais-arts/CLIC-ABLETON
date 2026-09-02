@@ -16,6 +16,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import font as tkfont, ttk
 
@@ -1108,7 +1109,7 @@ class App:
 
         web_row = tk.Frame(self.root, bg=BG_IDLE)
         web_row.pack(fill="x", padx=10, pady=(0, 10))
-        tk.Label(web_row, text="Affichage smartphone :", bg=BG_IDLE, fg="#bbbbbb").pack(side="left")
+
         url_var = tk.StringVar(value=self.web_server.url())
         # Entry en lecture seule plutôt qu'un Label : le texte reste
         # sélectionnable/copiable (Ctrl/Cmd+C) même si non modifiable.
@@ -1124,6 +1125,11 @@ class App:
             self.root.clipboard_append(url_var.get())
 
         tk.Button(web_row, text="Copier", command=_copy_url).pack(side="left", padx=(4, 0))
+
+        def _open_url() -> None:
+            webbrowser.open(url_var.get())
+
+        tk.Button(web_row, text="Ouvrir", command=_open_url).pack(side="left", padx=(4, 0))
 
     def _apply_mode(self) -> None:
         mode = self.mode_var.get()
@@ -2791,6 +2797,7 @@ class App:
         # fondus du blanc vers leur couleur normale, et 50% plus grands ;
         # remplace entièrement le flash jaune/bleu habituel pour ces mesures.
         highlighted = connected and self._scene_sheet_row is not None and self._scene_sheet_row.highlight
+        self.shared_state.set_highlighted(highlighted)
         if highlighted:
             bg = _lerp_color(FLASH_HIGHLIGHT, BG_IDLE, fractional)
             digit_fill = _lerp_color(FLASH_HIGHLIGHT, FG_TEXT, fractional)
