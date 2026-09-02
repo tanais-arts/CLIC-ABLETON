@@ -27,7 +27,7 @@ from config import load_config, save_config
 from hui_bridge import HuiBridge
 from link_client import AbletonLink, LinkUnavailable
 from live_osc import LiveOSC
-from lyrics import LyricsSheet, load_lyrics
+from lyrics import LyricsSheet, load_lyrics, save_lyrics_line
 from scene_sheet import SceneSheet, SceneSheetRow, load_scene_sheet
 from web_server import BeatWebServer, SharedBeatState, project_phase
 
@@ -593,6 +593,11 @@ class App:
         # (voir _compute_lyrics_line_fonts) : concerne uniquement le grand
         # écran, jamais la page web (qui reçoit le texte brut).
         self._lyrics_line_fonts: dict[int, tuple] = {}
+        # Édition en direct d'une ligne de paroles (double-clic, voir
+        # _lyrics_start_edit) : {"index", "entry", "var", "window_item"},
+        # None si aucune édition en cours. Gèle le défilement (voir
+        # _draw_lyrics_scroll) tant qu'elle est ouverte.
+        self._lyrics_editor: dict | None = None
         # Dernière signature rythmique (numérateur COUNT) poussée à Live, pour
         # ne la renvoyer que si elle change réellement (voir _apply_scene_sheet_row).
         self._live_time_signature_sent: int | None = None
@@ -802,6 +807,9 @@ class App:
         # canvas sous macOS/Tk (Cocoa recalcule les zones de suivi de la
         # souris à chaque création/suppression d'item).
         self._canvas_items: dict[str, int] = {}
+        # Double-clic sur une ligne de paroles affichée = édition en direct
+        # du CSV (voir _on_lyrics_double_click/_lyrics_start_edit).
+        self.display.tag_bind("lyrics_line", "<Double-Button-1>", self._on_lyrics_double_click)
 
         # -- Label de section (INTRO/COUPLET/REFRAIN..., voir scene_sheet.py) --
         # Groupe centré dans son ensemble (label courant + label suivant),
@@ -1209,6 +1217,7 @@ class App:
         )
         self.shared_state.set_lyrics_lines(self._lyrics_sheet.lines if self._lyrics_sheet is not None else [])
         self._lyrics_bar_beats = []
+        self._lyrics_close_editor()
         self._compute_lyrics_line_fonts()
         label_bar = self._scene_sheet.bar_for_label(self.goto_label_var.get())
         try:
@@ -1900,6 +1909,7 @@ class App:
         self._lyrics_sheet = None
         self._lyrics_bar_beats = []
         self._lyrics_line_fonts = {}
+        self._lyrics_close_editor()
         self._hide_lyrics_scroll_items()
         try:
             self.live_osc.set_selected_scene(new_index)
@@ -1943,6 +1953,7 @@ class App:
                 self._lyrics_sheet = None
                 self._lyrics_bar_beats = []
                 self._lyrics_line_fonts = {}
+                self._lyrics_close_editor()
                 self._hide_lyrics_scroll_items()
                 # 2s après le lancement d'une scène "tempo seul", on
                 # sélectionne automatiquement la scène suivante (comme un
@@ -2728,6 +2739,11 @@ class App:
         if sheet is None or not sheet.lines or self._bar_count is None:
             self._hide_lyrics_scroll_items()
             return
+        if self._lyrics_editor is not None:
+            # Édition en direct ouverte (voir _lyrics_start_edit) : on gèle
+            # l'affichage tel quel pour que l'Entry superposée reste alignée
+            # sur sa ligne, plutôt que de la voir défiler sous le curseur.
+            return
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
@@ -2755,7 +2771,7 @@ class App:
                 continue
             key = f"lyrics_line_{index}"
             item, _ = self._get_canvas_item(
-                key, lambda: canvas.create_text(width / 2, 0, font=LYRICS_FONT, fill=FG_TEXT),
+                key, lambda: canvas.create_text(width / 2, 0, font=LYRICS_FONT, fill=FG_TEXT, tags=("lyrics_line",)),
             )
             canvas.coords(item, width / 2, y)
             font = self._lyrics_line_fonts.get(index, LYRICS_FONT)
@@ -2773,6 +2789,82 @@ class App:
             if item is not None:
                 self.display.itemconfigure(item, state="hidden")
         self._lyrics_visible_indices = set()
+
+    def _on_lyrics_double_click(self, _event) -> None:
+        """Double-clic sur une ligne de paroles affichée (voir
+        _draw_lyrics_scroll, tag "lyrics_line") : ouvre son édition."""
+        current = self.display.find_withtag("current")
+        if not current:
+            return
+        item_id = current[0]
+        for key, value in self._canvas_items.items():
+            if value == item_id and key.startswith("lyrics_line_"):
+                self._lyrics_start_edit(int(key.rsplit("_", 1)[1]))
+                return
+
+    def _lyrics_start_edit(self, index: int) -> None:
+        """Ouvre une Entry superposée sur la ligne `index` (voir
+        _on_lyrics_double_click), pré-remplie avec son texte actuel."""
+        if self._lyrics_editor is not None or self._lyrics_sheet is None:
+            return
+        if index < 0 or index >= len(self._lyrics_sheet.lines):
+            return
+        item = self._canvas_items.get(f"lyrics_line_{index}")
+        if item is None:
+            return
+        canvas = self.display
+        x, y = canvas.coords(item)
+        font = self._lyrics_line_fonts.get(index, LYRICS_FONT)
+        var = tk.StringVar(value=self._lyrics_sheet.lines[index])
+        entry = tk.Entry(
+            canvas, textvariable=var, font=font, justify="center",
+            bg="#222222", fg=FG_TEXT, insertbackground=FG_TEXT, relief="solid", bd=1,
+        )
+        window_item = canvas.create_window(
+            x, y, window=entry, anchor="center", width=max(200, canvas.winfo_width() - 20),
+        )
+        entry.select_range(0, "end")
+        entry.focus_set()
+        entry.bind("<Return>", lambda _e: self._lyrics_commit_edit(index))
+        entry.bind("<Escape>", lambda _e: self._lyrics_cancel_edit())
+        entry.bind("<FocusOut>", lambda _e: self._lyrics_commit_edit(index))
+        self._lyrics_editor = {"index": index, "entry": entry, "var": var, "window_item": window_item}
+
+    def _lyrics_commit_edit(self, index: int) -> None:
+        """Valide l'édition en cours (touche Entrée ou perte de focus) :
+        réécrit la ligne dans le CSV (lyrics.save_lyrics_line) si le texte a
+        changé, puis referme l'éditeur."""
+        editor = self._lyrics_editor
+        if editor is None or editor["index"] != index:
+            return
+        new_text = editor["var"].get().strip()
+        self._lyrics_close_editor()
+        sheet = self._lyrics_sheet
+        if sheet is None or index >= len(sheet.lines) or new_text == sheet.lines[index]:
+            return
+        if save_lyrics_line(self._scene_name, self.SCENE_SHEET_DIR, index, new_text, log=lambda msg: print(f"[Paroles] {msg}")):
+            sheet.lines[index] = new_text
+            self.shared_state.set_lyrics_lines(sheet.lines)
+            self._compute_lyrics_line_fonts()
+            # Rafraîchit tout de suite l'item canvas : _draw_lyrics_scroll ne
+            # sera pas forcément rappelé avant longtemps (ex. figé à l'arrêt).
+            item = self._canvas_items.get(f"lyrics_line_{index}")
+            if item is not None:
+                self.display.itemconfigure(item, text=new_text, font=self._lyrics_line_fonts.get(index, LYRICS_FONT))
+        else:
+            print(f"[Paroles] Échec de l'enregistrement de la ligne {index}")
+
+    def _lyrics_cancel_edit(self) -> None:
+        """Annule l'édition en cours (touche Échap) sans rien enregistrer."""
+        self._lyrics_close_editor()
+
+    def _lyrics_close_editor(self) -> None:
+        editor = self._lyrics_editor
+        if editor is None:
+            return
+        self._lyrics_editor = None
+        editor["entry"].destroy()
+        self.display.delete(editor["window_item"])
 
     def _draw_digit(
         self, beat: int, fill: str = FG_TEXT, size_scale: float = 1.0, top_aligned: bool = False,
@@ -2932,7 +3024,11 @@ class App:
                 self._hide_lyrics_scroll_items()
         elif self._last_bpm and not running:
             self._draw_scroll_line(beats_per_bar, beat, fractional, top_aligned=lyrics_enabled)
-            self._hide_lyrics_scroll_items()
+            # STOP (transport arrêté mais tempo déjà connu) : les paroles ne
+            # doivent PAS disparaître, elles restent figées à l'écran (même
+            # affichage que le dernier temps joué) jusqu'au prochain PLAY.
+            if not lyrics_enabled:
+                self._hide_lyrics_scroll_items()
         else:
             self._hide_canvas_items("digit", "circle_left", "circle_right", "line_track", "line_fill")
             self._hide_lyrics_scroll_items()

@@ -65,3 +65,35 @@ def load_lyrics(scene_name: str, base_dir: Path, log=print) -> LyricsSheet | Non
         for values in rows[1:]  # 1re ligne = en-tête, ignorée
     ]
     return LyricsSheet(lines=lines)
+
+
+def save_lyrics_line(scene_name: str, base_dir: Path, line_index: int, text: str, log=print) -> bool:
+    """Réécrit la colonne "Discours" de la ligne `line_index` (0-based, après
+    l'en-tête) dans le CSV, sans toucher aux autres colonnes/lignes (édition
+    en direct depuis beat_display.py). False si le fichier ou la ligne
+    n'existe pas (jamais d'exception)."""
+    path = base_dir / "Lyrics" / f"{scene_name}.csv"
+    if not path.is_file():
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+    except OSError as exc:
+        log(f"Paroles {path.name} : lecture impossible avant écriture ({exc})")
+        return False
+    row_pos = line_index + 1  # +1 pour l'en-tête
+    if row_pos >= len(rows):
+        return False
+    row = rows[row_pos]
+    while len(row) <= TEXT_COLUMN_INDEX:
+        row.append("")
+    row[TEXT_COLUMN_INDEX] = text
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            # lineterminator="\n" : le CSV exporté par Live n'a pas de \r,
+            # sinon chaque ligne (pas juste celle éditée) change dans le diff.
+            csv.writer(handle, lineterminator="\n").writerows(rows)
+    except OSError as exc:
+        log(f"Paroles {path.name} : écriture impossible ({exc})")
+        return False
+    return True
