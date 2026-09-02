@@ -633,6 +633,474 @@ poll();
 </html>
 """
 
+# Page minimale, en JS ES5 pur (var/function, XMLHttpRequest, pas de
+# fetch/const/let/arrow functions/template literals/Promise/Map) : Safari sur
+# iOS 9.3.5 (iPad mini 1/iPad 2, bloqués à cette version) exécute un moteur
+# JS trop ancien pour _PAGE, dont le premier "const"/arrow function fait
+# échouer TOUT le script (page qui reste figée sur les valeurs par défaut,
+# HTML/CSS seuls rendus). Réutilise le même /state (JSON, indépendant du JS
+# client) et les mêmes /sounds/*.wav : aucun changement côté serveur/Tk
+# nécessaire. Repris de _PAGE : bouton Points (chiffre/2 points), bouton
+# Muet (Web Audio API, supportée dès iOS 6 via le préfixe webkit, chargée en
+# XHR+decodeAudioData plutôt que fetch), bouton Paroles (défilement, glissé
+# au doigt via touchstart/touchmove/touchend — les Pointer Events n'existent
+# pas avant Safari 13). Mêmes clés localStorage que _PAGE (réglages
+# communs, même origine).
+_LEGACY_PAGE = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Temps - Ableton Live</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #1e1e1e; color: #f5f5f5;
+    font-family: Helvetica, Arial, sans-serif;
+    overflow: hidden;
+  }
+  @-webkit-keyframes flashYellow { from { background: #f5c518; } to { background: #1e1e1e; } }
+  @-webkit-keyframes flashBlue { from { background: #2b4bff; } to { background: #1e1e1e; } }
+  @keyframes flashYellow { from { background: #f5c518; } to { background: #1e1e1e; } }
+  @keyframes flashBlue { from { background: #2b4bff; } to { background: #1e1e1e; } }
+  body.flash { -webkit-animation: flashYellow 300ms ease-out; animation: flashYellow 300ms ease-out; }
+  body.flash-blue { -webkit-animation: flashBlue 300ms ease-out; animation: flashBlue 300ms ease-out; }
+  body { display: -webkit-box; display: -webkit-flex; display: flex; -webkit-flex-direction: column; flex-direction: column; }
+  #latencyRow {
+    -webkit-flex: 0 0 auto; flex: 0 0 auto;
+    padding: 8px 0; text-align: center; font-size: 2.2vh; color: #888888;
+  }
+  #latencyRow input[type=range] { width: 60%; vertical-align: middle; }
+  #btnRow { margin-top: 6px; }
+  #btnRow button {
+    padding: 6px 14px; font-size: 2.2vh; margin: 0 4px;
+    background: #333333; color: #f5f5f5; border: none; border-radius: 6px;
+  }
+  #btnRow button.active { background: #2b7a2b; }
+  #beat {
+    -webkit-box-flex: 1; -webkit-flex: 1 1 auto; flex: 1 1 auto;
+    position: relative;
+    display: -webkit-box; display: -webkit-flex; display: flex;
+    -webkit-flex-direction: column; flex-direction: column;
+    -webkit-box-pack: center; -webkit-justify-content: center; justify-content: center;
+    -webkit-box-align: center; -webkit-align-items: center; align-items: center;
+    text-align: center;
+  }
+  #dot { display: none; font-size: 20vh; color: #f5f5f5; margin: 1vh 0; }
+  #digit { display: none; font-size: 40vh; font-weight: bold; color: #f5f5f5; margin: 1vh 0; }
+  #dotsPair { display: none; margin: 1vh 0; }
+  #dotsPair .circle {
+    display: inline-block; width: 18vh; height: 18vh; border-radius: 50%;
+    border: 3px solid #f5f5f5; box-sizing: border-box; margin: 0 3vw;
+  }
+  #dotsPair .circle.filled { background: #f5f5f5; }
+  #scrollLine {
+    display: none;
+    position: absolute; left: 15%; right: 15%; top: 50%;
+    height: 0.8vh; margin-top: -0.4vh;
+    overflow: hidden;
+    background: rgba(245, 245, 245, 0.15);
+  }
+  #scrollThumb {
+    position: absolute; top: 0; bottom: 0; left: 0;
+    width: 0%; background: #f5f5f5;
+  }
+  #offline { display: none; font-size: 10vh; font-weight: bold; text-align: center; color: #ff4d4d; }
+  #sceneLabel, #barCount, #sceneName {
+    -webkit-flex: 0 0 auto; flex: 0 0 auto;
+    text-align: center; min-height: 1.2em;
+  }
+  #sceneName { font-size: 3.5vh; color: #ff4d4d; }
+  #sceneName.launched { color: #3ddc57; }
+  #sceneLabel { font-size: 4vh; font-weight: bold; color: #7fb2ff; }
+  #barCount { font-size: 5vh; font-weight: bold; color: #bbbbbb; }
+  #info {
+    -webkit-flex: 0 0 auto; flex: 0 0 auto;
+    text-align: center; font-size: 5vh; color: #bbbbbb; padding: 6px 0;
+  }
+  #lyricsScroll {
+    display: none;
+    -webkit-flex: 0 0 auto; flex: 0 0 auto;
+    position: relative; overflow: hidden;
+    width: 100%; height: 30vh;
+    background: #000000;
+  }
+  #lyricsScroll .lyricsLineText {
+    position: absolute; left: 0; right: 0;
+    text-align: center; padding: 0 4vw;
+    font-size: 3.6vh; font-weight: bold; color: #f5f5f5;
+    margin-top: -1.5em;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 4;
+    overflow: hidden;
+  }
+  body.lyrics-mode #info { display: none; }
+  body.lyrics-mode #lyricsScroll { height: 50vh; }
+  body.lyrics-mode #digit { font-size: 25vh; }
+</style>
+</head>
+<body>
+  <div id="latencyRow">
+    <span>Delai</span>
+    <input type="range" id="latencySlider" min="-120" max="120" step="1" value="0">
+    <div id="btnRow">
+      <button id="muteBtn">Son coupe</button>
+      <button id="lyricsBtn">Paroles masquees</button>
+      <button id="dotsBtn">Points</button>
+    </div>
+  </div>
+  <div id="beat">
+    <div id="dot">&bull;</div>
+    <div id="digit">--</div>
+    <div id="dotsPair"><span id="dotLeft" class="circle"></span><span id="dotRight" class="circle"></span></div>
+    <div id="offline">OFFLINE</div>
+    <div id="scrollLine"><div id="scrollThumb"></div></div>
+  </div>
+  <div id="sceneLabel"></div>
+  <div id="barCount"></div>
+  <div id="sceneName"></div>
+  <div id="lyricsScroll"></div>
+  <div id="info">-- BPM</div>
+<script>
+var KEY = 'beatDisplayLatencyMs';
+var slider = document.getElementById('latencySlider');
+var saved = localStorage.getItem(KEY);
+if (saved !== null) { slider.value = saved; }
+function saveLatency() { localStorage.setItem(KEY, slider.value); }
+slider.onchange = saveLatency;
+slider.oninput = saveLatency;
+
+var dotEl = document.getElementById('dot');
+var digitEl = document.getElementById('digit');
+var dotsPairEl = document.getElementById('dotsPair');
+var dotLeftEl = document.getElementById('dotLeft');
+var dotRightEl = document.getElementById('dotRight');
+var scrollLineEl = document.getElementById('scrollLine');
+var scrollThumbEl = document.getElementById('scrollThumb');
+var offlineEl = document.getElementById('offline');
+var infoEl = document.getElementById('info');
+var sceneNameEl = document.getElementById('sceneName');
+var barCountEl = document.getElementById('barCount');
+var sceneLabelEl = document.getElementById('sceneLabel');
+var lastBeat = null;
+var lastBarPhase = 0;
+
+function retrigger(className) {
+  // Force le recalcul de style pour rejouer l'animation même si la même
+  // classe (donc la même @keyframes) était déjà active juste avant ;
+  // préserve 'lyrics-mode' si présente (seule autre classe sur body).
+  var base = document.body.className.indexOf('lyrics-mode') !== -1 ? 'lyrics-mode' : '';
+  document.body.className = base;
+  void document.body.offsetWidth;
+  document.body.className = (base ? base + ' ' : '') + className;
+}
+
+// --- Points / chiffre ---
+var DOTS_KEY = 'beatDisplayShowDots';
+var dotsBtn = document.getElementById('dotsBtn');
+var showDots = localStorage.getItem(DOTS_KEY) === '1';
+function updateDotsBtn() {
+  dotsBtn.innerHTML = showDots ? 'Chiffres' : 'Points';
+  dotsBtn.className = showDots ? 'active' : '';
+}
+updateDotsBtn();
+dotsBtn.onclick = function () {
+  showDots = !showDots;
+  localStorage.setItem(DOTS_KEY, showDots ? '1' : '0');
+  updateDotsBtn();
+};
+
+// --- Son (Web Audio API, chargement via XHR) ---
+var MUTE_KEY = 'beatDisplayMuted';
+var muteBtn = document.getElementById('muteBtn');
+var muted = localStorage.getItem(MUTE_KEY) !== '0';
+var audioCtx = null;
+var clickBuffer = null;
+var clickUpBuffer = null;
+var audioLoading = false;
+
+function loadBuffer(ctx, url, onDone) {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', url, true);
+  xhr.responseType = 'arraybuffer';
+  xhr.onload = function () {
+    if (xhr.status !== 200) { return; }
+    ctx.decodeAudioData(xhr.response, function (buffer) { onDone(buffer); }, function () {});
+  };
+  xhr.send(null);
+}
+
+function initAudio() {
+  if (audioLoading) { return; }
+  audioLoading = true;
+  var Ctor = window.AudioContext || window.webkitAudioContext;
+  if (!Ctor) { return; }
+  if (!audioCtx) { audioCtx = new Ctor(); }
+  if (audioCtx.state === 'suspended' && audioCtx.resume) { audioCtx.resume(); }
+  if (!clickBuffer) { loadBuffer(audioCtx, '/sounds/click.wav', function (b) { clickBuffer = b; }); }
+  if (!clickUpBuffer) { loadBuffer(audioCtx, '/sounds/click_up.wav', function (b) { clickUpBuffer = b; }); }
+}
+
+function updateMuteBtn() {
+  muteBtn.innerHTML = muted ? 'Son coupe' : 'Son actif';
+  muteBtn.className = muted ? '' : 'active';
+}
+updateMuteBtn();
+if (!muted) { initAudio(); }
+
+function unlockAudio() {
+  if (audioCtx && audioCtx.state === 'suspended' && audioCtx.resume) { audioCtx.resume(); }
+}
+document.addEventListener('touchend', unlockAudio, false);
+document.addEventListener('mousedown', unlockAudio, false);
+
+muteBtn.onclick = function () {
+  muted = !muted;
+  localStorage.setItem(MUTE_KEY, muted ? '1' : '0');
+  updateMuteBtn();
+  if (!muted) { initAudio(); }
+};
+
+var nextClickAt = null;
+var nextClickBeat = null;
+var SCHEDULE_AHEAD_S = 0.15;
+
+function scheduleClick(at, beat) {
+  var source = audioCtx.createBufferSource();
+  source.buffer = beat === 1 ? clickUpBuffer : clickBuffer;
+  source.connect(audioCtx.destination);
+  source.start(at);
+}
+
+function scheduleUpcomingClicks(data) {
+  if (muted || !audioCtx || !clickBuffer || !clickUpBuffer || !data.bpm) { return; }
+  var beatsPerBar = data.beats_per_bar || 4;
+  var secondsPerBeat = 60 / data.bpm;
+  var fractionalBeat = (data.bar_phase * beatsPerBar) % 1;
+  var now = audioCtx.currentTime;
+  var trueNextAt = now + (1 - fractionalBeat) * secondsPerBeat;
+  var trueNextBeat = (data.beat % beatsPerBar) + 1;
+  if (nextClickAt === null || Math.abs(trueNextAt - nextClickAt) > secondsPerBeat * 0.5) {
+    nextClickAt = trueNextAt;
+    nextClickBeat = trueNextBeat;
+  }
+  while (nextClickAt < now + SCHEDULE_AHEAD_S) {
+    scheduleClick(nextClickAt, nextClickBeat);
+    nextClickAt += secondsPerBeat;
+    nextClickBeat = (nextClickBeat % beatsPerBar) + 1;
+  }
+}
+
+// --- Paroles ---
+var LYRICS_KEY = 'beatDisplayShowLyrics';
+var LYRICS_BEATS_PER_LINE = 8;
+var LYRICS_VISIBLE_LINES = 3;
+var LYRICS_HEIGHT_KEY = 'beatDisplayLyricsHeight';
+var lyricsBtn = document.getElementById('lyricsBtn');
+var lyricsScrollEl = document.getElementById('lyricsScroll');
+var lyricsLineEls = {};
+var showLyrics = localStorage.getItem(LYRICS_KEY) === '1';
+var lyricsHeightRatio = parseFloat(localStorage.getItem(LYRICS_HEIGHT_KEY)) || 0.5;
+var lyricsDragStartY = null;
+var lyricsDragStartRatio = 0.5;
+var lyricsBaseSongBeat = null;
+var lyricsBaseBpm = null;
+var lyricsBaseAt = 0;
+var lyricsLinesCache = [];
+
+function setLyricsModeClass(on) {
+  var has = document.body.className.indexOf('lyrics-mode') !== -1;
+  if (on && !has) { document.body.className += ' lyrics-mode'; }
+  if (!on && has) { document.body.className = document.body.className.replace('lyrics-mode', '').replace(/\\s+/g, ' '); }
+}
+
+function updateLyricsBtn() {
+  lyricsBtn.innerHTML = showLyrics ? 'Paroles affichees' : 'Paroles masquees';
+  lyricsBtn.className = showLyrics ? 'active' : '';
+  setLyricsModeClass(showLyrics);
+  sceneNameEl.style.display = showLyrics ? 'none' : '';
+  barCountEl.style.display = showLyrics ? 'none' : '';
+  if (!showLyrics) { lyricsScrollEl.style.display = 'none'; }
+}
+updateLyricsBtn();
+
+lyricsBtn.onclick = function () {
+  showLyrics = !showLyrics;
+  localStorage.setItem(LYRICS_KEY, showLyrics ? '1' : '0');
+  updateLyricsBtn();
+};
+
+function lyricsPointFromEvent(event) {
+  if (event.touches && event.touches.length) { return event.touches[0].clientY; }
+  return event.clientY;
+}
+
+lyricsScrollEl.addEventListener('touchstart', function (event) {
+  lyricsDragStartY = lyricsPointFromEvent(event);
+  lyricsDragStartRatio = lyricsHeightRatio;
+}, false);
+lyricsScrollEl.addEventListener('mousedown', function (event) {
+  lyricsDragStartY = lyricsPointFromEvent(event);
+  lyricsDragStartRatio = lyricsHeightRatio;
+}, false);
+
+function lyricsDragMove(event) {
+  if (lyricsDragStartY === null) { return; }
+  var boxHeight = lyricsScrollEl.clientHeight || 1;
+  var deltaRatio = (lyricsPointFromEvent(event) - lyricsDragStartY) / boxHeight;
+  lyricsHeightRatio = Math.min(1, Math.max(0, lyricsDragStartRatio + deltaRatio));
+  localStorage.setItem(LYRICS_HEIGHT_KEY, lyricsHeightRatio);
+}
+lyricsScrollEl.addEventListener('touchmove', lyricsDragMove, false);
+lyricsScrollEl.addEventListener('mousemove', lyricsDragMove, false);
+
+function endLyricsDrag() { lyricsDragStartY = null; }
+lyricsScrollEl.addEventListener('touchend', endLyricsDrag, false);
+lyricsScrollEl.addEventListener('touchcancel', endLyricsDrag, false);
+lyricsScrollEl.addEventListener('mouseup', endLyricsDrag, false);
+
+function renderLyricsScroll(lines, songBeat) {
+  if (!showLyrics || !lines.length || typeof songBeat !== 'number') {
+    lyricsScrollEl.style.display = 'none';
+    return;
+  }
+  lyricsScrollEl.style.display = 'block';
+  var boxHeight = lyricsScrollEl.clientHeight || 1;
+  var pixelsPerBeat = boxHeight / (LYRICS_VISIBLE_LINES * LYRICS_BEATS_PER_LINE);
+  var centerY = boxHeight * lyricsHeightRatio;
+  var bufferPx = LYRICS_BEATS_PER_LINE * pixelsPerBeat;
+  var visible = {};
+  var index, text, y, el;
+  for (index = 0; index < lines.length; index++) {
+    text = lines[index];
+    if (!text) { continue; }
+    y = centerY + (index * LYRICS_BEATS_PER_LINE - songBeat) * pixelsPerBeat;
+    if (y < -bufferPx || y > boxHeight + bufferPx) { continue; }
+    el = lyricsLineEls[index];
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'lyricsLineText';
+      lyricsScrollEl.appendChild(el);
+      lyricsLineEls[index] = el;
+    }
+    el.innerHTML = text;
+    el.style.top = y + 'px';
+    el.style.display = 'block';
+    visible[index] = true;
+  }
+  for (index in lyricsLineEls) {
+    if (lyricsLineEls.hasOwnProperty(index) && !visible[index]) {
+      lyricsLineEls[index].style.display = 'none';
+    }
+  }
+}
+
+function lyricsAnimationLoop() {
+  var songBeat = lyricsBaseSongBeat;
+  if (songBeat !== null && lyricsBaseBpm) {
+    var elapsedS = (performance.now() - lyricsBaseAt) / 1000;
+    songBeat += elapsedS * (lyricsBaseBpm / 60);
+  }
+  renderLyricsScroll(lyricsLinesCache, songBeat);
+  if (window.requestAnimationFrame) {
+    requestAnimationFrame(lyricsAnimationLoop);
+  } else {
+    setTimeout(lyricsAnimationLoop, 60);
+  }
+}
+lyricsAnimationLoop();
+
+function render(data) {
+  if (data.offline) {
+    dotEl.style.display = 'none';
+    digitEl.style.display = 'none';
+    dotsPairEl.style.display = 'none';
+    scrollLineEl.style.display = 'none';
+    offlineEl.style.display = 'block';
+    return;
+  }
+  offlineEl.style.display = 'none';
+  if (data.connected) {
+    dotEl.style.display = 'none';
+    scrollLineEl.style.display = 'none';
+    if (showDots) {
+      digitEl.style.display = 'none';
+      dotsPairEl.style.display = 'block';
+      var leftFilled = data.beat % 2 === 1;
+      dotLeftEl.className = leftFilled ? 'circle filled' : 'circle';
+      dotRightEl.className = leftFilled ? 'circle' : 'circle filled';
+    } else {
+      dotsPairEl.style.display = 'none';
+      digitEl.style.display = 'block';
+      digitEl.innerHTML = String(data.beat);
+    }
+    scheduleUpcomingClicks(data);
+    if (data.beat !== lastBeat) {
+      lastBeat = data.beat;
+      if (data.beat === 1) { retrigger('flash'); }
+      else if (data.beat === 3) { retrigger('flash-blue'); }
+    }
+  } else {
+    digitEl.style.display = 'none';
+    dotsPairEl.style.display = 'none';
+    lastBeat = null;
+    nextClickAt = null;
+    if (data.bpm && !data.running) {
+      dotEl.style.display = 'none';
+      scrollLineEl.style.display = 'block';
+      var barPhase = data.bar_phase || 0;
+      if (barPhase < lastBarPhase) {
+        scrollThumbEl.style.width = '0%';
+      }
+      lastBarPhase = barPhase;
+      scrollThumbEl.style.width = (barPhase * 100) + '%';
+    } else {
+      scrollLineEl.style.display = 'none';
+      dotEl.style.display = data.bpm ? 'none' : 'block';
+    }
+  }
+  sceneNameEl.innerHTML = data.scene_name ? data.scene_name : '';
+  sceneNameEl.className = data.scene_launched ? 'launched' : '';
+  barCountEl.innerHTML = data.bar_count ? ('Mes. ' + data.bar_count) : '';
+  sceneLabelEl.innerHTML = data.scene_label ? data.scene_label : '';
+  lyricsLinesCache = (data.lyrics_lines && data.lyrics_lines.length) ? data.lyrics_lines : [];
+  if (typeof data.lyrics_song_beat === 'number') {
+    lyricsBaseSongBeat = data.lyrics_song_beat;
+    lyricsBaseBpm = (data.connected && typeof data.bpm === 'number') ? data.bpm : null;
+    lyricsBaseAt = performance.now();
+  } else {
+    lyricsBaseSongBeat = null;
+    lyricsBaseBpm = null;
+  }
+  var suffix = '';
+  if (data.mode === 'link') {
+    suffix = data.running ? ' (lecture)' : '';
+  } else {
+    suffix = data.running ? '' : ' (arret)';
+  }
+  infoEl.innerHTML = (data.bpm ? data.bpm.toFixed(1) : '--') + ' BPM' + suffix;
+}
+
+function poll() {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/state?latency_ms=' + slider.value, true);
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
+    var data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
+    render(data);
+  };
+  xhr.send(null);
+}
+
+setInterval(poll, 60);
+poll();
+</script>
+</body>
+</html>
+"""
+
 
 def project_phase(phase: float, bpm: float | None, extrapolate: bool, latency_ms: float) -> float:
     """Projette une phase dans le temps en tenant compte d'un décalage.
@@ -810,7 +1278,15 @@ def _make_handler(shared_state: SharedBeatState):
                 self.end_headers()
                 self.wfile.write(body)
             elif parsed.path.startswith("/sounds/") and parsed.path[len("/sounds/"):] in _SOUND_FILES:
-                file_path = _SOUNDS_DIR / parsed.path[len("/sounds/"):]
+                file_name = parsed.path[len("/sounds/"):]
+                file_path = _SOUNDS_DIR / file_name
+                if not file_path.is_file():
+                    # Pas de click.wav/click_up.wav à la racine de sounds/ :
+                    # les kits (voir audio_metronome.py) vivent dans des
+                    # sous-dossiers (sounds/Kit1/click.wav...), on replie sur
+                    # le kit par défaut plutôt que 404 (la page web n'a pas
+                    # connaissance du kit choisi pour le métronome audio).
+                    file_path = _SOUNDS_DIR / "Kit1" / file_name
                 if file_path.is_file():
                     body = file_path.read_bytes()
                     self.send_response(200)
@@ -822,6 +1298,16 @@ def _make_handler(shared_state: SharedBeatState):
                 else:
                     self.send_response(404)
                     self.end_headers()
+            elif parsed.path in ("/legacy", "/legacy/"):
+                # Page ES5 pour Safari trop ancien (iOS 9.3.5, iPad mini
+                # 1/iPad 2) : voir _LEGACY_PAGE.
+                body = _LEGACY_PAGE.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
             else:
                 body = _PAGE.encode("utf-8")
                 self.send_response(200)
