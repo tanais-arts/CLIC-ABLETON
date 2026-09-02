@@ -201,9 +201,46 @@ _PAGE = """<!DOCTYPE html>
     body.lyrics-mode #digit { font-size: 20vh; }
     body.lyrics-mode #dotsPair .circle { width: 9vh; height: 9vh; }
   }
+  /* Prompteur : ne laisse que le LABEL + le défilement des paroles (plein
+     écran), un cadre de 10px qui flashe à la place des chiffres pour rester
+     synchrone, et un unique bouton EXIT pour revenir au mode précédent. */
+  #promptFrame {
+    display: none;
+    position: fixed; inset: 0; pointer-events: none;
+    border: 10px solid transparent; box-sizing: border-box; z-index: 500;
+  }
+  body.prompter-mode #promptFrame { display: block; }
+  body.prompter-mode #latency,
+  body.prompter-mode #beat,
+  body.prompter-mode #sceneName,
+  body.prompter-mode #barCount,
+  body.prompter-mode #info { display: none; }
+  #exitPromptBtn {
+    display: none;
+    position: fixed; top: 10px; right: 10px; z-index: 600;
+    padding: 4px 10px; font-size: 1.6vh;
+    background: rgba(51, 51, 51, 0.4); color: rgba(245, 245, 245, 0.5);
+    border: none; border-radius: 4px;
+    -webkit-user-select: none; user-select: none;
+  }
+  body.prompter-mode #exitPromptBtn { display: block; }
+  body.prompter-mode #lyricsScroll { height: 92vh; }
+  @keyframes flashBorderYellow { from { border-color: #f5c518; } to { border-color: transparent; } }
+  @keyframes flashBorderBlue { from { border-color: #2b4bff; } to { border-color: transparent; } }
+  @keyframes flashBorderWhite { from { border-color: #ffffff; } to { border-color: transparent; } }
+  /* En mode prompteur, le flash de fond habituel (body.flash...) est
+     remplacé par le flash du cadre : jamais les deux à la fois. */
+  body.prompter-mode.flash, body.prompter-mode.flash-blue, body.prompter-mode.flash-white {
+    animation: none; background: #1e1e1e;
+  }
+  body.prompter-mode.flash #promptFrame { animation: flashBorderYellow 300ms ease-out; }
+  body.prompter-mode.flash-blue #promptFrame { animation: flashBorderBlue 300ms ease-out; }
+  body.prompter-mode.flash-white #promptFrame { animation: flashBorderWhite 150ms ease-out; }
+  body.prompter-mode.is-offline #promptFrame { border-color: #ff4d4d; }
 </style>
 </head>
 <body>
+  <div id="promptFrame"></div>
   <div id="latency">
     <div class="row">
       <span>Délai</span>
@@ -213,6 +250,7 @@ _PAGE = """<!DOCTYPE html>
       <button id="muteBtn">Son coupé</button>
       <button id="lyricsBtn">Paroles masquées</button>
       <button id="dotsBtn">Points</button>
+      <button id="promptBtn">PROMPTEUR</button>
     </div>
   </div>
   <div id="beat">
@@ -226,6 +264,7 @@ _PAGE = """<!DOCTYPE html>
   <div id="barCount"></div>
   <div id="sceneName"></div>
   <div id="lyricsScroll"></div>
+  <button id="exitPromptBtn">EXIT</button>
   <div id="info">-- BPM</div>
 <script>
 // Repliement de la barre d'adresse Safari : la page est rendue "défilante"
@@ -376,6 +415,33 @@ lyricsBtn.addEventListener('click', () => {
   localStorage.setItem(LYRICS_KEY, showLyrics ? '1' : '0');
   updateLyricsBtn();
 });
+
+// Mode prompteur : force l'affichage des paroles (sans toucher au réglage
+// mémorisé de l'appareil) et masque tout le reste ; EXIT restaure l'état
+// d'avant l'entrée dans ce mode.
+const promptBtn = document.getElementById('promptBtn');
+const exitPromptBtn = document.getElementById('exitPromptBtn');
+let prompterPrevShowLyrics = showLyrics;
+
+function enterPrompterMode() {
+  prompterPrevShowLyrics = showLyrics;
+  if (!showLyrics) {
+    showLyrics = true;
+    updateLyricsBtn();
+  }
+  document.body.classList.add('prompter-mode');
+}
+
+function exitPrompterMode() {
+  document.body.classList.remove('prompter-mode');
+  if (showLyrics !== prompterPrevShowLyrics) {
+    showLyrics = prompterPrevShowLyrics;
+    updateLyricsBtn();
+  }
+}
+
+promptBtn.addEventListener('click', enterPrompterMode);
+exitPromptBtn.addEventListener('click', exitPrompterMode);
 
 // Hauteur du défilement des paroles : préférence propre à cet appareil
 // (chacun règle la sienne), réglée en glissant le doigt directement sur la
@@ -529,6 +595,7 @@ async function poll() {
     const infoEl = document.getElementById('info');
     const offlineEl = document.getElementById('offline');
     document.body.classList.toggle('highlighted', !!data.highlighted);
+    document.body.classList.toggle('is-offline', !!data.offline);
     if (data.offline) {
       dotEl.style.display = 'none';
       digitEl.style.display = 'none';
@@ -738,9 +805,45 @@ _LEGACY_PAGE = """<!DOCTYPE html>
   body.lyrics-mode #info { display: none; }
   body.lyrics-mode #lyricsScroll { height: 50vh; }
   body.lyrics-mode #digit { font-size: 25vh; }
+  #promptFrame {
+    display: none;
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    border: 10px solid transparent; box-sizing: border-box; z-index: 500;
+    pointer-events: none;
+  }
+  body.prompter-mode #promptFrame { display: block; }
+  body.prompter-mode #latencyRow,
+  body.prompter-mode #beat,
+  body.prompter-mode #sceneName,
+  body.prompter-mode #barCount,
+  body.prompter-mode #info { display: none; }
+  #exitPromptBtn {
+    display: none;
+    position: fixed; top: 10px; right: 10px; z-index: 600;
+    padding: 4px 10px; font-size: 1.6vh;
+    background: rgba(51, 51, 51, 0.4); color: rgba(245, 245, 245, 0.5);
+    border: none; border-radius: 4px;
+  }
+  body.prompter-mode #exitPromptBtn { display: block; }
+  body.prompter-mode #lyricsScroll { height: 92vh; }
+  @-webkit-keyframes flashBorderYellow { from { border-color: #f5c518; } to { border-color: transparent; } }
+  @-webkit-keyframes flashBorderBlue { from { border-color: #2b4bff; } to { border-color: transparent; } }
+  @keyframes flashBorderYellow { from { border-color: #f5c518; } to { border-color: transparent; } }
+  @keyframes flashBorderBlue { from { border-color: #2b4bff; } to { border-color: transparent; } }
+  body.prompter-mode.flash, body.prompter-mode.flash-blue {
+    -webkit-animation: none; animation: none; background: #1e1e1e;
+  }
+  body.prompter-mode.flash #promptFrame {
+    -webkit-animation: flashBorderYellow 300ms ease-out; animation: flashBorderYellow 300ms ease-out;
+  }
+  body.prompter-mode.flash-blue #promptFrame {
+    -webkit-animation: flashBorderBlue 300ms ease-out; animation: flashBorderBlue 300ms ease-out;
+  }
+  body.prompter-mode.is-offline #promptFrame { border-color: #ff4d4d; }
 </style>
 </head>
 <body>
+  <div id="promptFrame"></div>
   <div id="latencyRow">
     <span>Delai</span>
     <input type="range" id="latencySlider" min="-120" max="120" step="1" value="0">
@@ -748,6 +851,7 @@ _LEGACY_PAGE = """<!DOCTYPE html>
       <button id="muteBtn">Son coupe</button>
       <button id="lyricsBtn">Paroles masquees</button>
       <button id="dotsBtn">Points</button>
+      <button id="promptBtn">PROMPTEUR</button>
     </div>
   </div>
   <div id="beat">
@@ -761,6 +865,7 @@ _LEGACY_PAGE = """<!DOCTYPE html>
   <div id="barCount"></div>
   <div id="sceneName"></div>
   <div id="lyricsScroll"></div>
+  <button id="exitPromptBtn">EXIT</button>
   <div id="info">-- BPM</div>
 <script>
 var KEY = 'beatDisplayLatencyMs';
@@ -789,11 +894,32 @@ var lastBarPhase = 0;
 function retrigger(className) {
   // Force le recalcul de style pour rejouer l'animation même si la même
   // classe (donc la même @keyframes) était déjà active juste avant ;
-  // préserve 'lyrics-mode' si présente (seule autre classe sur body).
-  var base = document.body.className.indexOf('lyrics-mode') !== -1 ? 'lyrics-mode' : '';
+  // préserve les classes "collantes" (lyrics-mode, prompter-mode,
+  // is-offline), seules autres classes possibles sur body.
+  var base = stickyClassName();
   document.body.className = base;
   void document.body.offsetWidth;
   document.body.className = (base ? base + ' ' : '') + className;
+}
+
+var STICKY_CLASSES = ['lyrics-mode', 'prompter-mode', 'is-offline'];
+
+function stickyClassName() {
+  var parts = [];
+  var i;
+  for (i = 0; i < STICKY_CLASSES.length; i++) {
+    if (document.body.className.indexOf(STICKY_CLASSES[i]) !== -1) { parts.push(STICKY_CLASSES[i]); }
+  }
+  return parts.join(' ');
+}
+
+function toggleStickyClass(name, on) {
+  var has = document.body.className.indexOf(name) !== -1;
+  if (on && !has) {
+    document.body.className = (document.body.className + ' ' + name).replace(/^\\s+/, '');
+  } else if (!on && has) {
+    document.body.className = document.body.className.replace(name, '').replace(/\\s+/g, ' ').replace(/^\\s+|\\s+$/g, '');
+  }
 }
 
 // --- Points / chiffre ---
@@ -910,9 +1036,7 @@ var lyricsBaseAt = 0;
 var lyricsLinesCache = [];
 
 function setLyricsModeClass(on) {
-  var has = document.body.className.indexOf('lyrics-mode') !== -1;
-  if (on && !has) { document.body.className += ' lyrics-mode'; }
-  if (!on && has) { document.body.className = document.body.className.replace('lyrics-mode', '').replace(/\\s+/g, ' '); }
+  toggleStickyClass('lyrics-mode', on);
 }
 
 function updateLyricsBtn() {
@@ -930,6 +1054,33 @@ lyricsBtn.onclick = function () {
   localStorage.setItem(LYRICS_KEY, showLyrics ? '1' : '0');
   updateLyricsBtn();
 };
+
+// Mode prompteur : force l'affichage des paroles (sans toucher au reglage
+// memorise de l'appareil) et masque tout le reste ; EXIT restaure l'etat
+// d'avant l'entree dans ce mode.
+var promptBtn = document.getElementById('promptBtn');
+var exitPromptBtn = document.getElementById('exitPromptBtn');
+var prompterPrevShowLyrics = showLyrics;
+
+function enterPrompterMode() {
+  prompterPrevShowLyrics = showLyrics;
+  if (!showLyrics) {
+    showLyrics = true;
+    updateLyricsBtn();
+  }
+  toggleStickyClass('prompter-mode', true);
+}
+
+function exitPrompterMode() {
+  toggleStickyClass('prompter-mode', false);
+  if (showLyrics !== prompterPrevShowLyrics) {
+    showLyrics = prompterPrevShowLyrics;
+    updateLyricsBtn();
+  }
+}
+
+promptBtn.onclick = enterPrompterMode;
+exitPromptBtn.onclick = exitPrompterMode;
 
 function lyricsPointFromEvent(event) {
   if (event.touches && event.touches.length) { return event.touches[0].clientY; }
@@ -1012,6 +1163,7 @@ function lyricsAnimationLoop() {
 lyricsAnimationLoop();
 
 function render(data) {
+  toggleStickyClass('is-offline', !!data.offline);
   if (data.offline) {
     dotEl.style.display = 'none';
     digitEl.style.display = 'none';
