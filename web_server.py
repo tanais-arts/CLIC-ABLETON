@@ -224,12 +224,12 @@ _PAGE = """<!DOCTYPE html>
     body.lyrics-mode #dotsPair .circle { width: 9vh; height: 9vh; }
   }
   /* Prompteur : ne laisse que le LABEL + le défilement des paroles (plein
-     écran), un cadre de 10px qui flashe à la place des chiffres pour rester
+     écran), un cadre de 20px qui flashe à la place des chiffres pour rester
      synchrone, et un unique bouton EXIT pour revenir au mode précédent. */
   #promptFrame {
     display: none;
     position: fixed; inset: 0; pointer-events: none;
-    border: 10px solid transparent; box-sizing: border-box; z-index: 500;
+    border: 20px solid transparent; box-sizing: border-box; z-index: 500;
   }
   body.prompter-mode #promptFrame { display: block; }
   body.prompter-mode #latency,
@@ -851,7 +851,7 @@ _LEGACY_PAGE = """<!DOCTYPE html>
   #promptFrame {
     display: none;
     position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-    border: 10px solid transparent; box-sizing: border-box; z-index: 500;
+    border: 20px solid transparent; box-sizing: border-box; z-index: 500;
     pointer-events: none;
   }
   body.prompter-mode #promptFrame { display: block; }

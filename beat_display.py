@@ -1510,13 +1510,14 @@ class App:
             while True:
                 message = self._controller_queue.get_nowait()
                 key = _controller_key(message)
-                # Log actif : identifier quel bouton/encodeur physique a été touché.
-                print(f"[Contrôleur MIDI] {_describe_controller_message(message, key)}")
                 # Ne déclenche que sur l'appui (vélocité/valeur > 0), pas le relâchement.
                 if key is None or len(message) < 3 or message[2] <= 0:
                     continue
                 if self._learning is not None:
                     action = self._learning
+                    # Log seulement en apprentissage : utile pour identifier le
+                    # bouton/encodeur physique, sans spammer le terminal sinon.
+                    print(f"[Contrôleur MIDI] {_describe_controller_message(message, key)}")
                     self.controller_map[action] = key
                     self.config[f"controller_map_{action}"] = list(key)
                     save_config(self.config)
