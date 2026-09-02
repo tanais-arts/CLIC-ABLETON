@@ -2270,10 +2270,22 @@ class App:
             self._link_dialog.destroy()
             self._link_dialog = None
 
-    def _update_bar_count(self, connected: bool, beat: int, fractional: float = 0.0) -> None:
+    def _update_bar_count(
+        self, connected: bool, beat: int, fractional: float = 0.0, bars_advanced: int | None = None,
+    ) -> None:
         """Compte les mesures depuis le premier vrai temps 1 qui suit le
         lancement du morceau en cours (armé par _scene_launch pour les vraies
-        scènes uniquement, jamais pour les scènes "tempo seul"/préparation)."""
+        scènes uniquement, jamais pour les scènes "tempo seul"/préparation).
+
+        `bars_advanced` (nombre de mesures réellement franchies depuis le
+        dernier appel, calculé par l'appelant à partir du temps réel écoulé)
+        doit être fourni en mode Link/Offline : une mesure à 1 temps (COUNT=1
+        dans la feuille de scène) donne `beat` en permanence égal à 1 (modulo
+        1), ce qui rendait la détection "beat == 1 et précédent != 1"
+        incapable de jamais redétecter de nouvelle mesure ensuite (comptage,
+        LABEL/HIGHLIGHT dont END, figés pour le reste du morceau). Sans
+        valeur fournie (mode MIDI Clock), on retombe sur cette ancienne
+        détection par transition."""
         if not connected:
             self._bar_count_prev_beat = None
             self._bar_count_signature_pushed_for = None
@@ -2297,9 +2309,12 @@ class App:
                     self.root.after(50, lambda b=jump_beats: self._jump_beats(b))
                 self._pending_goto_jump_beats = None
             return
-        if self._bar_count is not None and beat == 1 and self._bar_count_prev_beat != 1:
-            self._bar_count += 1
-            self._apply_scene_sheet_row(self._bar_count)
+        if bars_advanced is None:
+            bars_advanced = 1 if (beat == 1 and self._bar_count_prev_beat != 1) else 0
+        if self._bar_count is not None and bars_advanced > 0:
+            for _ in range(bars_advanced):
+                self._bar_count += 1
+                self._apply_scene_sheet_row(self._bar_count)
             self.bar_count_label.config(text=f"Mesure {self._bar_count}")
             self.shared_state.set_bar_count(self._bar_count)
         elif (
@@ -2372,17 +2387,23 @@ class App:
                     self._offline_last_beat_time = now
                     self._offline_beat_in_bar = 1
                     fractional = 0.0
+                    offline_bars_advanced = 0
                 else:
                     beat_duration = 60.0 / bpm
                     elapsed = now - self._offline_last_beat_time
                     fractional = (elapsed % beat_duration) / beat_duration
                     full_beats = int(elapsed / beat_duration)
                     if full_beats > 0:
-                        self._offline_beat_in_bar = (
-                            (self._offline_beat_in_bar - 1 + full_beats) % int(quantum)
-                        ) + 1
+                        # Division entière (pas juste modulo) : détecte le
+                        # nombre réel de mesures franchies même quand quantum
+                        # vaut 1 (voir _update_bar_count).
+                        total = (self._offline_beat_in_bar - 1) + full_beats
+                        offline_bars_advanced = total // int(quantum)
+                        self._offline_beat_in_bar = (total % int(quantum)) + 1
                         self._offline_last_beat_time += full_beats * beat_duration
-                self._update_bar_count(True, self._offline_beat_in_bar, fractional)
+                    else:
+                        offline_bars_advanced = 0
+                self._update_bar_count(True, self._offline_beat_in_bar, fractional, offline_bars_advanced)
                 self._update_display(
                     self._offline_beat_in_bar, int(quantum), fractional, bpm, True, True,
                 )
@@ -2411,6 +2432,7 @@ class App:
                     self._safe_int_var(self.latency_var, "_latency_ms_cache"),
                 )
                 fractional = phase % 1.0
+                link_bars_advanced = 0
                 if self._awaiting_downbeat or self._awaiting_bar_start:
                     # Détection du premier vrai temps 1 (reconnexion Link ou
                     # lancement de scène) : Live aligne réellement les clips
@@ -2447,12 +2469,17 @@ class App:
                         elapsed_beats = snapshot["bpm"] / 60.0 * dt
                         wraps = round(elapsed_beats - (fractional - self._link_prev_fractional))
                         if wraps > 0:
-                            self._link_beat_in_bar = ((self._link_beat_in_bar - 1 + wraps) % int(quantum)) + 1
+                            # Division entière (pas juste modulo) : détecte le
+                            # nombre réel de mesures franchies même quand
+                            # quantum vaut 1 (voir _update_bar_count).
+                            total = (self._link_beat_in_bar - 1) + wraps
+                            link_bars_advanced = total // int(quantum)
+                            self._link_beat_in_bar = (total % int(quantum)) + 1
                     self._link_prev_fractional = fractional
                     self._link_last_update_time = now
                     beat = self._link_beat_in_bar
                 connected = connected and not self._awaiting_downbeat
-                self._update_bar_count(connected, beat, fractional)
+                self._update_bar_count(connected, beat, fractional, link_bars_advanced)
                 self._update_display(beat, int(quantum), fractional, snapshot["bpm"], connected, snapshot["is_playing"])
                 self._update_link_peers_label(link.num_peers)
                 self._on_link_tempo_observed(snapshot["bpm"])
