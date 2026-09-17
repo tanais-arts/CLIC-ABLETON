@@ -15,7 +15,6 @@ DEFAULTS = {
     "mode": "link",  # "link" ou "midi"
     "midi_port": "",
     "beats_per_bar": 4,
-    "latency_ms": 0,
     "web_port": 8765,
     # YAMAHA 01V96 (Note On canal 1) : G-2 pour -1, Sol#-2 pour +1.
     "controller_map_minus": ["note", 0, 7],
@@ -29,7 +28,9 @@ DEFAULTS = {
     # D#-2 pour activer/désactiver notre métronome audio local (voir
     # audio_metronome.py) — ne commande plus le métronome interne de Live.
     "controller_map_metronome": ["note", 0, 3],
-    "controller_map_metronome_2": ["note", 0, 4],
+    # E-2 (note 4) active/désactive la boucle définie par la colonne LOOP.
+    # M2 reste commandé uniquement depuis son bouton dans l'interface.
+    "controller_map_loop": ["note", 0, 4],
     # Carte son et nombre de canaux pour le métronome audio local.
     # "" = périphérique de sortie par défaut du système. channels : 2 = paire
     # stéréo, 1 = mono (toujours les premiers canaux du périphérique).
@@ -40,14 +41,14 @@ DEFAULTS = {
     "metronome_kit": "Kit1",
     # Compensation de latence du clic audio local (ms, +/-) : positif =
     # déclenche le clic plus tôt (compense la latence de la carte son/de
-    # l'ampli), distinct de "latency_ms" qui ne concerne que l'affichage.
-    "metronome_audio_latency_ms": 70,
+    # l'ampli).
+    "metronome_audio_latency_ms": 10,
     # Deuxième sortie métronome (2e carte son + kit + latence), jouée en
     # parallèle de la première quand activée (2 musiciens, clics différents).
     "metronome_audio_device_2": "",
     "metronome_audio_channels_2": 2,
     "metronome_kit_2": "Kit1",
-    "metronome_audio_latency_ms_2": 0,
+    "metronome_audio_latency_ms_2": 10,
     # Mapping piste Live (index) -> tranche HUI/Yamaha (valeur), 0-14 (la
     # tranche 15/canal 16 est réservée au contrôle du tempo, voir
     # TEMPO_FADER_ZONE dans beat_display.py, donc absente du mapping).
@@ -76,6 +77,17 @@ def load_config() -> dict:
             config.update(json.load(handle))
     except (FileNotFoundError, json.JSONDecodeError):
         pass
+    # Migration des anciens mappings : M2 n'est plus piloté en MIDI et la
+    # note 3 appartient à M1. Corrige aussi un ancien conflit enregistré où
+    # M1 partageait la note 1/2 avec Stop ou Play.
+    config.pop("controller_map_metronome_2", None)
+    protected = {
+        tuple(config.get("controller_map_stop") or ()),
+        tuple(config.get("controller_map_play") or ()),
+        tuple(config.get("controller_map_loop") or ()),
+    }
+    if tuple(config.get("controller_map_metronome") or ()) in protected:
+        config["controller_map_metronome"] = list(DEFAULTS["controller_map_metronome"])
     return config
 
 

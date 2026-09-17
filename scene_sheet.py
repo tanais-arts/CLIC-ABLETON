@@ -6,7 +6,8 @@ beat_display.py (`_apply_scene_sheet_row`) et README.md.
 Colonnes attendues dans la première ligne (n'importe quel ordre, insensible
 à la casse) : MES (numéro de mesure depuis le début du morceau, entier),
 COUNT (temps par mesure pour cette mesure, entier), HIGHLIGHT (1 = mesure à
-surligner, 0/vide = normal), LABEL (texte libre).
+surligner, 0/vide = normal), LABEL (texte libre), LOOP (optionnel : 1 = rend
+la boucle activable, 0 = la rend inactivable, vide = conserve l'état courant).
 
 Fichier absent, illisible, mal formé, ou openpyxl non installé -> None :
 c'est le comportement "normal, pas de feuille" attendu par beat_display.py,
@@ -16,8 +17,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
+import unicodedata
 
 REQUIRED_COLUMNS = ("MES", "COUNT", "HIGHLIGHT", "LABEL")
+
+
+def _canonical_scene_name(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name.replace("’", "'"))
+    normalized = normalized.encode("ascii", "ignore").decode().lower()
+    normalized = re.sub(r"\b[ldjtmns]['’]", "", normalized)
+    return "".join(character for character in normalized if character.isalnum())
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,7 @@ class SceneSheetRow:
     count: int | None
     highlight: bool
     label: str
+    loop: int | None = None
 
 
 class SceneSheet:
@@ -83,6 +94,19 @@ class SceneSheet:
                 return mes
         return None
 
+    def previous_loop_marker(self, mes: int) -> int | None:
+        """Dernière mesure LOOP=1 située à `mes` ou avant."""
+        markers = [bar for bar, row in self._rows.items() if bar <= mes and row.loop == 1]
+        return max(markers) if markers else None
+
+    def next_loop_marker(self, mes: int) -> int | None:
+        """Première borne LOOP explicite (0 ou 1) strictement après `mes`."""
+        markers = [
+            bar for bar, row in self._rows.items()
+            if bar > mes and row.loop in {0, 1}
+        ]
+        return min(markers) if markers else None
+
 
 def load_scene_sheet(scene_name: str, base_dir: Path, log=print) -> SceneSheet | None:
     """Charge `<base_dir>/Feuilles/<scene_name>.xlsx` si le fichier existe, sinon None."""
@@ -90,7 +114,15 @@ def load_scene_sheet(scene_name: str, base_dir: Path, log=print) -> SceneSheet |
         return None
     path = base_dir / "Feuilles" / f"{scene_name}.xlsx"
     if not path.is_file():
-        return None
+        wanted = _canonical_scene_name(scene_name)
+        matches = [
+            candidate for candidate in (base_dir / "Feuilles").glob("*.xlsx")
+            if not candidate.name.startswith("~$")
+            and _canonical_scene_name(candidate.stem) == wanted
+        ]
+        if len(matches) != 1:
+            return None
+        path = matches[0]
     try:
         import openpyxl
     except ImportError:
@@ -105,6 +137,7 @@ def load_scene_sheet(scene_name: str, base_dir: Path, log=print) -> SceneSheet |
             str(name).strip().upper(): index
             for index, name in enumerate(header) if name is not None
         }
+        loop_column = columns.get("LOOP")
         missing = [col for col in REQUIRED_COLUMNS if col not in columns]
         if missing:
             log(f"Feuille de scène {path.name} ignorée : colonnes manquantes {missing}.")
@@ -126,7 +159,13 @@ def load_scene_sheet(scene_name: str, base_dir: Path, log=print) -> SceneSheet |
             highlight = values[columns["HIGHLIGHT"]] == 1
             label_value = values[columns["LABEL"]]
             label = str(label_value).strip() if label_value else ""
-            rows[mes] = SceneSheetRow(count=count, highlight=highlight, label=label)
+            loop = None
+            if loop_column is not None and values[loop_column] is not None:
+                try:
+                    loop = int(values[loop_column])
+                except (TypeError, ValueError):
+                    loop = None
+            rows[mes] = SceneSheetRow(count=count, highlight=highlight, label=label, loop=loop)
         return SceneSheet(rows)
     except Exception as exc:  # fichier corrompu/format inattendu : ne jamais bloquer l'appli
         log(f"Feuille de scène {path.name} ignorée : {exc}")

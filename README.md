@@ -36,10 +36,9 @@ pip install -r requirements.txt
 4. **Temps par mesure** est un indicateur non éditable : il affiche `1`
    pendant une scène numérique de préroll, puis le `COUNT` courant de la
    feuille de scène dès le lancement du morceau.
-5. Ajuster **Latence (ms)** une seule fois pour compenser le délai de
-   transmission/affichage perçu par le batteur (valeur positive = l'appli
-   affiche le temps un peu en avance). Ce réglage est mémorisé automatiquement
-   (fichier `config.json`) : le batteur n'a jamais besoin d'y toucher.
+5. Les champs **Latence clic (ms)** des réglages AUDIO compensent séparément
+   le délai de M1 et M2 sur leurs interfaces respectives. Une valeur positive
+   avance le clic ; elle agit dès la saisie et est mémorisée automatiquement.
 6. **Régler le tempo** : saisir la valeur voulue dans le champ "Régler le
    tempo" — elle est envoyée à toute la session Link (Live inclus) à la
    validation (flèches, touche Entrée ou en cliquant ailleurs), pas à chaque
@@ -83,7 +82,7 @@ pip install -r requirements.txt
    attendues (première ligne) : `MES` (numéro de mesure depuis le début du
    morceau), `COUNT` (temps par mesure pour cette mesure — pilote directement
    l'indicateur "Temps par mesure"), `HIGHLIGHT`
-   (`1` = mesure à surligner, `0`/vide = normale) et `LABEL` (texte libre,
+   (`1` = mesure à surligner, `0`/vide = normale), `LABEL` (texte libre,
    ex. INTRO/COUPLET/REFRAIN). Une mesure `HIGHLIGHT` fait clignoter le fond
    en **blanc** (au lieu du jaune/bleu habituel) sur **tous** les temps de la
    mesure, avec les chiffres/points eux-mêmes qui s'estompent du blanc vers
@@ -95,6 +94,13 @@ pip install -r requirements.txt
    comptage à une mesure donnée du morceau (ex. reprise en cours de
    répétition) : il ne déplace que le compteur local de CLIC, jamais la
    position de lecture réelle dans Live.
+   La colonne optionnelle `LOOP` pilote le bouton de boucle : `1` pose une
+   borne et rend le bouton activable, `0` pose une borne de sortie et le rend
+   inactivable une fois franchie, une cellule vide ne change pas son état.
+   Un appui après une borne `1` active la répétition de cette section au
+   passage de la prochaine borne explicite (`1` ou `0`). Un nouvel
+   appui demande une sortie propre à son prochain passage. Le logo clignote
+   pendant les quatre derniers temps avant un retour de boucle.
 
 ### Compilation de la bibliothèque Link (déjà faite dans ce projet)
 

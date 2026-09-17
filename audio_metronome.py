@@ -70,6 +70,9 @@ class AudioMetronome:
         self._click_up, _ = _load_wav_mono(_SOUNDS_DIR / DEFAULT_KIT / "click_up.wav")
         self.device_name: str | None = None
         self.channels: int = 2
+        self._prepared_click: np.ndarray
+        self._prepared_click_up: np.ndarray
+        self._prepare_buffers()
         self._stream: sd.OutputStream | None = None
         self._play_buf: np.ndarray | None = None
         self._play_pos: int = 0
@@ -78,6 +81,7 @@ class AudioMetronome:
     def configure(self, device_name: str, channels: int) -> None:
         self.device_name = device_name or None
         self.channels = 1 if channels == 1 else 2
+        self._prepare_buffers()
         if self._stream is not None:
             self._open_stream()
 
@@ -93,6 +97,7 @@ class AudioMetronome:
         self.kit_name = kit_name
         self._click, self._click_sr = click, click_sr
         self._click_up = click_up
+        self._prepare_buffers()
         if self._stream is not None:
             self._open_stream()
 
@@ -155,8 +160,12 @@ class AudioMetronome:
             return mono.reshape(-1, 1)
         return np.column_stack([mono, mono])
 
+    def _prepare_buffers(self) -> None:
+        """Prépare les deux samples au format de sortie hors du chemin temps réel."""
+        self._prepared_click = self._prepare(self._click)
+        self._prepared_click_up = self._prepare(self._click_up)
+
     def play(self, beat: int) -> None:
         if self._stream is None:
             return
-        mono = self._click_up if beat == 1 else self._click
-        self._pending = self._prepare(mono)
+        self._pending = self._prepared_click_up if beat == 1 else self._prepared_click

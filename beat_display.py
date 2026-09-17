@@ -29,7 +29,7 @@ from link_client import AbletonLink, LinkUnavailable
 from live_osc import LiveOSC
 from lyrics import LyricsSheet, load_lyrics, save_lyrics_line
 from scene_sheet import SceneSheet, SceneSheetRow, load_scene_sheet
-from web_server import BeatWebServer, SharedBeatState, project_phase
+from web_server import BeatWebServer, SharedBeatState
 
 CLOCK = 0xF8
 START = 0xFA
@@ -337,10 +337,9 @@ class App:
         self.root.minsize(520, 420)
 
         self.config = load_config()
-        # Valeur courante de la métrique (pilotée par la scène) pour le thread
-        # métronome, et dernière latence valide du Spinbox (voir _safe_int_var).
+        # Valeur courante de la métrique, pilotée par la scène et lue par le
+        # thread métronome.
         self._beats_per_bar_cache: int = self.config["beats_per_bar"]
-        self._latency_ms_cache: int = self.config["latency_ms"]
 
         # -- Source MIDI (repli pour les logiciels sans Link) --
         self._event_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -372,7 +371,8 @@ class App:
         # -- Métronome audio local (clic .wav, voir audio_metronome.py) : ne
         # commande plus le métronome interne de Live (sa signature globale
         # ne correspond pas à notre feuille de scène à mesures variables). --
-        self._metronome_on: bool = False
+        # M1 est actif par défaut à chaque lancement ; M2 reste manuel.
+        self._metronome_on: bool = True
         self._last_played_beat: int | None = None
         self._metronome_on_2: bool = False
         # Coupe silencieusement le clic quand le LABEL "END" (feuille de
@@ -385,6 +385,7 @@ class App:
         self._audio_metronome.configure(
             self.config["metronome_audio_device"], self.config["metronome_audio_channels"],
         )
+        self._audio_metronome.set_enabled(True)
         # Deuxième sortie (voir _build_ui metronome_frame_2) : jouée en
         # parallèle de la première quand activée, propre carte son/kit/latence.
         self._audio_metronome_2 = AudioMetronome()
@@ -438,10 +439,10 @@ class App:
         # navigation scènes, stop, lancer la scène) --
         self._controller_queue: "queue.Queue[list[int]]" = queue.Queue()
         self.controller = ControllerListener(self._controller_queue)
-        self._action_order = ["minus", "plus", "scene_prev", "scene_next", "stop", "play", "metronome", "metronome_2"]
+        self._action_order = ["minus", "plus", "scene_prev", "scene_next", "stop", "play", "metronome", "loop"]
         self._action_labels = {
             "minus": "−1", "plus": "+1", "scene_prev": "▲", "scene_next": "▼", "stop": "■", "play": "▶",
-            "metronome": "M1", "metronome_2": "M2",
+            "metronome": "M1", "metronome_2": "M2", "loop": "LOOP",
         }
         self._action_commands = {
             "minus": lambda: self._jump_beats(-1),
@@ -452,6 +453,7 @@ class App:
             "play": self._scene_launch,
             "metronome": self._toggle_metronome,
             "metronome_2": self._toggle_metronome_2,
+            "loop": self._on_loop_button_click,
         }
         self.controller_map: dict[str, tuple[str, int, int] | None] = {
             action: _as_key(self.config.get(f"controller_map_{action}"))
@@ -614,11 +616,15 @@ class App:
         # encore côté Live) — on les renvoie donc dès que Live répond.
         self._live_available = False
         self._live_last_seen = 0.0
-        # Bouton Boucle : structure visuelle prête, sans action métier tant
-        # que sa fonction n'est pas définie. États : unavailable/available/active.
-        self._loop_button_state = "available"
+        # Boucle pilotée par les marqueurs LOOP de la feuille de scène.
+        self._loop_button_state = "unavailable"
+        self._loop_start_bar: int | None = None
+        self._loop_end_bar: int | None = None
+        self._loop_exit_pending = False
+        self._loop_warning = False
 
         self._build_ui()
+        self._set_action_active("metronome", True)
         self._refresh_ports()
         if self.config.get("midi_port"):
             self.port_var.set(self.config["midi_port"])
@@ -769,13 +775,6 @@ class App:
             bg="#222222", fg=FG_TEXT, relief="sunken",
         ).pack(side="left", padx=(6, 16))
 
-        tk.Label(settings_frame, text="Latence (ms) :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
-        self.latency_var = tk.IntVar(value=self.config["latency_ms"])
-        tk.Spinbox(
-            settings_frame, from_=-60, to=60, increment=1, width=6,
-            textvariable=self.latency_var, command=self._on_settings_change,
-        ).pack(side="left", padx=6)
-
         self.dots_var = tk.BooleanVar(value=self.config["dots_only"])
         tk.Checkbutton(
             settings_frame, text="Points", variable=self.dots_var,
@@ -887,13 +886,20 @@ class App:
             btn.pack(fill="both", expand=True)
             return btn
 
-        def add_control(parent_row: tk.Frame, action: str, text: str, font_size: int = 14) -> None:
+        def add_control(
+            parent_row: tk.Frame, action: str, text: str,
+            font_size: int = 14, learnable: bool = True,
+        ) -> None:
             group = tk.Frame(parent_row, bg=BG_IDLE)
             group.pack(side="left", padx=4)
             mini = tk.Frame(group, bg=BG_IDLE)
             mini.pack(side="left", padx=(0, 2))
-            self.learn_buttons[action] = add_mini_button(mini, "A", lambda: self._start_learn(action))
-            self.clear_buttons[action] = add_mini_button(mini, "E", lambda: self._clear_assignment(action))
+            if learnable:
+                self.learn_buttons[action] = add_mini_button(mini, "A", lambda: self._start_learn(action))
+                self.clear_buttons[action] = add_mini_button(mini, "E", lambda: self._clear_assignment(action))
+            else:
+                mini.config(width=MINI_SIZE)
+                mini.pack_propagate(False)
             # macOS Aqua ignore le bg d'un tk.Button natif : on flashe ce cadre autour, pas le bouton.
             # Taille de la boîte fixée en pixels (pack_propagate(False)) plutôt qu'en
             # largeur/hauteur "caractères" du Button : cette dernière dépend de la
@@ -913,7 +919,7 @@ class App:
         # Glyphe ■ plus petit que ▶ à taille de police égale : agrandi.
         add_control(controls_row_1, "stop", "■", font_size=32)
         add_control(controls_row_1, "metronome", "M1")
-        add_control(controls_row_1, "metronome_2", "M2")
+        add_control(controls_row_1, "metronome_2", "M2", learnable=False)
         add_control(controls_row_2, "minus", "−1")
         add_control(controls_row_2, "plus", "+1")
         add_control(controls_row_2, "scene_prev", "▲")
@@ -1041,10 +1047,14 @@ class App:
         ).pack(side="left", padx=(6, 0))
         tk.Label(metronome_frame, text="Latence clic (ms) :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", padx=(16, 0))
         self.metronome_latency_var = tk.IntVar(value=self.config["metronome_audio_latency_ms"])
-        tk.Spinbox(
+        self.metronome_latency_spinbox = tk.Spinbox(
             metronome_frame, from_=-500, to=500, increment=5, width=6,
             textvariable=self.metronome_latency_var, command=self._on_metronome_audio_change,
-        ).pack(side="left", padx=(6, 0))
+        )
+        self.metronome_latency_spinbox.pack(side="left", padx=(6, 0))
+        self.metronome_latency_var.trace_add(
+            "write", lambda *_args: self._on_metronome_latency_change(),
+        )
 
         # -- Deuxième sortie métronome (2e musicien, propre carte son/kit/
         # latence), activée/désactivée par le bouton "M2" (_toggle_metronome_2). --
@@ -1084,10 +1094,14 @@ class App:
         ).pack(side="left", padx=(6, 0))
         tk.Label(metronome_frame_2, text="Latence clic (ms) :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", padx=(16, 0))
         self.metronome_latency_var_2 = tk.IntVar(value=self.config["metronome_audio_latency_ms_2"])
-        tk.Spinbox(
+        self.metronome_latency_spinbox_2 = tk.Spinbox(
             metronome_frame_2, from_=-500, to=500, increment=5, width=6,
             textvariable=self.metronome_latency_var_2, command=self._on_metronome_audio_change_2,
-        ).pack(side="left", padx=(6, 0))
+        )
+        self.metronome_latency_spinbox_2.pack(side="left", padx=(6, 0))
+        self.metronome_latency_var_2.trace_add(
+            "write", lambda *_args: self._on_metronome_latency_change_2(),
+        )
         self._refresh_metronome_devices()
 
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour piloter les mêmes boutons --
@@ -1246,6 +1260,7 @@ class App:
         if not self._scene_name:
             self.status_label.config(text="Aucun fichier XLSX disponible")
             return
+        self._reset_loop_state()
         self._scene_sheet = load_scene_sheet(
             self._scene_name, self.SCENE_SHEET_DIR, log=lambda msg: print(f"[Feuille de scène] {msg}"),
         )
@@ -1546,7 +1561,59 @@ class App:
             holder.config(bg=bg)
 
     def _on_loop_button_click(self, _event=None) -> None:
-        """Point d'entrée réservé à la future fonction du bouton Boucle."""
+        """Arme une boucle entre le LOOP=1 précédent et la prochaine borne
+        LOOP explicite (0 ou 1), ou demande sa sortie si elle est active."""
+        if self._loop_button_state == "active":
+            self._loop_exit_pending = True
+            return
+        if (
+            self._loop_button_state != "available"
+            or self._scene_sheet is None
+            or self._bar_count is None
+        ):
+            return
+        start_bar = self._scene_sheet.previous_loop_marker(self._bar_count)
+        end_bar = self._scene_sheet.next_loop_marker(self._bar_count)
+        if start_bar is None or end_bar is None:
+            return
+        self._loop_start_bar = start_bar
+        self._loop_end_bar = end_bar
+        self._loop_exit_pending = False
+        self._loop_warning = False
+        self._set_loop_button_state("active")
+
+    def _reset_loop_state(self) -> None:
+        self._loop_start_bar = None
+        self._loop_end_bar = None
+        self._loop_exit_pending = False
+        self._loop_warning = False
+        self._set_loop_button_state("unavailable")
+
+    def _apply_loop_marker(self, mes: int) -> None:
+        row = self._scene_sheet.get(mes) if self._scene_sheet is not None else None
+        if row is None or row.loop is None:
+            return
+        if row.loop == 0:
+            self._reset_loop_state()
+        elif row.loop == 1 and self._loop_button_state == "unavailable":
+            self._set_loop_button_state("available")
+
+    def _loop_beats_remaining(self, beat: int, fractional: float) -> float | None:
+        if (
+            self._loop_button_state != "active"
+            or self._loop_exit_pending
+            or self._scene_sheet is None
+            or self._bar_count is None
+            or self._loop_end_bar is None
+            or self._bar_count >= self._loop_end_bar
+        ):
+            return None
+        remaining = self._count_for_mes(self._bar_count) - ((beat - 1) + fractional)
+        remaining += sum(
+            self._count_for_mes(mes)
+            for mes in range(self._bar_count + 1, self._loop_end_bar)
+        )
+        return remaining
 
     def _set_loop_button_state(self, state: str) -> None:
         if state not in {"unavailable", "available", "active"}:
@@ -1556,13 +1623,19 @@ class App:
 
     def _render_loop_button(self, fractional: float = 0.0, connected: bool = False) -> None:
         state = self._loop_button_state
-        background = "#e0342b" if state == "active" else self._loop_button_gray
+        if state == "active" and self._loop_exit_pending and connected:
+            # Sortie demandée mais appliquée seulement à la prochaine borne :
+            # alterne rouge/gris au tempo pour confirmer immédiatement que
+            # l'appui de désactivation a bien été enregistré.
+            background = self._loop_button_gray if fractional < 0.5 else "#e0342b"
+        else:
+            background = "#e0342b" if state == "active" else self._loop_button_gray
         self.loop_button.config(
             bg=background, highlightbackground=background,
-            cursor="hand2" if state != "unavailable" else "arrow",
         )
         logo_visible = state == "available" or (
-            state == "active" and (not connected or fractional < 0.5)
+            state == "active"
+            and (not self._loop_warning or not connected or fractional < 0.5)
         )
         self.loop_button.itemconfigure("loop_icon", state="normal" if logo_visible else "hidden")
 
@@ -1604,11 +1677,6 @@ class App:
             pass
 
     def _on_settings_change(self) -> None:
-        try:
-            latency = int(self.latency_var.get())
-        except (tk.TclError, ValueError):
-            return
-        self.config["latency_ms"] = latency
         self.config["mode"] = self.mode_var.get()
         self._mode_cache = self.config["mode"]
         self.config["dots_only"] = self.dots_var.get()
@@ -1656,6 +1724,16 @@ class App:
         self.config["metronome_audio_latency_ms"] = self._metronome_latency_ms_cache
         save_config(self.config)
 
+    def _on_metronome_latency_change(self) -> None:
+        """Applique la latence M1 à chaque saisie valide, sans rouvrir le flux."""
+        try:
+            latency = max(-500, min(500, int(self.metronome_latency_var.get())))
+        except (tk.TclError, ValueError):
+            return
+        self._metronome_latency_ms_cache = latency
+        self.config["metronome_audio_latency_ms"] = latency
+        save_config(self.config)
+
     def _on_metronome_audio_change_2(self) -> None:
         device = self.metronome_device_var_2.get()
         if device == self.METRONOME_DEFAULT_DEVICE_LABEL:
@@ -1673,6 +1751,16 @@ class App:
             self.metronome_latency_var_2, "_metronome_latency_ms_cache_2",
         )
         self.config["metronome_audio_latency_ms_2"] = self._metronome_latency_ms_cache_2
+        save_config(self.config)
+
+    def _on_metronome_latency_change_2(self) -> None:
+        """Applique la latence M2 à chaque saisie valide, sans rouvrir le flux."""
+        try:
+            latency = max(-500, min(500, int(self.metronome_latency_var_2.get())))
+        except (tk.TclError, ValueError):
+            return
+        self._metronome_latency_ms_cache_2 = latency
+        self.config["metronome_audio_latency_ms_2"] = latency
         save_config(self.config)
 
     # --------------------------------------------------------- Ableton Link --
@@ -1957,6 +2045,7 @@ class App:
         # navigation.
         self._scene_sheet = None
         self._scene_sheet_row = None
+        self._reset_loop_state()
         self._scene_label_sticky = ""
         self.scene_label_label.config(text="")
         self.shared_state.set_scene_label("")
@@ -2013,6 +2102,7 @@ class App:
                 # Scène "tempo seul" : aucune feuille de scène ne s'applique.
                 self._scene_sheet = None
                 self._scene_sheet_row = None
+                self._reset_loop_state()
                 self._scene_label_sticky = ""
                 self.scene_label_label.config(text="")
                 self.shared_state.set_scene_label("")
@@ -2031,6 +2121,7 @@ class App:
                 launched_index = self._scene_index
                 self.root.after(2000, lambda: self._auto_advance_scene(launched_index))
             else:
+                self._reset_loop_state()
                 self.scene_name_label.config(fg=SCENE_LAUNCHED)
                 # Le smartphone n'affiche le vrai titre qu'à ce moment (pas de
                 # spoiler avant l'appui) : À SUIVRE jusqu'ici, nom révélé ici.
@@ -2111,6 +2202,7 @@ class App:
         clips en cours, comportement natif normal), puis (comme au 2e Stop) ramène
         le curseur à 1:1:1, en attente d'un start de scène."""
         self._metronome_end_muted = False
+        self._reset_loop_state()
         self.shared_state.set_metronome_end_muted(False)
         # Remet le temps par mesure à la valeur par défaut : une feuille de
         # scène peut l'avoir modifié (COUNT) pour son dernier temps joué, et
@@ -2325,7 +2417,7 @@ class App:
             self.live_osc.set_time_signature(count)
             self._live_time_signature_sent = count
 
-    def _apply_scene_sheet_row(self, mes: int) -> None:
+    def _apply_scene_sheet_row(self, mes: int, apply_loop_marker: bool = True) -> None:
         """Applique la ligne de la feuille de scène (scene_sheet.py) pour la
         mesure `mes` : COUNT (temps par mesure, avec retour à la valeur
         configurée si absent), HIGHLIGHT (consommé par _update_display) et
@@ -2333,9 +2425,12 @@ class App:
         arrive). Sans feuille (ou mesure hors feuille), comportement normal."""
         row = self._scene_sheet.get(mes) if self._scene_sheet is not None else None
         self._scene_sheet_row = row
+        if apply_loop_marker:
+            self._apply_loop_marker(mes)
         count = self._count_for_mes(mes)
         self.beats_var.set(count)
         self.midi_state.beats_per_bar = count
+        self._beats_per_bar_cache = count
         self._push_live_time_signature(count)
         if row is not None and row.label:
             self._scene_label_sticky = row.label
@@ -2426,6 +2521,7 @@ class App:
                 self._bar_count_prev_beat = 1
                 self.bar_count_label.config(text=f"Mesure {self._bar_count}")
                 self.shared_state.set_bar_count(self._bar_count)
+                self._apply_loop_marker(self._bar_count)
                 if self._pending_goto_jump_beats:
                     # Léger délai : une piste dont le clip démarre tout juste
                     # à cet instant précis (pas déjà en lecture depuis une
@@ -2442,7 +2538,28 @@ class App:
             bars_advanced = 1 if (beat == 1 and self._bar_count_prev_beat != 1) else 0
         if self._bar_count is not None and bars_advanced > 0:
             for _ in range(bars_advanced):
-                self._bar_count += 1
+                next_bar = self._bar_count + 1
+                if self._loop_button_state == "active" and next_bar == self._loop_end_bar:
+                    if self._loop_exit_pending:
+                        self._loop_start_bar = None
+                        self._loop_end_bar = None
+                        self._loop_exit_pending = False
+                        self._loop_warning = False
+                        self._set_loop_button_state("available")
+                    else:
+                        loop_start = self._loop_start_bar
+                        if loop_start is not None:
+                            loop_beats = sum(
+                                self._count_for_mes(mes)
+                                for mes in range(loop_start, next_bar)
+                            )
+                            self._jump_beats(-loop_beats)
+                            self._bar_count = loop_start
+                            self._bar_count_signature_pushed_for = None
+                            self._scene_label_sticky = self._scene_sheet.label_at_or_before(loop_start)
+                            self._apply_scene_sheet_row(loop_start)
+                            break
+                self._bar_count = next_bar
                 self._apply_scene_sheet_row(self._bar_count)
             self.bar_count_label.config(text=f"Mesure {self._bar_count}")
             self.shared_state.set_bar_count(self._bar_count)
@@ -2458,7 +2575,15 @@ class App:
             # changement réel tout en restant le plus proche possible de la
             # bascule. Ne touche ni beats_var ni la feuille/highlight
             # locaux, qui basculent toujours exactement au temps 1 suivant.
-            self._push_live_time_signature(self._count_for_mes(self._bar_count + 1))
+            next_bar = self._bar_count + 1
+            if (
+                self._loop_button_state == "active"
+                and not self._loop_exit_pending
+                and next_bar == self._loop_end_bar
+                and self._loop_start_bar is not None
+            ):
+                next_bar = self._loop_start_bar
+            self._push_live_time_signature(self._count_for_mes(next_bar))
             self._bar_count_signature_pushed_for = self._bar_count
         self._bar_count_prev_beat = beat
 
@@ -2481,10 +2606,7 @@ class App:
             if connected and not self._was_connected:
                 self._awaiting_downbeat = True
             self._was_connected = connected
-            phase = project_phase(
-                self.midi_state.phase(), self.midi_state.bpm, connected,
-                self._safe_int_var(self.latency_var, "_latency_ms_cache"),
-            )
+            phase = self.midi_state.phase()
             beat = int(phase % self.midi_state.beats_per_bar) + 1
             if connected and self._awaiting_downbeat and beat == 1:
                 self._awaiting_downbeat = False
@@ -2559,10 +2681,7 @@ class App:
                     self._link_prev_fractional = None
                     self._link_last_update_time = None
                 self._was_connected = connected
-                phase = project_phase(
-                    snapshot["phase"], snapshot["bpm"], connected,
-                    self._safe_int_var(self.latency_var, "_latency_ms_cache"),
-                )
+                phase = snapshot["phase"]
                 fractional = phase % 1.0
                 link_bars_advanced = 0
                 bar_start_ready = True
@@ -2675,8 +2794,6 @@ class App:
         phase Link n'atteigne réellement le début de mesure, et forcer le
         clic sur le temps 1 à cet instant-là le faisait partir en avance sur
         l'affichage (qui, lui, attend le vrai temps 1)."""
-        last_beat: int | None = None
-        last_beat_2: int | None = None
         while not self._metronome_thread_stop.is_set():
             if self._mode_cache == "link" and self.link is not None:
                 if self._metronome_on and not self._metronome_end_muted:
@@ -2694,20 +2811,12 @@ class App:
                                 "_metronome_prev_fractional", "_metronome_last_update_time",
                                 "_metronome_awaiting_downbeat", "_metronome_awaiting_scene_start",
                             )
-                            if beat is not None and beat != last_beat:
-                                last_beat = beat
+                            if beat is not None:
                                 self._audio_metronome.play(beat)
-                            elif beat is None:
-                                # Autorise le nouveau clic UP=1 même si le
-                                # dernier clic du préroll était lui aussi 1.
-                                last_beat = None
                         else:
-                            last_beat = None
                             self._metronome_awaiting_downbeat = True
                     except Exception:
                         pass
-                else:
-                    last_beat = None
                 if self._metronome_on_2 and not self._metronome_end_muted:
                     try:
                         quantum = float(max(1, self._beats_per_bar_cache))
@@ -2720,21 +2829,12 @@ class App:
                                 "_metronome_prev_fractional_2", "_metronome_last_update_time_2",
                                 "_metronome_awaiting_downbeat_2", "_metronome_awaiting_scene_start_2",
                             )
-                            if beat_2 is not None and beat_2 != last_beat_2:
-                                last_beat_2 = beat_2
+                            if beat_2 is not None:
                                 self._audio_metronome_2.play(beat_2)
-                            elif beat_2 is None:
-                                last_beat_2 = None
                         else:
-                            last_beat_2 = None
                             self._metronome_awaiting_downbeat_2 = True
                     except Exception:
                         pass
-                else:
-                    last_beat_2 = None
-            else:
-                last_beat = None
-                last_beat_2 = None
             self._metronome_thread_stop.wait(0.01)
 
     def _metronome_next_beat(
@@ -2774,6 +2874,7 @@ class App:
             setattr(self, last_update_attr, time.monotonic())
             return 1
         now = time.monotonic()
+        next_beat = None
         prev_fractional = getattr(self, prev_fractional_attr)
         last_update = getattr(self, last_update_attr)
         if prev_fractional is not None and last_update is not None:
@@ -2783,9 +2884,10 @@ class App:
             if wraps > 0:
                 beat_in_bar = getattr(self, beat_attr)
                 setattr(self, beat_attr, ((beat_in_bar - 1 + wraps) % int(quantum)) + 1)
+                next_beat = getattr(self, beat_attr)
         setattr(self, prev_fractional_attr, fractional)
         setattr(self, last_update_attr, now)
-        return getattr(self, beat_attr)
+        return next_beat
 
     # ----------------------------------------------------------- Display --
     def _get_canvas_item(self, key: str, create) -> tuple[int, bool]:
@@ -3068,6 +3170,12 @@ class App:
         self, beat: int, beats_per_bar: int, fractional: float, bpm: float | None, connected: bool, running: bool,
     ) -> None:
         self._set_action_active("play", connected and running)
+        loop_beats_remaining = self._loop_beats_remaining(beat, fractional)
+        self._loop_warning = (
+            connected
+            and loop_beats_remaining is not None
+            and 0 < loop_beats_remaining <= 4
+        )
         self._render_loop_button(fractional, connected)
         # En mode Link, le clic est déclenché par _metronome_loop (thread à
         # part, insensible aux gels de _poll/after() sous macOS) ; ici on ne
