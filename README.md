@@ -33,7 +33,9 @@ pip install -r requirements.txt
 3. Choisir la source **Ableton Link** (sélectionné par défaut). Dès que Link
    est activé côté Live, le nombre de "Pairs Link connectés" passe à 1 et le
    compteur se synchronise automatiquement — rien d'autre à régler.
-4. Ajuster **Temps par mesure** si le morceau n'est pas en 4/4.
+4. **Temps par mesure** est un indicateur non éditable : il affiche `1`
+   pendant une scène numérique de préroll, puis le `COUNT` courant de la
+   feuille de scène dès le lancement du morceau.
 5. Ajuster **Latence (ms)** une seule fois pour compenser le délai de
    transmission/affichage perçu par le batteur (valeur positive = l'appli
    affiche le temps un peu en avance). Ce réglage est mémorisé automatiquement
@@ -79,8 +81,8 @@ pip install -r requirements.txt
    Quand il existe, il permet de faire varier, mesure par mesure, le
    comptage/l'affichage sans y toucher à la main pendant le morceau. Colonnes
    attendues (première ligne) : `MES` (numéro de mesure depuis le début du
-   morceau), `COUNT` (temps par mesure pour cette mesure — remplace
-   temporairement "Temps par mesure", qui reflète la valeur en cours), `HIGHLIGHT`
+   morceau), `COUNT` (temps par mesure pour cette mesure — pilote directement
+   l'indicateur "Temps par mesure"), `HIGHLIGHT`
    (`1` = mesure à surligner, `0`/vide = normale) et `LABEL` (texte libre,
    ex. INTRO/COUPLET/REFRAIN). Une mesure `HIGHLIGHT` fait clignoter le fond
    en **blanc** (au lieu du jaune/bleu habituel) sur **tous** les temps de la

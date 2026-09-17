@@ -337,10 +337,8 @@ class App:
         self.root.minsize(520, 420)
 
         self.config = load_config()
-        # Dernières valeurs valides de beats_var/latency_var (Spinbox) : leur
-        # IntVar.get() lève TclError le temps où le champ est vidé pendant la
-        # frappe, ce qui plantait _poll() et gelait l'affichage/le métronome
-        # jusqu'à l'appui suivant (voir _safe_int_var).
+        # Valeur courante de la métrique (pilotée par la scène) pour le thread
+        # métronome, et dernière latence valide du Spinbox (voir _safe_int_var).
         self._beats_per_bar_cache: int = self.config["beats_per_bar"]
         self._latency_ms_cache: int = self.config["latency_ms"]
 
@@ -421,10 +419,12 @@ class App:
         # (re)connexion, pour ne jamais forcer le clic sur un temps 1 qui ne
         # correspond pas à la position réelle de Link (voir _metronome_next_beat).
         self._metronome_awaiting_downbeat = True
+        self._metronome_awaiting_scene_start = False
         self._metronome_beat_in_bar_2 = 1
         self._metronome_prev_fractional_2: float | None = None
         self._metronome_last_update_time_2: float | None = None
         self._metronome_awaiting_downbeat_2 = True
+        self._metronome_awaiting_scene_start_2 = False
         # -- Mode Offline (test sans Live/MIDI) --
         self._offline_playing: bool = False
         self._offline_beat_in_bar: int = 1
@@ -614,6 +614,9 @@ class App:
         # encore côté Live) — on les renvoie donc dès que Live répond.
         self._live_available = False
         self._live_last_seen = 0.0
+        # Bouton Boucle : structure visuelle prête, sans action métier tant
+        # que sa fonction n'est pas définie. États : unavailable/available/active.
+        self._loop_button_state = "available"
 
         self._build_ui()
         self._refresh_ports()
@@ -761,9 +764,9 @@ class App:
 
         tk.Label(settings_frame, text="Temps par mesure :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
         self.beats_var = tk.IntVar(value=self.config["beats_per_bar"])
-        tk.Spinbox(
-            settings_frame, from_=1, to=12, width=4, textvariable=self.beats_var,
-            command=self._on_settings_change,
+        tk.Label(
+            settings_frame, width=4, textvariable=self.beats_var,
+            bg="#222222", fg=FG_TEXT, relief="sunken",
         ).pack(side="left", padx=(6, 16))
 
         tk.Label(settings_frame, text="Latence (ms) :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
@@ -857,10 +860,14 @@ class App:
         # bouton +1). À gauche de chaque bouton : "A" (apprendre le code
         # MIDI) au-dessus de "E" (effacer l'apprentissage), eux aussi carrés
         # (taille fixe en pixels). --
-        controls_row_1 = tk.Frame(self.root, bg=BG_IDLE)
-        controls_row_1.pack(fill="x", padx=10, pady=(0, 2))
-        controls_row_2 = tk.Frame(self.root, bg=BG_IDLE)
-        controls_row_2.pack(fill="x", padx=10, pady=(0, 8))
+        controls_panel = tk.Frame(self.root, bg=BG_IDLE)
+        controls_panel.pack(fill="x", padx=10, pady=(0, 8))
+        controls_rows = tk.Frame(controls_panel, bg=BG_IDLE)
+        controls_rows.pack(side="left")
+        controls_row_1 = tk.Frame(controls_rows, bg=BG_IDLE)
+        controls_row_1.pack(fill="x", pady=(0, 2))
+        controls_row_2 = tk.Frame(controls_rows, bg=BG_IDLE)
+        controls_row_2.pack(fill="x")
         MINI_SIZE = 22  # pixels : taille fixe pour que A/E soient réellement carrés
         self.learn_buttons: dict[str, tk.Button] = {}
         self.clear_buttons: dict[str, tk.Button] = {}
@@ -911,6 +918,39 @@ class App:
         add_control(controls_row_2, "plus", "+1")
         add_control(controls_row_2, "scene_prev", "▲")
         add_control(controls_row_2, "scene_next", "▼")
+
+        # Presque la largeur d'un bouton M2, hauteur des deux rangées réunies.
+        # Canvas plutôt que tk.Button : Aqua ignore les couleurs de fond des
+        # boutons natifs, alors que l'état actif doit être franchement rouge.
+        self._loop_button_gray = self._control_buttons["metronome_2"].cget("background")
+        loop_button_holder = tk.Frame(
+            controls_panel, width=77, height=110, bg=self._loop_button_gray,
+        )
+        loop_button_holder.pack_propagate(False)
+        loop_button_holder.pack(side="left", padx=4)
+        self.loop_button = tk.Canvas(
+            loop_button_holder, bg=self._loop_button_gray,
+            highlightthickness=1, highlightbackground=self._loop_button_gray, cursor="arrow",
+        )
+        self.loop_button.pack(fill="both", expand=True)
+        self.loop_button.create_arc(
+            18, 35, 58, 75, start=28, extent=145, style="arc",
+            width=6, outline="#111111", tags="loop_icon",
+        )
+        self.loop_button.create_polygon(
+            16, 49, 17, 34, 30, 42, fill="#111111", outline="",
+            tags="loop_icon",
+        )
+        self.loop_button.create_arc(
+            18, 35, 58, 75, start=208, extent=145, style="arc",
+            width=6, outline="#111111", tags="loop_icon",
+        )
+        self.loop_button.create_polygon(
+            60, 61, 59, 76, 46, 68, fill="#111111", outline="",
+            tags="loop_icon",
+        )
+        self.loop_button.bind("<Button-1>", self._on_loop_button_click)
+        self._render_loop_button()
 
         # -- Réglages AUDIO/MIDI dans des fenêtres à part (plutôt qu'un
         # panneau repliable dans la fenêtre principale) : sur macOS Aqua, un
@@ -1505,6 +1545,27 @@ class App:
         if action not in self._action_flash_after_id:
             holder.config(bg=bg)
 
+    def _on_loop_button_click(self, _event=None) -> None:
+        """Point d'entrée réservé à la future fonction du bouton Boucle."""
+
+    def _set_loop_button_state(self, state: str) -> None:
+        if state not in {"unavailable", "available", "active"}:
+            raise ValueError(f"État de bouton Boucle inconnu : {state}")
+        self._loop_button_state = state
+        self._render_loop_button()
+
+    def _render_loop_button(self, fractional: float = 0.0, connected: bool = False) -> None:
+        state = self._loop_button_state
+        background = "#e0342b" if state == "active" else self._loop_button_gray
+        self.loop_button.config(
+            bg=background, highlightbackground=background,
+            cursor="hand2" if state != "unavailable" else "arrow",
+        )
+        logo_visible = state == "available" or (
+            state == "active" and (not connected or fractional < 0.5)
+        )
+        self.loop_button.itemconfigure("loop_icon", state="normal" if logo_visible else "hidden")
+
     def _poll_controller(self) -> None:
         try:
             while True:
@@ -1544,13 +1605,9 @@ class App:
 
     def _on_settings_change(self) -> None:
         try:
-            beats = max(1, int(self.beats_var.get()))
             latency = int(self.latency_var.get())
         except (tk.TclError, ValueError):
             return
-        self.midi_state.beats_per_bar = beats
-        self.config["beats_per_bar"] = beats
-        self._beats_per_bar_cache = beats
         self.config["latency_ms"] = latency
         self.config["mode"] = self.mode_var.get()
         self._mode_cache = self.config["mode"]
@@ -1812,8 +1869,8 @@ class App:
 
     def _jump_beats(self, beats: int) -> None:
         """Décale de `beats` temps le clip en cours de lecture de chaque
-        piste, sans déplacer le compteur général de Live (voir README.md) —
-        indépendant du mode Link/MIDI choisi pour l'affichage."""
+        piste, sans déplacer le compteur général de Live, les chiffres ni
+        les deux métronomes locaux (voir README.md)."""
         try:
             self.live_osc.jump_tracks_by(beats)
         except OSError as exc:
@@ -1941,6 +1998,18 @@ class App:
             # de flash, pas d'agrandissement (réservés aux scènes nommées).
             if self._scene_name.strip().isdigit():
                 self.live_osc.start_playing()
+                # Préroll batteur : les scènes numériques tournent en 1/4,
+                # donc le chiffre affiché et l'accent restent toujours sur 1.
+                # La vraie scène réappliquera ensuite son COUNT via sa feuille.
+                self.beats_var.set(1)
+                self.midi_state.beats_per_bar = 1
+                self._beats_per_bar_cache = 1
+                self._link_beat_in_bar = 1
+                self._metronome_beat_in_bar = 1
+                self._metronome_beat_in_bar_2 = 1
+                self._metronome_awaiting_scene_start = False
+                self._metronome_awaiting_scene_start_2 = False
+                self._push_live_time_signature(1)
                 # Scène "tempo seul" : aucune feuille de scène ne s'applique.
                 self._scene_sheet = None
                 self._scene_sheet_row = None
@@ -1976,6 +2045,14 @@ class App:
                 self._bar_count_prev_beat = None
                 self._bar_count_signature_pushed_for = None
                 self._awaiting_bar_start = True
+                # Même ancrage que l'affichage : M1/M2 attendent la prochaine
+                # frontière de noire, puis repartent par un clic UP sur 1.
+                # Ne pas utiliser phase % quantum ici : après le préroll 1/4,
+                # la phase absolue Link peut correspondre à 2, 3 ou 4 en 4/4.
+                self._metronome_beat_in_bar = 1
+                self._metronome_awaiting_scene_start = True
+                self._metronome_beat_in_bar_2 = 1
+                self._metronome_awaiting_scene_start_2 = True
                 self.bar_count_label.config(text="")
                 self.shared_state.set_bar_count(None)
                 # Feuille de scène XLSX (Feuilles/<nom de scène>.xlsx, voir
@@ -2414,7 +2491,10 @@ class App:
             running = connected  # présence réelle du clock, avant masquage
             connected = connected and not self._awaiting_downbeat
             self._update_bar_count(connected, beat, phase % 1.0)
-            self._update_display(beat, self.midi_state.beats_per_bar, phase % 1.0, self.midi_state.bpm, connected, running)
+            self._update_display(
+                beat, self.midi_state.beats_per_bar, phase % 1.0,
+                self.midi_state.bpm, connected, running,
+            )
             self.shared_state.update(
                 self.midi_state.phase(), self.midi_state.beats_per_bar,
                 self.midi_state.bpm, connected, running, "midi",
@@ -2485,14 +2565,28 @@ class App:
                 )
                 fractional = phase % 1.0
                 link_bars_advanced = 0
-                if self._awaiting_downbeat or self._awaiting_bar_start:
+                bar_start_ready = True
+                if self._awaiting_bar_start:
+                    # Le préroll numérique est en 1/4 : quand la vraie scène
+                    # repasse par exemple en 4/4, phase % 4 conserve la
+                    # position absolue Link (après 6 temps, il donnerait 3).
+                    # Affiche donc 1 dès le lancement, puis ancre notre
+                    # compteur local sur la prochaine frontière de temps.
+                    previous_fractional = self._link_prev_fractional
+                    bar_start_ready = (
+                        previous_fractional is not None
+                        and fractional < previous_fractional - 0.5
+                    )
+                    self._link_prev_fractional = fractional
+                    self._link_last_update_time = time.monotonic()
+                    self._link_beat_in_bar = 1
+                    beat = 1
+                    if bar_start_ready:
+                        self._awaiting_downbeat = False
+                elif self._awaiting_downbeat:
                     # Détection du premier vrai temps 1 (reconnexion Link ou
-                    # lancement de scène) : Live aligne réellement les clips
-                    # lancés sur ce quantum (quantification globale, cf. Link),
-                    # donc ce modulo est fiable ICI, à un instant donné.
-                    # Contrairement au comptage en continu ci-dessous, il ne
-                    # doit PAS servir une fois la mesure en cours (voir
-                    # _link_beat_in_bar plus bas).
+                    # démarrage initial) : le modulo Link est fiable tant que
+                    # le quantum n'a pas été changé par un préroll numérique.
                     beat = int(phase % quantum) + 1
                     if connected and self._awaiting_downbeat and beat == 1:
                         self._awaiting_downbeat = False
@@ -2531,8 +2625,13 @@ class App:
                     self._link_last_update_time = now
                     beat = self._link_beat_in_bar
                 connected = connected and not self._awaiting_downbeat
-                self._update_bar_count(connected, beat, fractional, link_bars_advanced)
-                self._update_display(beat, int(quantum), fractional, snapshot["bpm"], connected, snapshot["is_playing"])
+                self._update_bar_count(
+                    connected and bar_start_ready, beat, fractional, link_bars_advanced,
+                )
+                self._update_display(
+                    beat, int(quantum), fractional,
+                    snapshot["bpm"], connected, snapshot["is_playing"],
+                )
                 self._update_link_peers_label(link.num_peers)
                 self._on_link_tempo_observed(snapshot["bpm"])
                 # Phase relative à la mesure en cours (0..quantum), déjà bornée
@@ -2593,11 +2692,15 @@ class App:
                             beat = self._metronome_next_beat(
                                 quantum, snapshot, "_metronome_beat_in_bar",
                                 "_metronome_prev_fractional", "_metronome_last_update_time",
-                                "_metronome_awaiting_downbeat",
+                                "_metronome_awaiting_downbeat", "_metronome_awaiting_scene_start",
                             )
                             if beat is not None and beat != last_beat:
                                 last_beat = beat
                                 self._audio_metronome.play(beat)
+                            elif beat is None:
+                                # Autorise le nouveau clic UP=1 même si le
+                                # dernier clic du préroll était lui aussi 1.
+                                last_beat = None
                         else:
                             last_beat = None
                             self._metronome_awaiting_downbeat = True
@@ -2615,11 +2718,13 @@ class App:
                             beat_2 = self._metronome_next_beat(
                                 quantum, snapshot_2, "_metronome_beat_in_bar_2",
                                 "_metronome_prev_fractional_2", "_metronome_last_update_time_2",
-                                "_metronome_awaiting_downbeat_2",
+                                "_metronome_awaiting_downbeat_2", "_metronome_awaiting_scene_start_2",
                             )
                             if beat_2 is not None and beat_2 != last_beat_2:
                                 last_beat_2 = beat_2
                                 self._audio_metronome_2.play(beat_2)
+                            elif beat_2 is None:
+                                last_beat_2 = None
                         else:
                             last_beat_2 = None
                             self._metronome_awaiting_downbeat_2 = True
@@ -2634,7 +2739,8 @@ class App:
 
     def _metronome_next_beat(
         self, quantum: float, snapshot: dict,
-        beat_attr: str, prev_fractional_attr: str, last_update_attr: str, awaiting_attr: str,
+        beat_attr: str, prev_fractional_attr: str, last_update_attr: str,
+        awaiting_attr: str, scene_start_attr: str,
     ) -> int | None:
         """Calcule le temps courant dans la mesure pour une sortie métronome
         (voir _metronome_loop) : rattrape d'un coup le nombre exact de temps
@@ -2648,6 +2754,17 @@ class App:
         pour ne jamais déclencher un clic "temps 1" avant le vrai début de
         mesure côté Link."""
         fractional = snapshot["phase"] % 1.0
+        if getattr(self, scene_start_attr):
+            previous_fractional = getattr(self, prev_fractional_attr)
+            now = time.monotonic()
+            setattr(self, prev_fractional_attr, fractional)
+            setattr(self, last_update_attr, now)
+            setattr(self, beat_attr, 1)
+            if previous_fractional is None or fractional >= previous_fractional - 0.5:
+                return None
+            setattr(self, scene_start_attr, False)
+            setattr(self, awaiting_attr, False)
+            return 1
         if getattr(self, awaiting_attr):
             if int(snapshot["phase"] % quantum) + 1 != 1:
                 return None
@@ -2951,6 +3068,7 @@ class App:
         self, beat: int, beats_per_bar: int, fractional: float, bpm: float | None, connected: bool, running: bool,
     ) -> None:
         self._set_action_active("play", connected and running)
+        self._render_loop_button(fractional, connected)
         # En mode Link, le clic est déclenché par _metronome_loop (thread à
         # part, insensible aux gels de _poll/after() sous macOS) ; ici on ne
         # s'en occupe qu'en MIDI Clock, dont l'état n'existe que via _poll.
