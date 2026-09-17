@@ -2143,32 +2143,32 @@ class App:
         self.scene_name_label.config(fg=SCENE_NOT_LAUNCHED)
         self.shared_state.set_scene_name("À SUIVRE")
         self.shared_state.set_scene_launched(False)
-        # Changer de sélection annule le comptage de mesures en cours : il ne
-        # doit reprendre qu'au lancement réel de la scène qui sera affichée.
-        self._bar_count = None
-        self._bar_count_prev_beat = None
-        self._bar_count_signature_pushed_for = None
-        self._awaiting_bar_start = False
-        self.bar_count_label.config(text="")
-        self.shared_state.set_bar_count(None)
-        # Idem pour la feuille de scène (COUNT/HIGHLIGHT/LABEL) : elle ne
-        # s'applique qu'à la scène effectivement lancée, pas à une simple
-        # navigation.
-        self._scene_sheet = None
-        self._scene_sheet_row = None
-        self._reset_loop_state()
-        self._scene_label_sticky = ""
-        self.scene_label_label.config(text="")
-        self.shared_state.set_scene_label("")
-        self._next_scene_label_sticky = ""
-        self.next_scene_label_label.config(text="")
-        self.next_scene_label_label.pack_forget()
-        self.shared_state.set_next_scene_label("")
-        self._lyrics_sheet = None
-        self._lyrics_bar_beats = []
-        self._lyrics_line_fonts = {}
-        self._lyrics_close_editor()
-        self._hide_lyrics_scroll_items()
+        if self._bar_count is None and not self._awaiting_bar_start:
+            # Hors lecture, une navigation repart d'un état vierge. Pendant
+            # un morceau en cours, les flèches ne doivent surtout pas couper
+            # la feuille XLSX active : elles ne font que préparer la scène
+            # suivante à lancer.
+            self._bar_count = None
+            self._bar_count_prev_beat = None
+            self._bar_count_signature_pushed_for = None
+            self._awaiting_bar_start = False
+            self.bar_count_label.config(text="")
+            self.shared_state.set_bar_count(None)
+            self._scene_sheet = None
+            self._scene_sheet_row = None
+            self._reset_loop_state()
+            self._scene_label_sticky = ""
+            self.scene_label_label.config(text="")
+            self.shared_state.set_scene_label("")
+            self._next_scene_label_sticky = ""
+            self.next_scene_label_label.config(text="")
+            self.next_scene_label_label.pack_forget()
+            self.shared_state.set_next_scene_label("")
+            self._lyrics_sheet = None
+            self._lyrics_bar_beats = []
+            self._lyrics_line_fonts = {}
+            self._lyrics_close_editor()
+            self._hide_lyrics_scroll_items()
         try:
             self.live_osc.set_selected_scene(new_index)
             self.live_osc.get_scene_name(new_index)
