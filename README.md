@@ -98,15 +98,18 @@ pip install -r requirements.txt
    borne et rend le bouton activable, `0` pose une borne de sortie et le rend
    inactivable une fois franchie, une cellule vide ne change pas son état.
    Un appui après une borne `1` active la répétition de cette section au
-   passage de la prochaine borne explicite (`1` ou `0`). Un nouvel
+   passage de la prochaine borne explicite (`1` ou `0`). L'ordre de retour
+   est envoyé à Live dès le début du dernier temps (ex. sur le `4` en 4/4),
+   puis l'affichage revient à la borne de départ au `1` suivant. Un nouvel
    appui demande une sortie propre à son prochain passage. Le logo clignote
    pendant les quatre derniers temps avant un retour de boucle.
 9. **Urgence audio** : le bouton Attention, à droite de LOOP, met
    immédiatement les volumes de toutes les pistes Live à `0` (−∞ dB), sans
    arrêter le transport, les métronomes locaux, les labels, les paroles ni
    leur suivi. Le bouton reste rouge et le message rouge clignotant
-   « Vous êtes en roue libre ! » reste affiché. Cette action ne restaure pas
-   automatiquement les volumes précédents.
+   « Vous êtes en roue libre ! » reste affiché. Au lancement d'une nouvelle
+   scène, toutes les pistes reviennent à `0 dB`, sauf la piste nommée
+   `TEMOIN`, qui reste à −∞ dB ; l'alerte disparaît alors.
 
 ### Compilation de la bibliothèque Link (déjà faite dans ce projet)
 

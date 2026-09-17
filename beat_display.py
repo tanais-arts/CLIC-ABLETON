@@ -57,6 +57,7 @@ NEXT_LABEL_ANNOUNCE_BEATS = 8  # n'annonce (clignotement) le label suivant qu'à
 SCENE_FLASH_PULSE = 0.15  # secondes par flash
 SCENE_FLASH_GAP = 0.1  # secondes entre les deux flashs
 FG_TEXT = "#f5f5f5"
+LIVE_ZERO_DB_VOLUME = 0.85
 
 
 def _lerp_color(start: str, end: str, t: float) -> str:
@@ -362,6 +363,7 @@ class App:
         self._scene_index: int | None = None
         self._scene_count: int | None = None
         self._live_num_tracks: int | None = None
+        self._live_track_names: dict[int, str] = {}
         self._scene_name: str = ""
         # Tempo d'origine du morceau en cours, lu dans le nom de la scène qui
         # précède la scène du morceau (convention du set : ex. morceau "OVLM"
@@ -621,10 +623,13 @@ class App:
         self._loop_button_state = "unavailable"
         self._loop_start_bar: int | None = None
         self._loop_end_bar: int | None = None
+        self._loop_jump_sent_for: int | None = None
         self._loop_exit_pending = False
         self._loop_warning = False
         self._emergency_active = False
         self._emergency_waiting_for_tracks = False
+        self._emergency_restore_pending = False
+        self._emergency_restore_waiting_names: set[int] = set()
 
         self._build_ui()
         self._set_action_active("metronome", True)
@@ -1609,6 +1614,7 @@ class App:
             return
         self._loop_start_bar = start_bar
         self._loop_end_bar = end_bar
+        self._loop_jump_sent_for = None
         self._loop_exit_pending = False
         self._loop_warning = False
         self._set_loop_button_state("active")
@@ -1616,6 +1622,7 @@ class App:
     def _reset_loop_state(self) -> None:
         self._loop_start_bar = None
         self._loop_end_bar = None
+        self._loop_jump_sent_for = None
         self._loop_exit_pending = False
         self._loop_warning = False
         self._set_loop_button_state("unavailable")
@@ -1692,6 +1699,47 @@ class App:
                 self.live_osc.set_track_volume(track_index, 0.0)
         except OSError as exc:
             self.status_label.config(text=f"Erreur OSC : {exc}")
+
+    def _begin_emergency_restore(self) -> None:
+        """Au lancement suivant, remet les pistes à 0 dB sauf TEMOIN."""
+        if not self._emergency_active:
+            return
+        self._emergency_waiting_for_tracks = False
+        self._emergency_restore_pending = True
+        if self._live_num_tracks is None:
+            try:
+                self.live_osc.get_num_tracks()
+            except OSError as exc:
+                self.status_label.config(text=f"Erreur OSC : {exc}")
+            return
+        self._emergency_restore_waiting_names = {
+            track_index for track_index in range(self._live_num_tracks)
+            if track_index not in self._live_track_names
+        }
+        if not self._emergency_restore_waiting_names:
+            self._restore_live_tracks_after_emergency()
+            return
+        try:
+            for track_index in self._emergency_restore_waiting_names:
+                self.live_osc.get_track_name(track_index)
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC : {exc}")
+
+    def _restore_live_tracks_after_emergency(self) -> None:
+        if self._live_num_tracks is None:
+            return
+        try:
+            for track_index in range(self._live_num_tracks):
+                name = self._live_track_names.get(track_index, "").strip().upper()
+                volume = 0.0 if name == "TEMOIN" else LIVE_ZERO_DB_VOLUME
+                self.live_osc.set_track_volume(track_index, volume)
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC : {exc}")
+            return
+        self._emergency_active = False
+        self._emergency_restore_pending = False
+        self._emergency_restore_waiting_names.clear()
+        self._render_emergency_button()
 
     def _render_emergency_button(self, fractional: float = 0.0, connected: bool = False) -> None:
         background = "#e0342b" if self._emergency_active else self._loop_button_gray
@@ -2138,6 +2186,7 @@ class App:
             return
         try:
             self.live_osc.fire_scene(self._scene_index)
+            self._begin_emergency_restore()
             # Fader 16 remis à 0% de modification (position centrale) à
             # chaque lancement de scène, feuille de morceau ou tempo seul.
             self.hui_bridge_2.send_tempo_fader_feedback(self.TEMPO_FADER_CENTER_RAW)
@@ -2330,6 +2379,8 @@ class App:
                 # le seul signal fiable pour détecter un changement de projet.
                 self._live_last_seen = time.monotonic()
                 self._live_available = True
+                self._live_num_tracks = None
+                self._live_track_names.clear()
                 self._on_live_available()
             elif address == "/live/test":
                 self._live_last_seen = time.monotonic()
@@ -2346,7 +2397,9 @@ class App:
             elif address == "/live/song/get/num_tracks":
                 self._live_num_tracks = int(args[0])
                 self._reset_faders_beyond(self._live_num_tracks)
-                if self._emergency_waiting_for_tracks:
+                if self._emergency_restore_pending:
+                    self._begin_emergency_restore()
+                elif self._emergency_waiting_for_tracks:
                     self._silence_live_tracks()
             elif address == "/live/track/get/volume":
                 track_index, volume = int(args[0]), float(args[1])
@@ -2358,8 +2411,13 @@ class App:
                 self.hui_bridge_2.send_mute_feedback(track_index, muted)
             elif address == "/live/track/get/name":
                 track_index, name = int(args[0]), (args[1] or "")
+                self._live_track_names[track_index] = name
                 self.hui_bridge.send_name_feedback(track_index, name)
                 self.hui_bridge_2.send_name_feedback(track_index, name)
+                if track_index in self._emergency_restore_waiting_names:
+                    self._emergency_restore_waiting_names.discard(track_index)
+                    if self._emergency_restore_pending and not self._emergency_restore_waiting_names:
+                        self._restore_live_tracks_after_emergency()
             elif address == "/live/song/get/num_scenes":
                 self._scene_count = int(args[0])
             elif address == "/live/view/get/selected_scene":
@@ -2606,9 +2664,11 @@ class App:
             for _ in range(bars_advanced):
                 next_bar = self._bar_count + 1
                 if self._loop_button_state == "active" and next_bar == self._loop_end_bar:
-                    if self._loop_exit_pending:
+                    jump_already_sent = self._loop_jump_sent_for == self._bar_count
+                    if self._loop_exit_pending and not jump_already_sent:
                         self._loop_start_bar = None
                         self._loop_end_bar = None
+                        self._loop_jump_sent_for = None
                         self._loop_exit_pending = False
                         self._loop_warning = False
                         self._set_loop_button_state("available")
@@ -2619,7 +2679,11 @@ class App:
                                 self._count_for_mes(mes)
                                 for mes in range(loop_start, next_bar)
                             )
-                            self._jump_beats(-loop_beats)
+                            if self._loop_jump_sent_for != self._bar_count:
+                                # Filet de sécurité si le dernier temps n'a
+                                # pas été observé (poll retardé/interrompu).
+                                self._jump_beats(-loop_beats)
+                            self._loop_jump_sent_for = None
                             self._bar_count = loop_start
                             self._bar_count_signature_pushed_for = None
                             self._scene_label_sticky = self._scene_sheet.label_at_or_before(loop_start)
@@ -2629,6 +2693,27 @@ class App:
                 self._apply_scene_sheet_row(self._bar_count)
             self.bar_count_label.config(text=f"Mesure {self._bar_count}")
             self.shared_state.set_bar_count(self._bar_count)
+        elif (
+            self._bar_count is not None
+            and self._loop_button_state == "active"
+            and not self._loop_exit_pending
+            and self._bar_count + 1 == self._loop_end_bar
+            and self._loop_start_bar is not None
+            and beat == self.midi_state.beats_per_bar
+            and fractional >= 0.05
+            and self._loop_jump_sent_for != self._bar_count
+        ):
+            # Envoie le retour dès le début du dernier temps (ex. juste après
+            # l'apparition du 4 en 4/4), au lieu d'attendre le 1 suivant :
+            # Live/AbletonOSC dispose ainsi presque d'un temps entier pour
+            # appliquer le saut. La structure locale revient au départ au
+            # vrai changement de mesure, dans la branche ci-dessus.
+            loop_beats = sum(
+                self._count_for_mes(mes)
+                for mes in range(self._loop_start_bar, self._loop_end_bar)
+            )
+            self._jump_beats(-loop_beats)
+            self._loop_jump_sent_for = self._bar_count
         elif (
             self._bar_count is not None
             and beat == self.midi_state.beats_per_bar
