@@ -361,6 +361,7 @@ class App:
         # -- Navigation dans la colonne des scènes de Live (nom + précédente/suivante) --
         self._scene_index: int | None = None
         self._scene_count: int | None = None
+        self._live_num_tracks: int | None = None
         self._scene_name: str = ""
         # Tempo d'origine du morceau en cours, lu dans le nom de la scène qui
         # précède la scène du morceau (convention du set : ex. morceau "OVLM"
@@ -622,6 +623,8 @@ class App:
         self._loop_end_bar: int | None = None
         self._loop_exit_pending = False
         self._loop_warning = False
+        self._emergency_active = False
+        self._emergency_waiting_for_tracks = False
 
         self._build_ui()
         self._set_action_active("metronome", True)
@@ -832,6 +835,11 @@ class App:
         # Pas de pack() ici : le label n'est packé (voir _apply_scene_sheet_row)
         # que lorsqu'une annonce existe, pour que le label courant reste seul
         # au centre du groupe sinon (padx du next décentrerait la mesure sans lui).
+        self.emergency_label = tk.Label(
+            scene_label_row, text="", bg=BG_IDLE, fg="#ff2b2b",
+            font=("Helvetica", 16, "bold"),
+        )
+        self.emergency_label.pack(anchor="center")
 
         # -- Compteur de mesures depuis le lancement du morceau en cours --
         self.bar_count_label = tk.Label(
@@ -957,6 +965,29 @@ class App:
         )
         self.loop_button.bind("<Button-1>", self._on_loop_button_click)
         self._render_loop_button()
+
+        emergency_button_holder = tk.Frame(
+            controls_panel, width=77, height=110, bg=self._loop_button_gray,
+        )
+        emergency_button_holder.pack_propagate(False)
+        emergency_button_holder.pack(side="left", padx=4)
+        self.emergency_button = tk.Canvas(
+            emergency_button_holder, bg=self._loop_button_gray,
+            highlightthickness=1, highlightbackground=self._loop_button_gray, cursor="arrow",
+        )
+        self.emergency_button.pack(fill="both", expand=True)
+        self.emergency_button.create_polygon(
+            38, 25, 64, 77, 12, 77, fill="", outline="#111111",
+            width=5, joinstyle="round",
+        )
+        self.emergency_button.create_line(
+            38, 41, 38, 59, fill="#111111", width=6, capstyle="round",
+        )
+        self.emergency_button.create_oval(
+            35, 65, 41, 71, fill="#111111", outline="#111111",
+        )
+        self.emergency_button.bind("<Button-1>", self._activate_emergency)
+        self._render_emergency_button()
 
         # -- Réglages AUDIO/MIDI dans des fenêtres à part (plutôt qu'un
         # panneau repliable dans la fenêtre principale) : sur macOS Aqua, un
@@ -1639,6 +1670,38 @@ class App:
         )
         self.loop_button.itemconfigure("loop_icon", state="normal" if logo_visible else "hidden")
 
+    def _activate_emergency(self, _event=None) -> None:
+        """Coupe toutes les pistes Live sans arrêter l'horloge ni l'affichage."""
+        self._emergency_active = True
+        self._render_emergency_button()
+        if self._live_num_tracks is None:
+            self._emergency_waiting_for_tracks = True
+            try:
+                self.live_osc.get_num_tracks()
+            except OSError as exc:
+                self.status_label.config(text=f"Erreur OSC : {exc}")
+            return
+        self._silence_live_tracks()
+
+    def _silence_live_tracks(self) -> None:
+        if self._live_num_tracks is None:
+            return
+        self._emergency_waiting_for_tracks = False
+        try:
+            for track_index in range(self._live_num_tracks):
+                self.live_osc.set_track_volume(track_index, 0.0)
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC : {exc}")
+
+    def _render_emergency_button(self, fractional: float = 0.0, connected: bool = False) -> None:
+        background = "#e0342b" if self._emergency_active else self._loop_button_gray
+        self.emergency_button.config(bg=background, highlightbackground=background)
+        if self._emergency_active:
+            foreground = "#ff2b2b" if not connected or fractional < 0.5 else BG_IDLE
+            self.emergency_label.config(text="Vous êtes en roue libre !", fg=foreground)
+        else:
+            self.emergency_label.config(text="")
+
     def _poll_controller(self) -> None:
         try:
             while True:
@@ -2281,7 +2344,10 @@ class App:
                 if not any("Index out of range" in str(arg) for arg in args):
                     print(f"[OSC] erreur renvoyée par AbletonOSC : {args}")
             elif address == "/live/song/get/num_tracks":
-                self._reset_faders_beyond(int(args[0]))
+                self._live_num_tracks = int(args[0])
+                self._reset_faders_beyond(self._live_num_tracks)
+                if self._emergency_waiting_for_tracks:
+                    self._silence_live_tracks()
             elif address == "/live/track/get/volume":
                 track_index, volume = int(args[0]), float(args[1])
                 self.hui_bridge.send_volume_feedback(track_index, volume)
@@ -3170,6 +3236,7 @@ class App:
         self, beat: int, beats_per_bar: int, fractional: float, bpm: float | None, connected: bool, running: bool,
     ) -> None:
         self._set_action_active("play", connected and running)
+        self._render_emergency_button(fractional, connected)
         loop_beats_remaining = self._loop_beats_remaining(beat, fractional)
         self._loop_warning = (
             connected

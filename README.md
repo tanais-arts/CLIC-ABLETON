@@ -101,6 +101,12 @@ pip install -r requirements.txt
    passage de la prochaine borne explicite (`1` ou `0`). Un nouvel
    appui demande une sortie propre à son prochain passage. Le logo clignote
    pendant les quatre derniers temps avant un retour de boucle.
+9. **Urgence audio** : le bouton Attention, à droite de LOOP, met
+   immédiatement les volumes de toutes les pistes Live à `0` (−∞ dB), sans
+   arrêter le transport, les métronomes locaux, les labels, les paroles ni
+   leur suivi. Le bouton reste rouge et le message rouge clignotant
+   « Vous êtes en roue libre ! » reste affiché. Cette action ne restaure pas
+   automatiquement les volumes précédents.
 
 ### Compilation de la bibliothèque Link (déjà faite dans ce projet)
 
