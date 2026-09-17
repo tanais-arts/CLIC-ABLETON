@@ -74,6 +74,17 @@ _PAGE = """<!DOCTYPE html>
     font-size: 20vh; color: #f5f5f5;
     -webkit-user-select: none; user-select: none;
   }
+  /* Scènes chiffrées d'amorce (préroll, voir beat_display._scene_launch) :
+     un point qui pulse au tempo remplace le chiffre "1" fixe. */
+  #prerollDot {
+    display: none; width: 18vh; height: 18vh; border-radius: 50%;
+    background: #f5f5f5;
+  }
+  #prerollDot.pulse { animation: prerollPulse 300ms ease-out; }
+  @keyframes prerollPulse {
+    from { transform: scale(1.25); opacity: 1; }
+    to { transform: scale(0.85); opacity: 0.35; }
+  }
   #digit {
     display: none;
     font-size: 40vh; font-weight: bold; color: #f5f5f5;
@@ -130,6 +141,17 @@ _PAGE = """<!DOCTYPE html>
   }
   @keyframes sceneLabelNextPulse {
     from { color: #ffffff; }
+    to { color: transparent; }
+  }
+  /* Bouton d'urgence (voir beat_display._activate_emergency) : « ROUE LIBRE »
+     remplace le label de structure, rouge clignotant au même rythme que les
+     autres labels (retriggé à chaque temps, voir plus bas). */
+  #sceneLabelCurrent.emergency { color: #ff2b2b; }
+  #sceneLabelCurrent.emergency.pulse {
+    animation: roueLibrePulse 300ms steps(1, end);
+  }
+  @keyframes roueLibrePulse {
+    from { color: #ff2b2b; }
     to { color: transparent; }
   }
   #barCount {
@@ -277,6 +299,7 @@ _PAGE = """<!DOCTYPE html>
   </div>
   <div id="beat">
     <div id="dot">•</div>
+    <div id="prerollDot"></div>
     <div id="digit"></div>
     <div id="dotsPair"><div id="dotLeft" class="circle"></div><div id="dotRight" class="circle"></div></div>
     <div id="offline">OFFLINE</div>
@@ -299,6 +322,22 @@ function nudgeScrollForSafariChrome() {
 window.addEventListener('load', () => setTimeout(nudgeScrollForSafariChrome, 50));
 window.addEventListener('orientationchange', () => setTimeout(nudgeScrollForSafariChrome, 300));
 
+// Empêche la mise en veille de l'écran (attente ou lecture) : le Wake Lock
+// est relâché par le navigateur dès que l'onglet passe en arrière-plan, il
+// faut donc le redemander à chaque retour au premier plan.
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) {}
+}
+if ('wakeLock' in navigator) {
+  requestWakeLock();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') requestWakeLock();
+  });
+}
+
 const KEY = 'beatDisplayLatencyMs';
 const slider = document.getElementById('latencySlider');
 slider.value = localStorage.getItem(KEY) || 0;
@@ -308,6 +347,7 @@ slider.addEventListener('input', () => {
 
 let lastBeat = null;
 let lastBarPhase = 0;
+let lastPrerollPhase = 0;
 let lastSceneLaunched = false;
 const SCENE_FLASH_PULSE_MS = 150;
 const SCENE_FLASH_GAP_MS = 100;
@@ -322,6 +362,7 @@ function sceneFlashDouble() {
 }
 const beatEl = document.getElementById('beat');
 const dotEl = document.getElementById('dot');
+const prerollDotEl = document.getElementById('prerollDot');
 const digitEl = document.getElementById('digit');
 const dotsPairEl = document.getElementById('dotsPair');
 const dotLeftEl = document.getElementById('dotLeft');
@@ -620,6 +661,7 @@ async function poll() {
     document.body.classList.toggle('is-offline', !!data.offline);
     if (data.offline) {
       dotEl.style.display = 'none';
+      prerollDotEl.style.display = 'none';
       digitEl.style.display = 'none';
       dotsPairEl.style.display = 'none';
       scrollLineEl.style.display = 'none';
@@ -632,13 +674,29 @@ async function poll() {
     if (data.connected) {
       dotEl.style.display = 'none';
       scrollLineEl.style.display = 'none';
-      if (showDots) {
+      if (data.preroll) {
+        // Amorce chiffrée (voir beat_display._scene_launch) : un point qui
+        // pulse au tempo remplace le chiffre "1" fixe (toujours 1 en 1/4).
+        // Le chiffre restant coincé à 1, on détecte chaque nouveau temps par
+        // le passage à zéro de bar_phase, pas par un changement de data.beat.
+        digitEl.style.display = 'none';
+        dotsPairEl.style.display = 'none';
+        prerollDotEl.style.display = 'block';
+        const prerollPhase = data.bar_phase || 0;
+        if (data.bpm && prerollPhase < lastPrerollPhase) {
+          prerollDotEl.style.animationDuration = (60000 / data.bpm) + 'ms';
+          retrigger(prerollDotEl, 'pulse');
+        }
+        lastPrerollPhase = prerollPhase;
+      } else if (showDots) {
+        prerollDotEl.style.display = 'none';
         digitEl.style.display = 'none';
         dotsPairEl.style.display = 'flex';
         const leftFilled = data.beat % 2 === 1;
         dotLeftEl.classList.toggle('filled', leftFilled);
         dotRightEl.classList.toggle('filled', !leftFilled);
       } else {
+        prerollDotEl.style.display = 'none';
         dotsPairEl.style.display = 'none';
         digitEl.style.display = 'block';
         digitEl.textContent = data.beat;
@@ -658,10 +716,16 @@ async function poll() {
         // temps désormais.
         if (data.bpm) nextLabelPulseEl.style.animationDuration = (30000 / data.bpm) + 'ms';
         retrigger(nextLabelPulseEl, 'pulse');
+        if (data.emergency) {
+          const sceneLabelCurrentEl = document.getElementById('sceneLabelCurrent');
+          if (data.bpm) sceneLabelCurrentEl.style.animationDuration = (30000 / data.bpm) + 'ms';
+          retrigger(sceneLabelCurrentEl, 'pulse');
+        }
       }
     } else {
       digitEl.style.display = 'none';
       dotsPairEl.style.display = 'none';
+      prerollDotEl.style.display = 'none';
       lastBeat = null;
       nextClickAt = null;
       if (data.bpm && !data.running) {
@@ -690,10 +754,21 @@ async function poll() {
     document.getElementById('sceneName').textContent = data.scene_name || '';
     document.getElementById('sceneName').classList.toggle('launched', !!data.scene_launched);
     document.getElementById('barCount').textContent = data.bar_count ? ('Mes. ' + data.bar_count) : '';
-    document.getElementById('sceneLabelCurrent').textContent = data.scene_label || '';
+    const sceneLabelCurrentEl = document.getElementById('sceneLabelCurrent');
     const nextLabelEl = document.getElementById('sceneLabelNext');
-    nextLabelEl.textContent = data.next_scene_label ? (' ' + data.next_scene_label) : '';
-    nextLabelEl.classList.toggle('hasNext', !!data.next_scene_label);
+    if (data.emergency) {
+      // Remplace le label de structure, comme sur le grand écran, pas
+      // ajouté à côté : la ligne "à suivre" n'a aucun sens en urgence.
+      sceneLabelCurrentEl.textContent = 'ROUE LIBRE';
+      sceneLabelCurrentEl.classList.add('emergency');
+      nextLabelEl.textContent = '';
+      nextLabelEl.classList.remove('hasNext');
+    } else {
+      sceneLabelCurrentEl.textContent = data.scene_label || '';
+      sceneLabelCurrentEl.classList.remove('emergency', 'pulse');
+      nextLabelEl.textContent = data.next_scene_label ? (' ' + data.next_scene_label) : '';
+      nextLabelEl.classList.toggle('hasNext', !!data.next_scene_label);
+    }
     lyricsLinesCache = Array.isArray(data.lyrics_lines) ? data.lyrics_lines : [];
     if (typeof data.lyrics_song_beat === 'number') {
       lyricsBaseSongBeat = data.lyrics_song_beat;
@@ -784,6 +859,23 @@ _LEGACY_PAGE = """<!DOCTYPE html>
     text-align: center;
   }
   #dot { display: none; font-size: 20vh; color: #f5f5f5; margin: 1vh 0; }
+  /* Scènes chiffrées d'amorce (préroll, voir beat_display._scene_launch) :
+     un point qui pulse au tempo remplace le chiffre "1" fixe. */
+  #prerollDot {
+    display: none; width: 18vh; height: 18vh; border-radius: 50%;
+    background: #f5f5f5; margin: 1vh 0;
+  }
+  #prerollDot.pulse {
+    -webkit-animation: prerollPulse 300ms ease-out; animation: prerollPulse 300ms ease-out;
+  }
+  @-webkit-keyframes prerollPulse {
+    from { -webkit-transform: scale(1.25); opacity: 1; }
+    to { -webkit-transform: scale(0.85); opacity: 0.35; }
+  }
+  @keyframes prerollPulse {
+    from { transform: scale(1.25); opacity: 1; }
+    to { transform: scale(0.85); opacity: 0.35; }
+  }
   #digit { display: none; font-size: 40vh; font-weight: bold; color: #f5f5f5; margin: 1vh 0; }
   #dotsPair { display: none; margin: 1vh 0; }
   #dotsPair .circle {
@@ -899,6 +991,7 @@ _LEGACY_PAGE = """<!DOCTYPE html>
   </div>
   <div id="beat">
     <div id="dot">&bull;</div>
+    <div id="prerollDot"></div>
     <div id="digit">--</div>
     <div id="dotsPair"><span id="dotLeft" class="circle"></span><span id="dotRight" class="circle"></span></div>
     <div id="offline">OFFLINE</div>
@@ -911,6 +1004,19 @@ _LEGACY_PAGE = """<!DOCTYPE html>
   <button id="exitPromptBtn">EXIT</button>
   <div id="info">-- BPM</div>
 <script>
+// Empêche la mise en veille de l'écran (attente ou lecture), voir la même
+// logique dans la page moderne ci-dessus.
+var wakeLock = null;
+function requestWakeLock() {
+  navigator.wakeLock.request('screen').then(function (lock) { wakeLock = lock; }).catch(function () {});
+}
+if ('wakeLock' in navigator) {
+  requestWakeLock();
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') requestWakeLock();
+  });
+}
+
 var KEY = 'beatDisplayLatencyMs';
 var slider = document.getElementById('latencySlider');
 var saved = localStorage.getItem(KEY);
@@ -920,6 +1026,7 @@ slider.onchange = saveLatency;
 slider.oninput = saveLatency;
 
 var dotEl = document.getElementById('dot');
+var prerollDotEl = document.getElementById('prerollDot');
 var digitEl = document.getElementById('digit');
 var dotsPairEl = document.getElementById('dotsPair');
 var dotLeftEl = document.getElementById('dotLeft');
@@ -934,6 +1041,7 @@ var sceneLabelCurrentEl = document.getElementById('sceneLabelCurrent');
 var sceneLabelNextEl = document.getElementById('sceneLabelNext');
 var lastBeat = null;
 var lastBarPhase = 0;
+var lastPrerollPhase = 0;
 
 function retrigger(className) {
   // Force le recalcul de style pour rejouer l'animation même si la même
@@ -1220,6 +1328,7 @@ function render(data) {
   toggleStickyClass('is-offline', !!data.offline);
   if (data.offline) {
     dotEl.style.display = 'none';
+    prerollDotEl.style.display = 'none';
     digitEl.style.display = 'none';
     dotsPairEl.style.display = 'none';
     scrollLineEl.style.display = 'none';
@@ -1230,13 +1339,29 @@ function render(data) {
   if (data.connected) {
     dotEl.style.display = 'none';
     scrollLineEl.style.display = 'none';
-    if (showDots) {
+    if (data.preroll) {
+      // Amorce chiffrée (voir beat_display._scene_launch) : un point qui
+      // pulse au tempo remplace le chiffre "1" fixe (toujours 1 en 1/4).
+      // Le chiffre restant coincé à 1, on détecte chaque nouveau temps par
+      // le passage à zéro de bar_phase, pas par un changement de data.beat.
+      digitEl.style.display = 'none';
+      dotsPairEl.style.display = 'none';
+      prerollDotEl.style.display = 'block';
+      var prerollPhase = data.bar_phase || 0;
+      if (data.bpm && prerollPhase < lastPrerollPhase) {
+        prerollDotEl.style.animationDuration = (60000 / data.bpm) + 'ms';
+        retriggerEl(prerollDotEl, 'pulse');
+      }
+      lastPrerollPhase = prerollPhase;
+    } else if (showDots) {
+      prerollDotEl.style.display = 'none';
       digitEl.style.display = 'none';
       dotsPairEl.style.display = 'block';
       var leftFilled = data.beat % 2 === 1;
       dotLeftEl.className = leftFilled ? 'circle filled' : 'circle';
       dotRightEl.className = leftFilled ? 'circle' : 'circle filled';
     } else {
+      prerollDotEl.style.display = 'none';
       dotsPairEl.style.display = 'none';
       digitEl.style.display = 'block';
       digitEl.innerHTML = String(data.beat);
@@ -1254,6 +1379,7 @@ function render(data) {
   } else {
     digitEl.style.display = 'none';
     dotsPairEl.style.display = 'none';
+    prerollDotEl.style.display = 'none';
     lastBeat = null;
     nextClickAt = null;
     if (data.bpm && !data.running) {
@@ -1273,11 +1399,21 @@ function render(data) {
   sceneNameEl.innerHTML = data.scene_name ? data.scene_name : '';
   sceneNameEl.className = data.scene_launched ? 'launched' : '';
   barCountEl.innerHTML = data.bar_count ? ('Mes. ' + data.bar_count) : '';
-  sceneLabelCurrentEl.innerHTML = data.scene_label ? data.scene_label : '';
-  sceneLabelNextEl.innerHTML = data.next_scene_label ? (' ' + data.next_scene_label) : '';
-  // classList.toggle (pas une réaffectation de className) : préserve la
-  // classe "pulse" qui vient d'être (re)posée juste au-dessus par retriggerEl.
-  sceneLabelNextEl.classList.toggle('hasNext', !!data.next_scene_label);
+  if (data.emergency) {
+    // Remplace le label de structure, comme sur le grand écran, pas
+    // ajouté à côté : la ligne "à suivre" n'a aucun sens en urgence.
+    sceneLabelCurrentEl.innerHTML = 'ROUE LIBRE';
+    sceneLabelCurrentEl.style.color = '#ff2b2b';
+    sceneLabelNextEl.innerHTML = '';
+    sceneLabelNextEl.classList.remove('hasNext');
+  } else {
+    sceneLabelCurrentEl.innerHTML = data.scene_label ? data.scene_label : '';
+    sceneLabelCurrentEl.style.color = '';
+    sceneLabelNextEl.innerHTML = data.next_scene_label ? (' ' + data.next_scene_label) : '';
+    // classList.toggle (pas une réaffectation de className) : préserve la
+    // classe "pulse" qui vient d'être (re)posée juste au-dessus par retriggerEl.
+    sceneLabelNextEl.classList.toggle('hasNext', !!data.next_scene_label);
+  }
   lyricsLinesCache = (data.lyrics_lines && data.lyrics_lines.length) ? data.lyrics_lines : [];
   if (typeof data.lyrics_song_beat === 'number') {
     lyricsBaseSongBeat = data.lyrics_song_beat;
@@ -1359,6 +1495,8 @@ class SharedBeatState:
         self._lyrics_song_beat: float | None = None
         self._highlighted = False
         self._metronome_end_muted = False
+        self._emergency = False
+        self._preroll = False
 
     def update(
         self, phase: float, beats_per_bar: float, bpm: float | None,
@@ -1389,6 +1527,13 @@ class SharedBeatState:
     def set_scene_launched(self, launched: bool) -> None:
         with self._lock:
             self._scene_launched = launched
+
+    def set_preroll(self, preroll: bool) -> None:
+        """Scène chiffrée d'amorce (« tempo seul », voir beat_display._scene_launch,
+        toujours en 1/4) : la page web affiche un point qui pulse au tempo
+        à la place du chiffre "1" fixe."""
+        with self._lock:
+            self._preroll = preroll
 
     def set_bar_count(self, bar_count: int | None) -> None:
         """Numéro de mesure depuis le lancement du morceau en cours (voir
@@ -1448,6 +1593,13 @@ class SharedBeatState:
         with self._lock:
             self._metronome_end_muted = muted
 
+    def set_emergency(self, active: bool) -> None:
+        """Bouton d'urgence (voir beat_display._activate_emergency) : la page
+        web affiche « ROUE LIBRE » à la place des labels de structure tant que
+        c'est actif, même logique que le grand écran."""
+        with self._lock:
+            self._emergency = active
+
     def compute(self, latency_ms: float = 0.0) -> dict:
         """Calcule {beat, bpm, connected, running, mode} pour un décalage donné."""
         with self._lock:
@@ -1462,6 +1614,8 @@ class SharedBeatState:
             lyrics_song_beat = self._lyrics_song_beat
             highlighted = self._highlighted
             metronome_end_muted = self._metronome_end_muted
+            emergency = self._emergency
+            preroll = self._preroll
         # Le rafraîchissement (toutes les ~30ms) garde la référence quasi à
         # jour : on ajoute le petit delta réel au décalage demandé.
         elapsed_ms = (time.monotonic() - data["ref_monotonic"]) * 1000.0
@@ -1486,6 +1640,8 @@ class SharedBeatState:
             "lyrics_song_beat": lyrics_song_beat,
             "highlighted": highlighted,
             "metronome_end_muted": metronome_end_muted,
+            "emergency": emergency,
+            "preroll": preroll,
         }
 
 

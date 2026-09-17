@@ -58,6 +58,8 @@ SCENE_FLASH_PULSE = 0.15  # secondes par flash
 SCENE_FLASH_GAP = 0.1  # secondes entre les deux flashs
 FG_TEXT = "#f5f5f5"
 LIVE_ZERO_DB_VOLUME = 0.85
+EMERGENCY_FADE_MS = 1000  # durée du fondu des faders Live au bouton d'urgence
+EMERGENCY_FADE_STEPS = 10
 
 
 def _lerp_color(start: str, end: str, t: float) -> str:
@@ -630,6 +632,10 @@ class App:
         self._emergency_waiting_for_tracks = False
         self._emergency_restore_pending = False
         self._emergency_restore_waiting_names: set[int] = set()
+        # Dernier volume connu par piste (retours OSC), pour partir de la
+        # bonne valeur au fondu d'urgence plutôt que d'une position devinée.
+        self._live_track_volumes: dict[int, float] = {}
+        self._fade_after_id: str | None = None
 
         self._build_ui()
         self._set_action_active("metronome", True)
@@ -828,23 +834,25 @@ class App:
         # propre, centré (anchor="center").
         scene_label_row = tk.Frame(self.root, bg=BG_IDLE)
         scene_label_row.pack(fill="x", padx=10, pady=(0, 2))
-        scene_label_group = tk.Frame(scene_label_row, bg=BG_IDLE)
-        scene_label_group.pack(anchor="center")
+        self.scene_label_group = tk.Frame(scene_label_row, bg=BG_IDLE)
+        self.scene_label_group.pack(anchor="center")
         self.scene_label_label = tk.Label(
-            scene_label_group, text="", bg=BG_IDLE, fg="#7fb2ff", font=("Helvetica", 16, "bold"),
+            self.scene_label_group, text="", bg=BG_IDLE, fg="#7fb2ff", font=("Helvetica", 16, "bold"),
         )
         self.scene_label_label.pack(side="left")
         self.next_scene_label_label = tk.Label(
-            scene_label_group, text="", bg=BG_IDLE, fg="#ffffff", font=("Helvetica", 16, "bold"),
+            self.scene_label_group, text="", bg=BG_IDLE, fg="#ffffff", font=("Helvetica", 16, "bold"),
         )
         # Pas de pack() ici : le label n'est packé (voir _apply_scene_sheet_row)
         # que lorsqu'une annonce existe, pour que le label courant reste seul
         # au centre du groupe sinon (padx du next décentrerait la mesure sans lui).
+        # Remplace entièrement le groupe label de structure tant que l'urgence
+        # est active (voir _render_emergency_button), pas ajouté en dessous.
         self.emergency_label = tk.Label(
             scene_label_row, text="", bg=BG_IDLE, fg="#ff2b2b",
             font=("Helvetica", 16, "bold"),
         )
-        self.emergency_label.pack(anchor="center")
+        self._emergency_layout_active = False
 
         # -- Compteur de mesures depuis le lancement du morceau en cours --
         self.bar_count_label = tk.Label(
@@ -1334,6 +1342,7 @@ class App:
         self._apply_scene_sheet_row(self._bar_count_start)
         self.bar_count_label.config(text="")
         self.scene_name_label.config(text=self._scene_name, fg=SCENE_LAUNCHED)
+        self.shared_state.set_preroll(False)
         self.shared_state.set_scene_name(self._scene_name)
         self.shared_state.set_scene_launched(True)
         self.status_label.config(text="Lecture Offline")
@@ -1694,11 +1703,35 @@ class App:
         if self._live_num_tracks is None:
             return
         self._emergency_waiting_for_tracks = False
+        starts = {
+            track_index: self._live_track_volumes.get(track_index, LIVE_ZERO_DB_VOLUME)
+            for track_index in range(self._live_num_tracks)
+        }
+        self._fade_track_volumes(starts, 0.0)
+
+    def _fade_track_volumes(self, starts: dict[int, float], target: float, step: int = 0) -> None:
+        """Envoie le volume de chaque piste par petits pas linéaires entre
+        `starts[track]` et `target`, étalés sur EMERGENCY_FADE_MS : évite une
+        coupure/reprise brutale des faders au bouton d'urgence."""
+        if self._fade_after_id is not None:
+            self.root.after_cancel(self._fade_after_id)
+            self._fade_after_id = None
+        frac = (step + 1) / EMERGENCY_FADE_STEPS
         try:
-            for track_index in range(self._live_num_tracks):
-                self.live_osc.set_track_volume(track_index, 0.0)
+            for track_index, start in starts.items():
+                volume = start + (target - start) * frac
+                self.live_osc.set_track_volume(track_index, volume)
+                self._live_track_volumes[track_index] = volume
         except OSError as exc:
             self.status_label.config(text=f"Erreur OSC : {exc}")
+            return
+        if step + 1 < EMERGENCY_FADE_STEPS:
+            self._fade_after_id = self.root.after(
+                EMERGENCY_FADE_MS // EMERGENCY_FADE_STEPS,
+                lambda: self._fade_track_volumes(starts, target, step + 1),
+            )
+        else:
+            self._fade_after_id = None
 
     def _begin_emergency_restore(self) -> None:
         """Au lancement suivant, remet les pistes à 0 dB sauf TEMOIN."""
@@ -1744,9 +1777,18 @@ class App:
     def _render_emergency_button(self, fractional: float = 0.0, connected: bool = False) -> None:
         background = "#e0342b" if self._emergency_active else self._loop_button_gray
         self.emergency_button.config(bg=background, highlightbackground=background)
+        if self._emergency_active != self._emergency_layout_active:
+            self._emergency_layout_active = self._emergency_active
+            self.shared_state.set_emergency(self._emergency_active)
+            if self._emergency_active:
+                self.scene_label_group.pack_forget()
+                self.emergency_label.pack(anchor="center")
+            else:
+                self.emergency_label.pack_forget()
+                self.scene_label_group.pack(anchor="center")
         if self._emergency_active:
             foreground = "#ff2b2b" if not connected or fractional < 0.5 else BG_IDLE
-            self.emergency_label.config(text="Vous êtes en roue libre !", fg=foreground)
+            self.emergency_label.config(text="VOUS ETES EN ROUE LIBRE !", fg=foreground)
         else:
             self.emergency_label.config(text="")
 
@@ -2143,6 +2185,11 @@ class App:
         self.scene_name_label.config(fg=SCENE_NOT_LAUNCHED)
         self.shared_state.set_scene_name("À SUIVRE")
         self.shared_state.set_scene_launched(False)
+        # Ne touche PAS set_preroll ici : l'auto-avance après une scène
+        # "tempo seul" (voir _auto_advance_scene) déplace juste la sélection
+        # pendant que le préroll continue réellement de tourner dans Live —
+        # seuls un vrai lancement (_scene_launch), Stop ou l'offline y mettent
+        # fin (voir ces méthodes).
         if self._bar_count is None and not self._awaiting_bar_start:
             # Hors lecture, une navigation repart d'un état vierge. Pendant
             # un morceau en cours, les flèches ne doivent surtout pas couper
@@ -2187,6 +2234,11 @@ class App:
         try:
             self.live_osc.fire_scene(self._scene_index)
             self._begin_emergency_restore()
+            # Un LABEL "END" précédent coupe le clic (voir _apply_scene_sheet_row) ;
+            # tout lancement de scène (préroll chiffré ou vrai morceau) le
+            # réarme, sinon le métronome resterait muet indéfiniment ensuite.
+            self._metronome_end_muted = False
+            self.shared_state.set_metronome_end_muted(False)
             # Fader 16 remis à 0% de modification (position centrale) à
             # chaque lancement de scène, feuille de morceau ou tempo seul.
             self.hui_bridge_2.send_tempo_fader_feedback(self.TEMPO_FADER_CENTER_RAW)
@@ -2202,6 +2254,9 @@ class App:
                 # Préroll batteur : les scènes numériques tournent en 1/4,
                 # donc le chiffre affiché et l'accent restent toujours sur 1.
                 # La vraie scène réappliquera ensuite son COUNT via sa feuille.
+                # Sur smartphone, un point qui pulse au tempo remplace ce "1"
+                # fixe (voir SharedBeatState.set_preroll).
+                self.shared_state.set_preroll(True)
                 self.beats_var.set(1)
                 self.midi_state.beats_per_bar = 1
                 self._beats_per_bar_cache = 1
@@ -2211,6 +2266,14 @@ class App:
                 self._metronome_awaiting_scene_start = False
                 self._metronome_awaiting_scene_start_2 = False
                 self._push_live_time_signature(1)
+                # Préroll uniquement : pas de décompte de mesures tant que la
+                # vraie scène (auto-chargée ensuite) n'est pas lancée.
+                self._bar_count = None
+                self._bar_count_prev_beat = None
+                self._bar_count_signature_pushed_for = None
+                self._awaiting_bar_start = False
+                self.bar_count_label.config(text="")
+                self.shared_state.set_bar_count(None)
                 # Scène "tempo seul" : aucune feuille de scène ne s'applique.
                 self._scene_sheet = None
                 self._scene_sheet_row = None
@@ -2237,6 +2300,7 @@ class App:
                 self.scene_name_label.config(fg=SCENE_LAUNCHED)
                 # Le smartphone n'affiche le vrai titre qu'à ce moment (pas de
                 # spoiler avant l'appui) : À SUIVRE jusqu'ici, nom révélé ici.
+                self.shared_state.set_preroll(False)
                 self.shared_state.set_scene_name(self._scene_name)
                 self.shared_state.set_scene_launched(True)
                 if self._scene_flash_shown_for != self._scene_index:
@@ -2315,7 +2379,9 @@ class App:
         le curseur à 1:1:1, en attente d'un start de scène."""
         self._metronome_end_muted = False
         self._reset_loop_state()
+        self._begin_emergency_restore()
         self.shared_state.set_metronome_end_muted(False)
+        self.shared_state.set_preroll(False)
         # Remet le temps par mesure à la valeur par défaut : une feuille de
         # scène peut l'avoir modifié (COUNT) pour son dernier temps joué, et
         # rien ne le réinitialise sinon (ex. scène "tempo seul" suivante, qui
@@ -2403,6 +2469,7 @@ class App:
                     self._silence_live_tracks()
             elif address == "/live/track/get/volume":
                 track_index, volume = int(args[0]), float(args[1])
+                self._live_track_volumes[track_index] = volume
                 self.hui_bridge.send_volume_feedback(track_index, volume)
                 self.hui_bridge_2.send_volume_feedback(track_index, volume)
             elif address == "/live/track/get/mute":
