@@ -16,6 +16,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+import unicodedata
 import webbrowser
 from pathlib import Path
 from tkinter import font as tkfont, ttk
@@ -23,7 +24,7 @@ from tkinter import font as tkfont, ttk
 import rtmidi
 
 from audio_metronome import AudioMetronome, list_kits, list_output_devices
-from config import load_config, save_config
+from config import DEFAULT_HUI_TRACK_MAPPING, load_config, save_config
 from hui_bridge import HuiBridge
 from link_client import AbletonLink, LinkUnavailable
 from live_osc import LiveOSC
@@ -71,6 +72,15 @@ def _lerp_color(start: str, end: str, t: float) -> str:
     g = round(g1 + (g2 - g1) * t)
     b = round(b1 + (b2 - b1) * t)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _normalized_track_name(name: str) -> str:
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    return "".join(character for character in ascii_name.upper() if character.isalnum())
+
+
+def _is_temoin_track(name: str) -> bool:
+    return "TEMOIN" in _normalized_track_name(name)
 
 
 class ClockListener:
@@ -336,7 +346,7 @@ class App:
         # Les réglages AUDIO/MIDI vivent dans des fenêtres à part (voir
         # _make_settings_window) : la fenêtre principale n'a donc plus de
         # contenu qui grandit/rétrécit après coup, hors cette taille de départ.
-        self.root.geometry("710x1050+0+0")
+        self.root.geometry("640x1055+0+0")
         self.root.minsize(520, 420)
 
         self.config = load_config()
@@ -478,10 +488,13 @@ class App:
         # diagonale 1<->1 par défaut) : voir _open_hui_mapping_dialog. Le
         # fader 16 (tranche 7 du 2e port) est réservé au tempo (voir
         # TEMPO_FADER_ZONE/_apply_tempo_fader), donc exclu du mapping/clampé.
-        self._track_mapping: list[int] = list(self.config.get("hui_track_mapping", list(range(16))))
+        self._track_mapping: list[int] = list(
+            self.config.get("hui_track_mapping", DEFAULT_HUI_TRACK_MAPPING)
+        )
         if len(self._track_mapping) != 16:
-            self._track_mapping = list(range(16))
-        self._track_mapping = [min(v, 14) for v in self._track_mapping]
+            self._track_mapping = list(DEFAULT_HUI_TRACK_MAPPING)
+        self._track_mapping = self._sanitize_hui_mapping(self._track_mapping)
+        self.config["hui_track_mapping"] = self._track_mapping
         zone_map_1, zone_map_2 = self._hui_zone_maps(self._track_mapping)
         self.hui_bridge = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_1)
         # File des positions brutes (0-16383) du fader 16, remplie depuis le
@@ -630,14 +643,17 @@ class App:
         self._loop_warning = False
         self._emergency_active = False
         self._emergency_waiting_for_tracks = False
-        self._emergency_restore_pending = False
-        self._emergency_restore_waiting_names: set[int] = set()
+        self._emergency_volume_waiting: set[int] = set()
+        self._emergency_saved_volumes: dict[int, float] = {}
+        self._temoin_mute_pending = False
+        self._temoin_name_waiting: set[int] = set()
         # Dernier volume connu par piste (retours OSC), pour partir de la
         # bonne valeur au fondu d'urgence plutôt que d'une position devinée.
         self._live_track_volumes: dict[int, float] = {}
         self._fade_after_id: str | None = None
 
         self._build_ui()
+        self.root.bind("<Escape>", self._on_emergency_shortcut)
         self._set_action_active("metronome", True)
         self._refresh_ports()
         if self.config.get("midi_port"):
@@ -673,12 +689,12 @@ class App:
         # "naturelle" (plus petite, sections repliées) et écraserait la taille
         # fixée plus haut si on la posait avant ces pack() tardifs.
         self.root.update_idletasks()
-        self.root.geometry("710x1050+0+0")
+        self.root.geometry("640x1055+0+0")
         # Sur macOS, la fenêtre n'est réellement "mappée" par Aqua qu'au tout
         # début de mainloop() (update_idletasks() ne suffit pas) : Aqua peut
         # donc encore écraser la taille ci-dessus à ce moment-là. On la
         # reprogramme une fois mainloop lancé pour avoir le dernier mot.
-        self.root.after(50, lambda: self.root.geometry("710x1050+0+0"))
+        self.root.after(50, lambda: self.root.geometry("640x1055+0+0"))
         self._poll()
         self._ping_live()
         self._metronome_thread.start()
@@ -1206,8 +1222,13 @@ class App:
             hui_mapping_row, text="Configurer le mapping des faders…", command=self._open_hui_mapping_dialog,
         ).pack(side="left")
         tk.Label(
-            hui_mapping_row, text="  (fader 16 dédié au tempo, voir plus haut)", bg=BG_IDLE, fg="#888888",
+            hui_mapping_row, text="  (console 16 dédiée au tempo)", bg=BG_IDLE, fg="#888888",
         ).pack(side="left")
+        self.hui_mapping_summary = tk.Label(
+            midi_content, text=self._format_hui_mapping(), bg=BG_IDLE, fg="#bbbbbb",
+            justify="left", anchor="w", wraplength=620,
+        )
+        self.hui_mapping_summary.pack(fill="x", pady=(0, 6))
 
         status_row = tk.Frame(midi_content, bg=BG_IDLE)
         status_row.pack(fill="x", pady=(0, 4))
@@ -1403,6 +1424,7 @@ class App:
             print(f"[HUI] erreur de connexion : {exc}")
             return
         self._set_hui_listen(0, listen=True)
+        self.root.after(100, self._refresh_hui_feedback)
         self.hui_connect_btn.config(text="Déconnecter")
         self.config["hui_port"] = port_name
         save_config(self.config)
@@ -1428,9 +1450,21 @@ class App:
             print(f"[HUI] erreur de connexion : {exc}")
             return
         self._set_hui_listen(8, listen=True)
+        self.root.after(100, self._refresh_hui_feedback)
         self.hui_connect_btn_2.config(text="Déconnecter")
         self.config["hui_port_2"] = port_name
         save_config(self.config)
+
+    @staticmethod
+    def _sanitize_hui_mapping(mapping: list[int]) -> list[int]:
+        result: list[int] = []
+        used: set[int] = set()
+        for value in mapping[:16]:
+            channel = value if -1 <= value <= 14 and value not in used else -1
+            result.append(channel)
+            if channel >= 0:
+                used.add(channel)
+        return result + [-1] * (16 - len(result))
 
     @staticmethod
     def _hui_zone_maps(mapping: list[int]) -> tuple[dict[int, int], dict[int, int]]:
@@ -1449,19 +1483,36 @@ class App:
     def _apply_track_mapping(self, mapping: list[int]) -> None:
         """Applique le mapping choisi dans la fenêtre de configuration (pas
         automatique : rien ne change avant l'appui sur "Appliquer")."""
-        self._track_mapping = list(mapping)
+        self._track_mapping = self._sanitize_hui_mapping(mapping)
         zone_map_1, zone_map_2 = self._hui_zone_maps(self._track_mapping)
         self.hui_bridge.set_mapping(zone_map_1)
         self.hui_bridge_2.set_mapping(zone_map_2)
         self.config["hui_track_mapping"] = self._track_mapping
         save_config(self.config)
+        self.hui_mapping_summary.config(text=self._format_hui_mapping())
         self._refresh_hui_feedback()
+
+    def _format_hui_mapping(self) -> str:
+        pairs = [
+            f"Live {track + 1}→console {channel + 1}"
+            for track, channel in enumerate(self._track_mapping)
+            if channel >= 0
+        ]
+        return "  ·  ".join(pairs)
+
+    def _hui_bridge_for_track(self, track_index: int) -> HuiBridge | None:
+        if not 0 <= track_index < len(self._track_mapping):
+            return None
+        channel = self._track_mapping[track_index]
+        if 0 <= channel < 8:
+            return self.hui_bridge
+        if 8 <= channel < 15:
+            return self.hui_bridge_2
+        return None
 
     def _open_hui_mapping_dialog(self) -> None:
         """Fenêtre de mapping piste Live (ligne) <-> tranche HUI/Yamaha
-        (colonne) : une seule tranche par piste (boutons radio par ligne,
-        donc pas de doublon possible sur une même ligne), diagonale 1<->1 par
-        défaut. Colonne "—" en plus des 15 tranches : laisse la piste sans
+        (colonne). Colonne "—" en plus des 15 tranches : laisse la piste sans
         tranche assignée (pas commandée par la console). Tranche 16 absente
         (réservée au tempo, voir TEMPO_FADER_ZONE). Rien n'est appliqué avant
         l'appui sur "Appliquer"."""
@@ -1484,11 +1535,18 @@ class App:
                 row=track + 1, column=0, sticky="w", padx=(4, 6)
             )
             tk.Radiobutton(
-                dialog, variable=var, value=-1, bg=BG_IDLE, activebackground=BG_IDLE, selectcolor="#333333",
+                dialog, variable=var, value=-1, bg=BG_IDLE, activebackground=BG_IDLE,
+                selectcolor="#333333",
             ).grid(row=track + 1, column=1)
             for col in range(15):
+                def select_channel(track_index=track, channel=col) -> None:
+                    for other_track, other_var in enumerate(row_vars):
+                        if other_track != track_index and other_var.get() == channel:
+                            other_var.set(-1)
+
                 tk.Radiobutton(
-                    dialog, variable=var, value=col, bg=BG_IDLE, activebackground=BG_IDLE, selectcolor="#333333",
+                    dialog, variable=var, value=col, command=select_channel,
+                    bg=BG_IDLE, activebackground=BG_IDLE, selectcolor="#333333",
                 ).grid(row=track + 1, column=col + 2)
 
         button_row = tk.Frame(dialog, bg=BG_IDLE)
@@ -1688,7 +1746,10 @@ class App:
 
     def _activate_emergency(self, _event=None) -> None:
         """Coupe toutes les pistes Live sans arrêter l'horloge ni l'affichage."""
+        if self._emergency_active:
+            return
         self._emergency_active = True
+        self._emergency_saved_volumes.clear()
         self._render_emergency_button()
         if self._live_num_tracks is None:
             self._emergency_waiting_for_tracks = True
@@ -1697,16 +1758,39 @@ class App:
             except OSError as exc:
                 self.status_label.config(text=f"Erreur OSC : {exc}")
             return
-        self._silence_live_tracks()
+        self._prepare_emergency_silence()
+
+    def _on_emergency_shortcut(self, _event=None) -> str:
+        self._activate_emergency()
+        return "break"
+
+    def _prepare_emergency_silence(self) -> None:
+        if self._live_num_tracks is None:
+            return
+        self._emergency_waiting_for_tracks = False
+        self._emergency_volume_waiting = {
+            track_index for track_index in range(self._live_num_tracks)
+            if track_index not in self._live_track_volumes
+        }
+        if not self._emergency_volume_waiting:
+            self._silence_live_tracks()
+            return
+        try:
+            for track_index in self._emergency_volume_waiting:
+                self.live_osc.get_track_volume(track_index)
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC : {exc}")
 
     def _silence_live_tracks(self) -> None:
         if self._live_num_tracks is None:
             return
         self._emergency_waiting_for_tracks = False
+        self._emergency_volume_waiting.clear()
         starts = {
             track_index: self._live_track_volumes.get(track_index, LIVE_ZERO_DB_VOLUME)
             for track_index in range(self._live_num_tracks)
         }
+        self._emergency_saved_volumes = dict(starts)
         self._fade_track_volumes(starts, 0.0)
 
     def _fade_track_volumes(self, starts: dict[int, float], target: float, step: int = 0) -> None:
@@ -1733,46 +1817,53 @@ class App:
         else:
             self._fade_after_id = None
 
-    def _begin_emergency_restore(self) -> None:
-        """Au lancement suivant, remet les pistes à 0 dB sauf TEMOIN."""
+    def _restore_emergency_volumes(self) -> None:
         if not self._emergency_active:
             return
+        if self._fade_after_id is not None:
+            self.root.after_cancel(self._fade_after_id)
+            self._fade_after_id = None
         self._emergency_waiting_for_tracks = False
-        self._emergency_restore_pending = True
+        try:
+            for track_index, volume in self._emergency_saved_volumes.items():
+                self.live_osc.set_track_volume(track_index, volume)
+                self._live_track_volumes[track_index] = volume
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC : {exc}")
+            return
+        self._emergency_active = False
+        self._emergency_volume_waiting.clear()
+        self._emergency_saved_volumes.clear()
+        self._render_emergency_button()
+
+    def _mute_temoin_track(self) -> None:
         if self._live_num_tracks is None:
+            self._temoin_mute_pending = True
             try:
                 self.live_osc.get_num_tracks()
             except OSError as exc:
                 self.status_label.config(text=f"Erreur OSC : {exc}")
             return
-        self._emergency_restore_waiting_names = {
+        for track_index in range(self._live_num_tracks):
+            if _is_temoin_track(self._live_track_names.get(track_index, "")):
+                try:
+                    self.live_osc.set_track_mute(track_index, True)
+                except OSError as exc:
+                    self.status_label.config(text=f"Erreur OSC : {exc}")
+                    return
+                self._temoin_mute_pending = False
+                self._temoin_name_waiting.clear()
+                return
+        self._temoin_name_waiting = {
             track_index for track_index in range(self._live_num_tracks)
             if track_index not in self._live_track_names
         }
-        if not self._emergency_restore_waiting_names:
-            self._restore_live_tracks_after_emergency()
-            return
+        self._temoin_mute_pending = bool(self._temoin_name_waiting)
         try:
-            for track_index in self._emergency_restore_waiting_names:
+            for track_index in self._temoin_name_waiting:
                 self.live_osc.get_track_name(track_index)
         except OSError as exc:
             self.status_label.config(text=f"Erreur OSC : {exc}")
-
-    def _restore_live_tracks_after_emergency(self) -> None:
-        if self._live_num_tracks is None:
-            return
-        try:
-            for track_index in range(self._live_num_tracks):
-                name = self._live_track_names.get(track_index, "").strip().upper()
-                volume = 0.0 if name == "TEMOIN" else LIVE_ZERO_DB_VOLUME
-                self.live_osc.set_track_volume(track_index, volume)
-        except OSError as exc:
-            self.status_label.config(text=f"Erreur OSC : {exc}")
-            return
-        self._emergency_active = False
-        self._emergency_restore_pending = False
-        self._emergency_restore_waiting_names.clear()
-        self._render_emergency_button()
 
     def _render_emergency_button(self, fractional: float = 0.0, connected: bool = False) -> None:
         background = "#e0342b" if self._emergency_active else self._loop_button_gray
@@ -2147,6 +2238,8 @@ class App:
             self._set_hui_listen(0, listen=True)
         if self.hui_bridge_2.port_name:
             self._set_hui_listen(8, listen=True)
+        if self.hui_bridge.port_name or self.hui_bridge_2.port_name:
+            self.root.after(100, self._refresh_hui_feedback)
         try:
             self.live_osc.start_listen_signature_numerator()
             self.live_osc.start_listen_signature_denominator()
@@ -2233,7 +2326,6 @@ class App:
             return
         try:
             self.live_osc.fire_scene(self._scene_index)
-            self._begin_emergency_restore()
             # Un LABEL "END" précédent coupe le clic (voir _apply_scene_sheet_row) ;
             # tout lancement de scène (préroll chiffré ou vrai morceau) le
             # réarme, sinon le métronome resterait muet indéfiniment ensuite.
@@ -2251,6 +2343,7 @@ class App:
             # de flash, pas d'agrandissement (réservés aux scènes nommées).
             if self._scene_name.strip().isdigit():
                 self.live_osc.start_playing()
+                self._mute_temoin_track()
                 # Préroll batteur : les scènes numériques tournent en 1/4,
                 # donc le chiffre affiché et l'accent restent toujours sur 1.
                 # La vraie scène réappliquera ensuite son COUNT via sa feuille.
@@ -2379,7 +2472,7 @@ class App:
         le curseur à 1:1:1, en attente d'un start de scène."""
         self._metronome_end_muted = False
         self._reset_loop_state()
-        self._begin_emergency_restore()
+        self._restore_emergency_volumes()
         self.shared_state.set_metronome_end_muted(False)
         self.shared_state.set_preroll(False)
         # Remet le temps par mesure à la valeur par défaut : une feuille de
@@ -2447,6 +2540,10 @@ class App:
                 self._live_available = True
                 self._live_num_tracks = None
                 self._live_track_names.clear()
+                self._live_track_volumes.clear()
+                self._emergency_volume_waiting.clear()
+                self._temoin_mute_pending = False
+                self._temoin_name_waiting.clear()
                 self._on_live_available()
             elif address == "/live/test":
                 self._live_last_seen = time.monotonic()
@@ -2463,28 +2560,42 @@ class App:
             elif address == "/live/song/get/num_tracks":
                 self._live_num_tracks = int(args[0])
                 self._reset_faders_beyond(self._live_num_tracks)
-                if self._emergency_restore_pending:
-                    self._begin_emergency_restore()
-                elif self._emergency_waiting_for_tracks:
-                    self._silence_live_tracks()
+                if self._emergency_waiting_for_tracks:
+                    self._prepare_emergency_silence()
+                if self._temoin_mute_pending:
+                    self._mute_temoin_track()
             elif address == "/live/track/get/volume":
                 track_index, volume = int(args[0]), float(args[1])
                 self._live_track_volumes[track_index] = volume
-                self.hui_bridge.send_volume_feedback(track_index, volume)
-                self.hui_bridge_2.send_volume_feedback(track_index, volume)
+                bridge = self._hui_bridge_for_track(track_index)
+                if bridge is not None:
+                    bridge.send_volume_feedback(track_index, volume)
+                if track_index in self._emergency_volume_waiting:
+                    self._emergency_volume_waiting.discard(track_index)
+                    if self._emergency_active and not self._emergency_volume_waiting:
+                        self._silence_live_tracks()
             elif address == "/live/track/get/mute":
                 track_index, muted = int(args[0]), bool(args[1])
-                self.hui_bridge.send_mute_feedback(track_index, muted)
-                self.hui_bridge_2.send_mute_feedback(track_index, muted)
+                bridge = self._hui_bridge_for_track(track_index)
+                if bridge is not None:
+                    bridge.send_mute_feedback(track_index, muted)
             elif address == "/live/track/get/name":
                 track_index, name = int(args[0]), (args[1] or "")
                 self._live_track_names[track_index] = name
-                self.hui_bridge.send_name_feedback(track_index, name)
-                self.hui_bridge_2.send_name_feedback(track_index, name)
-                if track_index in self._emergency_restore_waiting_names:
-                    self._emergency_restore_waiting_names.discard(track_index)
-                    if self._emergency_restore_pending and not self._emergency_restore_waiting_names:
-                        self._restore_live_tracks_after_emergency()
+                bridge = self._hui_bridge_for_track(track_index)
+                if bridge is not None:
+                    bridge.send_name_feedback(track_index, name)
+                if track_index in self._temoin_name_waiting:
+                    self._temoin_name_waiting.discard(track_index)
+                    if _is_temoin_track(name):
+                        try:
+                            self.live_osc.set_track_mute(track_index, True)
+                        except OSError as exc:
+                            self.status_label.config(text=f"Erreur OSC : {exc}")
+                        self._temoin_mute_pending = False
+                        self._temoin_name_waiting.clear()
+                    elif not self._temoin_name_waiting:
+                        self._temoin_mute_pending = False
             elif address == "/live/song/get/num_scenes":
                 self._scene_count = int(args[0])
             elif address == "/live/view/get/selected_scene":
@@ -3264,7 +3375,7 @@ class App:
         entry.select_range(0, "end")
         entry.focus_set()
         entry.bind("<Return>", lambda _e: self._lyrics_commit_edit(index))
-        entry.bind("<Escape>", lambda _e: self._lyrics_cancel_edit())
+        entry.bind("<Escape>", lambda _e: (self._lyrics_cancel_edit(), "break")[1])
         entry.bind("<FocusOut>", lambda _e: self._lyrics_commit_edit(index))
         self._lyrics_editor = {"index": index, "entry": entry, "var": var, "window_item": window_item}
 

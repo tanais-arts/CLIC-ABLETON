@@ -172,6 +172,9 @@ class HuiBridge:
         self._port_name = port_name
         self._pending_zone = None
         self._pending_coarse = None
+        self._mute_sent_state.clear()
+        self._track_volume_sent.clear()
+        self._track_name.clear()
 
         # Port de sortie du même nom, pour le ping qui maintient l'envoi des
         # faders côté console (le mute continue de fonctionner sans ping).

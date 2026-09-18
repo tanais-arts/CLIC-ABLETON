@@ -104,12 +104,13 @@ pip install -r requirements.txt
    appui demande une sortie propre à son prochain passage. Le logo clignote
    pendant les quatre derniers temps avant un retour de boucle.
 9. **Urgence audio** : le bouton Attention, à droite de LOOP, met
-   immédiatement les volumes de toutes les pistes Live à `0` (−∞ dB), sans
-   arrêter le transport, les métronomes locaux, les labels, les paroles ni
-   leur suivi. Le bouton reste rouge et le message rouge clignotant
-   « Vous êtes en roue libre ! » reste affiché. Au lancement d'une nouvelle
-   scène, toutes les pistes reviennent à `0 dB`, sauf la piste nommée
-   `TEMOIN`, qui reste à −∞ dB ; l'alerte disparaît alors.
+   les volumes de toutes les pistes Live à `0` (−∞ dB) par un fondu de
+   1000 ms, sans arrêter le transport, les métronomes locaux, les labels,
+   les paroles ni leur suivi. Le bouton reste rouge et le message rouge
+   clignotant « VOUS ETES EN ROUE LIBRE ! » reste affiché. Au Stop, chaque
+   piste retrouve exactement le volume qu'elle avait avant l'urgence et
+   l'alerte disparaît. Le lancement d'une scène chiffrée mute séparément la
+   piste nommée `TEMOIN`, indépendamment de la fonction d'urgence.
 
 ### Compilation de la bibliothèque Link (déjà faite dans ce projet)
 

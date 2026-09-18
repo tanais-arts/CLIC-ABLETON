@@ -11,6 +11,8 @@ import os
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
+DEFAULT_HUI_TRACK_MAPPING = [0, 1, 2, 3, 4, 7, 8, 10, 11, 12, 13, 14, -1, -1, -1, -1]
+
 DEFAULTS = {
     "mode": "link",  # "link" ou "midi"
     "midi_port": "",
@@ -49,12 +51,9 @@ DEFAULTS = {
     "metronome_audio_channels_2": 2,
     "metronome_kit_2": "Kit1",
     "metronome_audio_latency_ms_2": 10,
-    # Mapping piste Live (index) -> tranche HUI/Yamaha (valeur), 0-14 (la
-    # tranche 15/canal 16 est réservée au contrôle du tempo, voir
-    # TEMPO_FADER_ZONE dans beat_display.py, donc absente du mapping).
-    # Diagonale par défaut (piste 1 -> tranche 1, etc.), modifiable dans
-    # l'interface ("Configurer le mapping des faders…").
-    "hui_track_mapping": [min(i, 14) for i in range(16)],
+    # Live 1-5 -> console 1-5 ; Live 6-12 -> console 8,9,11-15.
+    # Console 16 reste réservée au tempo ; Live 13-16 sont non affectées.
+    "hui_track_mapping": list(DEFAULT_HUI_TRACK_MAPPING),
     # Plage du fader 16 dédié au tempo : "3"/"6"/"10"/"20"/"100" (pourcentage
     # autour du tempo de référence).
     "tempo_fader_range": "6",
