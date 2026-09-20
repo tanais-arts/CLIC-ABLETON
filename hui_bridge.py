@@ -110,12 +110,14 @@ class HuiBridge:
     def __init__(
         self, live_osc, log=print, zone_to_track: dict[int, int] | None = None,
         tempo_zone: int | None = None, on_tempo_fader=None, on_tempo_reset=None,
+        on_track_fader=None,
     ):
         self._live_osc = live_osc
         self._log = log
         self._tempo_zone = tempo_zone
         self._on_tempo_fader = on_tempo_fader
         self._on_tempo_reset = on_tempo_reset
+        self._on_track_fader = on_track_fader
         self._midi_in: rtmidi.MidiIn | None = None
         self._midi_out: rtmidi.MidiOut | None = None
         self._port_name: str | None = None
@@ -282,10 +284,12 @@ class HuiBridge:
                 return
             self._track_volume_local[track] = volume
             self._track_volume_local_time[track] = time.monotonic()
+            if self._on_track_fader is not None and self._on_track_fader(track, volume):
+                return
             self._live_osc.set_track_volume(track, volume)
             return
 
-    def send_volume_feedback(self, track_index: int, volume: float) -> None:
+    def send_volume_feedback(self, track_index: int, volume: float, force: bool = False) -> None:
         """Renvoie vers la console la position de fader réelle d'Ableton pour
         `track_index` (ignoré si hors de la plage de ce port). Juste après un
         mouvement local, d'anciens retours OSC intermédiaires en retard
@@ -300,9 +304,9 @@ class HuiBridge:
         recent_local_move = (
             time.monotonic() - self._track_volume_local_time.get(track_index, 0.0)
         ) < VOLUME_ECHO_HOLDOFF_S
-        if not is_echo and recent_local_move:
+        if not force and not is_echo and recent_local_move:
             return
-        if abs(volume - self._track_volume_sent.get(track_index, -1.0)) < 1 / 16383.0:
+        if not force and abs(volume - self._track_volume_sent.get(track_index, -1.0)) < 1 / 16383.0:
             return
         self._track_volume_sent[track_index] = volume
         raw = max(0, min(16383, round(volume * 16383)))

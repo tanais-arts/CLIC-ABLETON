@@ -203,6 +203,15 @@ class LiveOSC:
     def get_track_name(self, track_index: int) -> None:
         self.send("/live/track/get/name", track_index)
 
+    def get_clip_slot_has_clip(self, track_index: int, clip_index: int) -> None:
+        self.send("/live/clip_slot/get/has_clip", track_index, clip_index)
+
+    def get_clip_gain(self, track_index: int, clip_index: int) -> None:
+        self.send("/live/clip/get/gain", track_index, clip_index)
+
+    def set_clip_gain(self, track_index: int, clip_index: int, value: float) -> None:
+        self.send("/live/clip/set/gain", track_index, clip_index, value)
+
     def ping(self) -> None:
         """Sonde légère pour détecter la présence de Live/AbletonOSC : répond
         toujours par /live/test ("ok",), même sans piste ni projet particulier

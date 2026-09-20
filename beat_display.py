@@ -496,7 +496,14 @@ class App:
         self._track_mapping = self._sanitize_hui_mapping(self._track_mapping)
         self.config["hui_track_mapping"] = self._track_mapping
         zone_map_1, zone_map_2 = self._hui_zone_maps(self._track_mapping)
-        self.hui_bridge = HuiBridge(self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_1)
+        self._trim_enabled: bool = False
+        self._trim_scene_index: int | None = None
+        self._trim_clip_has_clip: dict[int, bool] = {}
+        self._trim_clip_gains: dict[int, float] = {}
+        self.hui_bridge = HuiBridge(
+            self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_1,
+            on_track_fader=self._handle_hui_track_fader,
+        )
         # File des positions brutes (0-16383) du fader 16, remplie depuis le
         # thread MIDI de hui_bridge_2, consommée dans _poll (thread Tk) via
         # _poll_tempo_fader — jamais de widget Tk touché hors du thread principal.
@@ -509,7 +516,7 @@ class App:
         self.hui_bridge_2 = HuiBridge(
             self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_2,
             tempo_zone=self.TEMPO_FADER_ZONE, on_tempo_fader=self._tempo_fader_queue.put,
-            on_tempo_reset=lambda: self._tempo_reset_queue.put(None),
+            on_tempo_reset=lambda: self._tempo_reset_queue.put(None), on_track_fader=self._handle_hui_track_fader,
         )
         # Tempo de référence ("morceau chargé sans modification", position
         # centrale du fader 16) : voir _on_link_tempo_observed/_apply_tempo_fader.
@@ -828,6 +835,13 @@ class App:
         tk.Spinbox(
             goto_frame, from_=0, to=999, width=5, textvariable=self.preroll_var,
         ).pack(side="left", padx=(6, 0))
+        self.trim_button = tk.Label(
+            goto_frame, text="TRIM", width=7, height=1, fg="white", cursor="hand2",
+            padx=4, pady=2,
+        )
+        self.trim_button.bind("<Button-1>", lambda _event: self._toggle_trim_mode())
+        self.trim_button.pack(side="left", padx=(16, 0))
+        self._update_trim_button()
 
         # -- Affichage principal du temps : un carré, gros pour 1/3, petit pour 2/4 --
         self.display = tk.Canvas(self.root, bg=BG_IDLE, highlightthickness=0)
@@ -1490,7 +1504,10 @@ class App:
         self.config["hui_track_mapping"] = self._track_mapping
         save_config(self.config)
         self.hui_mapping_summary.config(text=self._format_hui_mapping())
-        self._refresh_hui_feedback()
+        if self._trim_enabled:
+            self._refresh_trim_faders()
+        else:
+            self._refresh_hui_feedback()
 
     def _format_hui_mapping(self) -> str:
         pairs = [
@@ -1567,6 +1584,72 @@ class App:
                 self.live_osc.get_track_name(track)
         except OSError as exc:
             self.status_label.config(text=f"Erreur OSC : {exc}")
+
+    def _mapped_hui_tracks(self) -> list[int]:
+        return [track for track in range(16) if self._hui_bridge_for_track(track) is not None]
+
+    def _update_trim_button(self) -> None:
+        if self._trim_enabled:
+            self.trim_button.config(
+                text="TRIM", relief="flat", bg="#c00000", fg="white",
+                activebackground="#e00000", activeforeground="white", highlightbackground="#c00000",
+            )
+        else:
+            self.trim_button.config(
+                text="TRIM", relief="flat", bg="#555555", fg="white",
+                activebackground="#666666", activeforeground="white", highlightbackground="#555555",
+            )
+
+    def _toggle_trim_mode(self) -> None:
+        if self._trim_enabled:
+            self._trim_enabled = False
+            self._trim_scene_index = None
+            self._trim_clip_has_clip.clear()
+            self._trim_clip_gains.clear()
+            self._update_trim_button()
+            self._refresh_hui_feedback()
+            return
+        if self._scene_index is None:
+            self.status_label.config(text="TRIM : aucune scène sélectionnée")
+            return
+        self._trim_enabled = True
+        self._update_trim_button()
+        self._refresh_trim_faders()
+
+    def _refresh_trim_faders(self) -> None:
+        if not self._trim_enabled or self._scene_index is None:
+            return
+        self._trim_scene_index = self._scene_index
+        self._trim_clip_has_clip.clear()
+        self._trim_clip_gains.clear()
+        for track in self._mapped_hui_tracks():
+            self._trim_clip_has_clip[track] = False
+            self._send_trim_fader_feedback(track, 0.0, force=True)
+            try:
+                self.live_osc.get_clip_slot_has_clip(track, self._trim_scene_index)
+            except OSError as exc:
+                self.status_label.config(text=f"Erreur OSC TRIM : {exc}")
+
+    def _send_trim_fader_feedback(self, track_index: int, gain: float, force: bool = False) -> None:
+        bridge = self._hui_bridge_for_track(track_index)
+        if bridge is not None:
+            bridge.send_volume_feedback(track_index, gain, force=force)
+
+    def _handle_hui_track_fader(self, track_index: int, value: float) -> bool:
+        if not self._trim_enabled:
+            return False
+        scene_index = self._trim_scene_index
+        if scene_index is None or not self._trim_clip_has_clip.get(track_index, False):
+            self._send_trim_fader_feedback(track_index, 0.0, force=True)
+            return True
+        gain = max(0.0, min(1.0, value))
+        self._trim_clip_gains[track_index] = gain
+        try:
+            self.live_osc.set_clip_gain(track_index, scene_index, gain)
+        except OSError as exc:
+            self.status_label.config(text=f"Erreur OSC TRIM : {exc}")
+        self._send_trim_fader_feedback(track_index, gain, force=True)
+        return True
 
     def _set_hui_listen(self, channel_offset: int, listen: bool) -> None:
         """Abonne/désabonne aux changements de volume, mute et nom d'Ableton
@@ -2272,6 +2355,8 @@ class App:
         if new_index == self._scene_index:
             return
         self._scene_index = new_index
+        if self._trim_enabled:
+            self._refresh_trim_faders()
         # Réinitialise tout de suite le vert/rouge du lancement précédent : le
         # nom/statut exacts de la nouvelle scène n'arriveront qu'après l'aller-
         # retour OSC, sinon on voit brièvement l'ancienne scène encore verte.
@@ -2568,12 +2653,27 @@ class App:
                 track_index, volume = int(args[0]), float(args[1])
                 self._live_track_volumes[track_index] = volume
                 bridge = self._hui_bridge_for_track(track_index)
-                if bridge is not None:
+                if bridge is not None and not self._trim_enabled:
                     bridge.send_volume_feedback(track_index, volume)
                 if track_index in self._emergency_volume_waiting:
                     self._emergency_volume_waiting.discard(track_index)
                     if self._emergency_active and not self._emergency_volume_waiting:
                         self._silence_live_tracks()
+            elif address == "/live/clip_slot/get/has_clip":
+                track_index, clip_index, has_clip = int(args[0]), int(args[1]), bool(args[2])
+                if self._trim_enabled and clip_index == self._trim_scene_index:
+                    self._trim_clip_has_clip[track_index] = has_clip
+                    if has_clip:
+                        self.live_osc.get_clip_gain(track_index, clip_index)
+                    else:
+                        self._trim_clip_gains.pop(track_index, None)
+                        self._send_trim_fader_feedback(track_index, 0.0, force=True)
+            elif address == "/live/clip/get/gain":
+                track_index, clip_index, gain = int(args[0]), int(args[1]), float(args[2])
+                if self._trim_enabled and clip_index == self._trim_scene_index:
+                    self._trim_clip_has_clip[track_index] = True
+                    self._trim_clip_gains[track_index] = gain
+                    self._send_trim_fader_feedback(track_index, gain, force=True)
             elif address == "/live/track/get/mute":
                 track_index, muted = int(args[0]), bool(args[1])
                 bridge = self._hui_bridge_for_track(track_index)
@@ -2600,6 +2700,8 @@ class App:
                 self._scene_count = int(args[0])
             elif address == "/live/view/get/selected_scene":
                 self._scene_index = int(args[0])
+                if self._trim_enabled:
+                    self._refresh_trim_faders()
                 self.live_osc.get_scene_name(self._scene_index)
             elif address == "/live/scene/get/name":
                 index, name = int(args[0]), (args[1] or "")
