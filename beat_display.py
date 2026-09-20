@@ -63,9 +63,13 @@ EMERGENCY_FADE_MS = 1000  # durée du fondu des faders Live au bouton d'urgence
 EMERGENCY_FADE_STEPS = 10
 # Dans Live, Clip.gain est normalisé : 0.0 = -inf, 0.5 = 0 dB, 1.0 = +24 dB.
 # Sur le HUI de la console, 0.5 correspond actuellement à -15 dB. La
-# graduation -10 dB est calibrée à environ 60% de la course.
+# graduation -5 dB est calibrée à environ 70% de la course.
 TRIM_LIVE_ZERO_GAIN = 0.5
-TRIM_HUI_ZERO_DB_POSITION = 0.60
+TRIM_HUI_ZERO_DB_POSITION = 0.70
+# Clip.gain est plus coûteux à appliquer côté Live que le volume de piste :
+# on coalesce les mouvements HUI pour ne pas remplir la file OSC.
+TRIM_GAIN_REPEAT_INTERVAL_S = 0.10
+TRIM_DIAGNOSTIC_TRACK = 5  # piste Live 6, nommée SYNTH 1 dans le Set utilisateur
 
 
 def _lerp_color(start: str, end: str, t: float) -> str:
@@ -505,9 +509,15 @@ class App:
         self._trim_scene_index: int | None = None
         self._trim_clip_has_clip: dict[int, bool] = {}
         self._trim_clip_gains: dict[int, float] = {}
+        self._trim_requested_gains: dict[int, float] = {}
+        self._trim_listened_clip: tuple[int, int] | None = None
+        self._trim_touch_queue: "queue.Queue[tuple[int, bool]]" = queue.Queue()
+        self._trim_touched_tracks: set[int] = set()
+        self._trim_last_repeat_time = 0.0
         self.hui_bridge = HuiBridge(
             self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_1,
             on_track_fader=self._handle_hui_track_fader,
+            on_track_fader_touch=lambda track, touched: self._trim_touch_queue.put((track, touched)),
         )
         # File des positions brutes (0-16383) du fader 16, remplie depuis le
         # thread MIDI de hui_bridge_2, consommée dans _poll (thread Tk) via
@@ -524,6 +534,7 @@ class App:
             tempo_zone=self.TEMPO_FADER_ZONE, on_tempo_fader=self._tempo_fader_queue.put,
             on_tempo_reset=lambda: self._tempo_reset_queue.put(None), on_track_fader=self._handle_hui_track_fader,
             on_tempo_select=lambda: self._trim_toggle_queue.put(None),
+            on_track_fader_touch=lambda track, touched: self._trim_touch_queue.put((track, touched)),
         )
         # Tempo de référence ("morceau chargé sans modification", position
         # centrale du fader 16) : voir _on_link_tempo_observed/_apply_tempo_fader.
@@ -1611,8 +1622,14 @@ class App:
         if self._trim_enabled:
             self._trim_enabled = False
             self._trim_scene_index = None
+            if self._trim_listened_clip is not None:
+                self.live_osc.stop_listen_clip_gain(*self._trim_listened_clip)
+                self._trim_listened_clip = None
             self._trim_clip_has_clip.clear()
             self._trim_clip_gains.clear()
+            self._trim_requested_gains.clear()
+            self._trim_listened_clip = None
+            self._trim_touched_tracks.clear()
             self._update_trim_button()
             self._refresh_hui_feedback()
             return
@@ -1623,12 +1640,58 @@ class App:
         self._update_trim_button()
         self._refresh_trim_faders()
 
+    def _poll_trim_fader_repeat(self) -> None:
+        try:
+            while True:
+                track_index, touched = self._trim_touch_queue.get_nowait()
+                if touched:
+                    self._trim_touched_tracks.add(track_index)
+                else:
+                    self._trim_touched_tracks.discard(track_index)
+                    if self._trim_enabled and self._trim_scene_index is not None:
+                        gain = self._trim_requested_gains.get(track_index)
+                        if gain is not None and self._trim_clip_has_clip.get(track_index, False):
+                            self.live_osc.set_clip_gain(track_index, self._trim_scene_index, gain)
+        except queue.Empty:
+            pass
+        if not self._trim_enabled or not self._trim_touched_tracks:
+            return
+        now = time.monotonic()
+        if now - self._trim_last_repeat_time < TRIM_GAIN_REPEAT_INTERVAL_S:
+            return
+        self._trim_last_repeat_time = now
+        scene_index = self._trim_scene_index
+        if scene_index is None:
+            return
+        for track_index in tuple(self._trim_touched_tracks):
+            gain = self._trim_requested_gains.get(track_index)
+            if gain is not None and self._trim_clip_has_clip.get(track_index, False):
+                self.live_osc.set_clip_gain(track_index, scene_index, gain)
+
     def _refresh_trim_faders(self) -> None:
         if not self._trim_enabled or self._scene_index is None:
             return
-        self._trim_scene_index = self._scene_index
+        target_scene_index = self._scene_index
+        if self._scene_name.strip().isdigit() and self._scene_count is not None:
+            target_scene_index += 1
+        if self._scene_count is not None and target_scene_index >= self._scene_count:
+            if self._trim_listened_clip is not None:
+                self.live_osc.stop_listen_clip_gain(*self._trim_listened_clip)
+                self._trim_listened_clip = None
+            self._trim_scene_index = None
+            self._trim_clip_has_clip.clear()
+            self._trim_clip_gains.clear()
+            self._trim_requested_gains.clear()
+            for track in self._mapped_hui_tracks():
+                self._send_trim_fader_feedback(track, 0.0, force=True)
+            return
+        self._trim_scene_index = target_scene_index
+        if self._trim_listened_clip is not None:
+            self.live_osc.stop_listen_clip_gain(*self._trim_listened_clip)
+            self._trim_listened_clip = None
         self._trim_clip_has_clip.clear()
         self._trim_clip_gains.clear()
+        self._trim_requested_gains.clear()
         for track in self._mapped_hui_tracks():
             self._trim_clip_has_clip[track] = False
             self._send_trim_fader_feedback(track, 0.0, force=True)
@@ -1675,11 +1738,15 @@ class App:
             self._send_trim_fader_feedback(track_index, 0.0, force=True)
             return True
         gain = self._trim_hui_position_to_live_gain(value)
+        self._trim_requested_gains[track_index] = gain
         self._trim_clip_gains[track_index] = gain
-        try:
+        if track_index == TRIM_DIAGNOSTIC_TRACK:
+            print(f"[TRIM] piste 6 SYNTH 1 demande HUI -> Live gain={gain:.6f}")
+        # Pendant le toucher, _poll_trim_fader_repeat() envoie uniquement la
+        # dernière valeur à intervalle régulier. Un premier événement peut
+        # arriver avant que le thread Tk ait consommé le marqueur touch.
+        if track_index not in self._trim_touched_tracks:
             self.live_osc.set_clip_gain(track_index, scene_index, gain)
-        except OSError as exc:
-            self.status_label.config(text=f"Erreur OSC TRIM : {exc}")
         self._send_trim_fader_feedback(track_index, gain, force=True)
         return True
 
@@ -2398,8 +2465,6 @@ class App:
         if new_index == self._scene_index:
             return
         self._scene_index = new_index
-        if self._trim_enabled:
-            self._refresh_trim_faders()
         # Réinitialise tout de suite le vert/rouge du lancement précédent : le
         # nom/statut exacts de la nouvelle scène n'arriveront qu'après l'aller-
         # retour OSC, sinon on voit brièvement l'ancienne scène encore verte.
@@ -2708,15 +2773,33 @@ class App:
                     self._trim_clip_has_clip[track_index] = has_clip
                     if has_clip:
                         self.live_osc.get_clip_gain(track_index, clip_index)
+                        if track_index == TRIM_DIAGNOSTIC_TRACK:
+                            if self._trim_listened_clip is not None:
+                                self.live_osc.stop_listen_clip_gain(*self._trim_listened_clip)
+                            self.live_osc.start_listen_clip_gain(track_index, clip_index)
+                            self._trim_listened_clip = (track_index, clip_index)
                     else:
                         self._trim_clip_gains.pop(track_index, None)
+                        self._trim_requested_gains.pop(track_index, None)
                         self._send_trim_fader_feedback(track_index, 0.0, force=True)
             elif address == "/live/clip/get/gain":
                 track_index, clip_index, gain = int(args[0]), int(args[1]), float(args[2])
                 if self._trim_enabled and clip_index == self._trim_scene_index:
                     self._trim_clip_has_clip[track_index] = True
                     self._trim_clip_gains[track_index] = gain
-                    self._send_trim_fader_feedback(track_index, gain, force=True)
+                    if track_index == TRIM_DIAGNOSTIC_TRACK:
+                        requested = self._trim_requested_gains.get(track_index)
+                        difference = gain - requested if requested is not None else None
+                        print(
+                            f"[TRIM] piste 6 SYNTH 1 confirmation Live gain={gain:.6f}"
+                            + (f" demande={requested:.6f} ecart={difference:+.6f}" if requested is not None else "")
+                        )
+                    # Les retours de start_listen peuvent arriver en retard et
+                    # dans le désordre pendant un mouvement HUI. Ne renvoyons
+                    # pas une ancienne valeur vers le fader tant que l'utilisateur
+                    # le touche : cela le ferait repartir brièvement en arrière.
+                    if track_index not in self._trim_touched_tracks:
+                        self._send_trim_fader_feedback(track_index, gain, force=True)
             elif address == "/live/track/get/mute":
                 track_index, muted = int(args[0]), bool(args[1])
                 bridge = self._hui_bridge_for_track(track_index)
@@ -2755,6 +2838,8 @@ class App:
                         self._goto_label_by_scene[self._scene_name] = self.goto_label_var.get()
                     self._scene_name = name
                     self._refresh_goto_labels()
+                    if self._trim_enabled:
+                        self._refresh_trim_faders()
                     # Convention du set : une scène nommée juste "84" ne fait
                     # que régler le tempo, la scène suivante contient le
                     # morceau prêt à être lancé — on affiche donc son nom
@@ -3068,6 +3153,7 @@ class App:
         self._poll_tempo_fader_keepalive()
         self._poll_tempo_reset()
         self._poll_trim_toggle()
+        self._poll_trim_fader_repeat()
         if self.mode_var.get() == "midi":
             try:
                 while True:

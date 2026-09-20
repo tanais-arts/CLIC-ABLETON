@@ -110,7 +110,7 @@ class HuiBridge:
     def __init__(
         self, live_osc, log=print, zone_to_track: dict[int, int] | None = None,
         tempo_zone: int | None = None, on_tempo_fader=None, on_tempo_reset=None,
-        on_track_fader=None, on_tempo_select=None,
+        on_track_fader=None, on_tempo_select=None, on_track_fader_touch=None,
     ):
         self._live_osc = live_osc
         self._log = log
@@ -119,6 +119,7 @@ class HuiBridge:
         self._on_tempo_reset = on_tempo_reset
         self._on_track_fader = on_track_fader
         self._on_tempo_select = on_tempo_select
+        self._on_track_fader_touch = on_track_fader_touch
         self._midi_in: rtmidi.MidiIn | None = None
         self._midi_out: rtmidi.MidiOut | None = None
         self._port_name: str | None = None
@@ -271,6 +272,8 @@ class HuiBridge:
                         f"HUI : tranche tempo zone={zone}, port={port}, "
                         f"valeur={value} (bouton non affecté)"
                     )
+            elif port == FADER_PORT and track is not None and self._on_track_fader_touch is not None:
+                self._on_track_fader_touch(track, pressed)
             return
 
         if cc == zone:  # poids fort (coarse) de la position du fader
