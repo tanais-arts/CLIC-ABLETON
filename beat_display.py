@@ -1664,6 +1664,7 @@ class App:
             self._trim_listened_clip = None
             self._trim_touched_tracks.clear()
             self._update_trim_button()
+            self.hui_bridge_2.send_tempo_select_feedback(False)
             self._refresh_hui_feedback()
             return
         if self._scene_index is None:
@@ -1671,6 +1672,7 @@ class App:
             return
         self._trim_enabled = True
         self._update_trim_button()
+        self.hui_bridge_2.send_tempo_select_feedback(True)
         self._refresh_trim_faders()
 
     def _poll_trim_fader_repeat(self) -> None:
@@ -3684,7 +3686,7 @@ class App:
     def _draw_digit(
         self, beat: int, fill: str = FG_TEXT, size_scale: float = 1.0, top_aligned: bool = False,
     ) -> None:
-        self._hide_canvas_items("circle_left", "circle_right", "line_track", "line_fill")
+        self._hide_canvas_items("circle_left", "circle_right", "pulse_dot")
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
@@ -3703,7 +3705,7 @@ class App:
         # Deux cercles côte à côte : celui de gauche se remplit aux temps
         # impairs (1, 3...), celui de droite aux temps pairs (2, 4...) —
         # l'alternance rend le pulse visible à chaque temps.
-        self._hide_canvas_items("digit", "line_track", "line_fill")
+        self._hide_canvas_items("digit", "pulse_dot")
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
@@ -3721,34 +3723,23 @@ class App:
                 item, fill=fill if filled else bg, outline=fill, width=3, state="normal",
             )
 
-    def _draw_scroll_line(
-        self, beats_per_bar: int, beat: int, fractional: float, top_aligned: bool = False,
-    ) -> None:
-        # À l'arrêt : la ligne se remplit de gauche à droite au milieu de
-        # l'écran (façon barre de progression), synchronisée sur le temps réel
-        # (vide au temps 1, pleine à la fin du dernier temps de la mesure).
-        # Remontée en haut (top_aligned) comme les chiffres/points quand les
-        # paroles sont activées, pour ne jamais empiéter sur leur zone.
+    def _draw_pulse_dot(self, fractional: float, top_aligned: bool = False) -> None:
+        # À l'arrêt (tempo déjà connu) : un point qui pulse à chaque temps,
+        # même principe que le point d'amorce des scènes chiffrées côté page
+        # web (#prerollDot) — remplace l'ancienne barre de progression.
         self._hide_canvas_items("digit", "circle_left", "circle_right")
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
             return
-        beats_per_bar = max(1, beats_per_bar)
-        bar_phase = ((beat - 1) + fractional) / beats_per_bar
-        x0, x1 = width * 0.15, width * 0.85
-        y = height * 0.25 if top_aligned else height / 2
-        track, _ = self._get_canvas_item("line_track", lambda: canvas.create_line(0, 0, 0, 0))
-        canvas.coords(track, x0, y, x1, y)
-        canvas.itemconfigure(track, fill="#3a3a3a", width=4, state="normal")
-        fill_end = x0 + bar_phase * (x1 - x0)
-        fill_item = self._canvas_items.get("line_fill")
-        if fill_end > x0:
-            fill_item, _ = self._get_canvas_item("line_fill", lambda: canvas.create_line(0, 0, 0, 0))
-            canvas.coords(fill_item, x0, y, fill_end, y)
-            canvas.itemconfigure(fill_item, fill=FG_TEXT, width=4, state="normal")
-        elif fill_item is not None:
-            canvas.itemconfigure(fill_item, state="hidden")
+        diameter = min(width, height) * 0.3
+        radius = diameter / 2
+        cx = width / 2
+        cy = height * 0.25 if top_aligned else height / 2
+        item, _ = self._get_canvas_item("pulse_dot", lambda: canvas.create_oval(0, 0, 0, 0))
+        canvas.coords(item, cx - radius, cy - radius, cx + radius, cy + radius)
+        fill = _lerp_color(FG_TEXT, BG_IDLE, fractional)
+        canvas.itemconfigure(item, fill=fill, outline=fill, state="normal")
 
     def _scene_flash_bg(self, bg: str) -> str:
         """Double flash blanc (2×150 ms, séparés d'un court silence) au-dessus
@@ -3846,14 +3837,14 @@ class App:
             else:
                 self._hide_lyrics_scroll_items()
         elif self._last_bpm and not running:
-            self._draw_scroll_line(beats_per_bar, beat, fractional, top_aligned=lyrics_enabled)
+            self._draw_pulse_dot(fractional, top_aligned=lyrics_enabled)
             # STOP (transport arrêté mais tempo déjà connu) : les paroles ne
             # doivent PAS disparaître, elles restent figées à l'écran (même
             # affichage que le dernier temps joué) jusqu'au prochain PLAY.
             if not lyrics_enabled:
                 self._hide_lyrics_scroll_items()
         else:
-            self._hide_canvas_items("digit", "circle_left", "circle_right", "line_track", "line_fill")
+            self._hide_canvas_items("digit", "circle_left", "circle_right", "pulse_dot")
             self._hide_lyrics_scroll_items()
 
         if bpm:

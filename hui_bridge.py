@@ -57,6 +57,7 @@ PORT_ON_MASK = 0x40
 PORT_NUMBER_MASK = 0x07
 FADER_PORT = 0
 MUTE_PORT = 2
+SELECT_PORT = 1
 PING_INTERVAL = 1.0  # secondes
 # Après un mouvement de fader local, on ignore les retours OSC qui ne
 # confirment pas la valeur envoyée pendant cette durée : ce sont des échos
@@ -336,6 +337,16 @@ class HuiBridge:
         coarse, fine = raw >> 7, raw & 0x7F
         self._midi_out.send_message([0xB0, self._tempo_zone, coarse])
         self._midi_out.send_message([0xB0, self._tempo_zone + 32, fine])
+
+    def send_tempo_select_feedback(self, on: bool) -> None:
+        """Allume/éteint la LED du bouton SELECT de la tranche tempo (utilisé
+        pour basculer le mode TRIM, voir beat_display.py) : même schéma
+        zone/port que le mute, sur le port SELECT au lieu de MUTE_PORT."""
+        if self._midi_out is None or self._tempo_zone is None:
+            return
+        value = SELECT_PORT | (PORT_ON_MASK if on else 0)
+        self._midi_out.send_message([0xB0, ZONE_CC_OUT, self._tempo_zone])
+        self._midi_out.send_message([0xB0, PORT_CC_OUT, value])
 
     def send_mute_feedback(self, track_index: int, muted: bool) -> None:
         """Renvoie vers la console l'état mute réel d'Ableton pour
