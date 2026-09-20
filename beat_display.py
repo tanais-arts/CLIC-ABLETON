@@ -61,6 +61,11 @@ FG_TEXT = "#f5f5f5"
 LIVE_ZERO_DB_VOLUME = 0.85
 EMERGENCY_FADE_MS = 1000  # durée du fondu des faders Live au bouton d'urgence
 EMERGENCY_FADE_STEPS = 10
+# Dans Live, Clip.gain est normalisé : 0.0 = -inf, 0.5 = 0 dB, 1.0 = +24 dB.
+# Sur le HUI de la console, 0.5 correspond actuellement à -15 dB. La
+# graduation -10 dB est calibrée à environ 60% de la course.
+TRIM_LIVE_ZERO_GAIN = 0.5
+TRIM_HUI_ZERO_DB_POSITION = 0.60
 
 
 def _lerp_color(start: str, end: str, t: float) -> str:
@@ -1633,7 +1638,32 @@ class App:
     def _send_trim_fader_feedback(self, track_index: int, gain: float, force: bool = False) -> None:
         bridge = self._hui_bridge_for_track(track_index)
         if bridge is not None:
-            bridge.send_volume_feedback(track_index, gain, force=force)
+            raw_position = round(self._trim_live_gain_to_hui_position(gain) * 16383)
+            bridge.send_volume_feedback(track_index, raw_position / 16383.0, force=force)
+
+    @staticmethod
+    def _trim_hui_position_to_live_gain(position: float) -> float:
+        """Convertit la position HUI (0..1) en Clip.gain normalisé."""
+        position = max(0.0, min(1.0, position))
+        if position <= TRIM_HUI_ZERO_DB_POSITION:
+            return position * TRIM_LIVE_ZERO_GAIN / TRIM_HUI_ZERO_DB_POSITION
+        return TRIM_LIVE_ZERO_GAIN + (
+            (position - TRIM_HUI_ZERO_DB_POSITION)
+            * (1.0 - TRIM_LIVE_ZERO_GAIN)
+            / (1.0 - TRIM_HUI_ZERO_DB_POSITION)
+        )
+
+    @staticmethod
+    def _trim_live_gain_to_hui_position(gain: float) -> float:
+        """Convertit Clip.gain normalisé en position HUI (0..1)."""
+        gain = max(0.0, min(1.0, gain))
+        if gain <= TRIM_LIVE_ZERO_GAIN:
+            return gain * TRIM_HUI_ZERO_DB_POSITION / TRIM_LIVE_ZERO_GAIN
+        return TRIM_HUI_ZERO_DB_POSITION + (
+            (gain - TRIM_LIVE_ZERO_GAIN)
+            * (1.0 - TRIM_HUI_ZERO_DB_POSITION)
+            / (1.0 - TRIM_LIVE_ZERO_GAIN)
+        )
 
     def _handle_hui_track_fader(self, track_index: int, value: float) -> bool:
         if not self._trim_enabled:
@@ -1642,7 +1672,7 @@ class App:
         if scene_index is None or not self._trim_clip_has_clip.get(track_index, False):
             self._send_trim_fader_feedback(track_index, 0.0, force=True)
             return True
-        gain = max(0.0, min(1.0, value))
+        gain = self._trim_hui_position_to_live_gain(value)
         self._trim_clip_gains[track_index] = gain
         try:
             self.live_osc.set_clip_gain(track_index, scene_index, gain)
