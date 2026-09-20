@@ -517,11 +517,13 @@ class App:
         # demande de rappel du tempo d'origine du morceau, appliquée au
         # prochain temps (voir _poll_tempo_reset/_schedule_tempo_reset).
         self._tempo_reset_queue: "queue.Queue[None]" = queue.Queue()
+        self._trim_toggle_queue: "queue.Queue[None]" = queue.Queue()
         self._tempo_reset_after_id: str | None = None
         self.hui_bridge_2 = HuiBridge(
             self.live_osc, log=lambda msg: print(f"[HUI] {msg}"), zone_to_track=zone_map_2,
             tempo_zone=self.TEMPO_FADER_ZONE, on_tempo_fader=self._tempo_fader_queue.put,
             on_tempo_reset=lambda: self._tempo_reset_queue.put(None), on_track_fader=self._handle_hui_track_fader,
+            on_tempo_select=lambda: self._trim_toggle_queue.put(None),
         )
         # Tempo de référence ("morceau chargé sans modification", position
         # centrale du fader 16) : voir _on_link_tempo_observed/_apply_tempo_fader.
@@ -2283,6 +2285,17 @@ class App:
         if triggered:
             self._schedule_tempo_reset()
 
+    def _poll_trim_toggle(self) -> None:
+        triggered = False
+        try:
+            while True:
+                self._trim_toggle_queue.get_nowait()
+                triggered = True
+        except queue.Empty:
+            pass
+        if triggered:
+            self._toggle_trim_mode()
+
     def _schedule_tempo_reset(self) -> None:
         """Calcule le délai jusqu'au prochain temps directement à partir de la
         phase/tempo Link courants (déterministe, indépendant du rythme des
@@ -3054,6 +3067,7 @@ class App:
         self._poll_tempo_fader()
         self._poll_tempo_fader_keepalive()
         self._poll_tempo_reset()
+        self._poll_trim_toggle()
         if self.mode_var.get() == "midi":
             try:
                 while True:
