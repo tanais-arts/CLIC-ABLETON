@@ -28,6 +28,7 @@ from config import DEFAULT_HUI_TRACK_MAPPING, load_config, save_config
 from hui_bridge import HuiBridge
 from link_client import AbletonLink, LinkUnavailable
 from live_osc import LiveOSC
+from midi_clock import MidiClockSender
 from lyrics import LyricsSheet, load_lyrics, save_lyrics_line
 from scene_sheet import SceneSheet, SceneSheetRow, load_scene_sheet
 from web_server import BeatWebServer, SharedBeatState
@@ -371,6 +372,9 @@ class App:
         # -- Source Ableton Link (recommandée) --
         self.link: AbletonLink | None = None
         self.link_error: str | None = None
+        self.midi_clock_sender = MidiClockSender(
+            port_name=self.config.get("midi_clock_port", "YAMAHA 01V96 Port1"), log=print,
+        )
 
         # -- Page web locale pour smartphone --
         self.shared_state = SharedBeatState()
@@ -683,6 +687,7 @@ class App:
         self._refresh_ports()
         if self.config.get("midi_port"):
             self.port_var.set(self.config["midi_port"])
+        self._refresh_midi_clock_ports()
         self._refresh_controller_ports()
         self._refresh_controller_ports_2()
         self._refresh_controller_ports_3()
@@ -1197,6 +1202,18 @@ class App:
         self._refresh_metronome_devices()
 
         # -- Contrôleur MIDI (ex. Behringer BCF2000) pour piloter les mêmes boutons --
+        clock_row = tk.Frame(midi_content, bg=BG_IDLE)
+        clock_row.pack(fill="x", pady=(0, 4))
+        tk.Label(clock_row, text="MIDI CLOCK OUT :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
+        self.midi_clock_port_var = tk.StringVar(value=self.midi_clock_sender.port_name)
+        self.midi_clock_port_combo = ttk.Combobox(
+            clock_row, textvariable=self.midi_clock_port_var, state="readonly", width=22,
+        )
+        self.midi_clock_port_combo.pack(side="left", padx=6)
+        tk.Button(clock_row, text="Rafraîchir", command=self._refresh_midi_clock_ports).pack(side="left", padx=2)
+        self.midi_clock_port_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_midi_clock_port_change())
+
+        # -- Contrôleur MIDI (ex. Behringer BCF2000) pour piloter les mêmes boutons --
         controller_row = tk.Frame(midi_content, bg=BG_IDLE)
         controller_row.pack(fill="x", pady=(0, 4))
         tk.Label(controller_row, text="MIDI IN OSC Boutons :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left")
@@ -1434,6 +1451,22 @@ class App:
         self.controller_port_combo["values"] = ports
         if ports and not self.controller_port_var.get():
             self.controller_port_var.set(ports[0])
+
+    def _refresh_midi_clock_ports(self) -> None:
+        ports = MidiClockSender.list_ports()
+        self.midi_clock_port_combo["values"] = ports
+        if self.midi_clock_sender.port_name in ports:
+            self.midi_clock_port_var.set(self.midi_clock_sender.port_name)
+        elif ports and not self.midi_clock_port_var.get():
+            self.midi_clock_port_var.set(ports[0])
+
+    def _on_midi_clock_port_change(self) -> None:
+        port_name = self.midi_clock_port_var.get()
+        if not port_name:
+            return
+        self.midi_clock_sender.set_port_name(port_name)
+        self.config["midi_clock_port"] = port_name
+        save_config(self.config)
 
     def _refresh_controller_ports_2(self) -> None:
         ports = self.controller.list_ports()
@@ -2203,6 +2236,7 @@ class App:
             self.status_label.config(text=f"Ableton Link indisponible : {exc}")
             return None
         self.link = link
+        self.midi_clock_sender.start(link)
         return self.link
 
     def _set_tempo(self) -> None:
@@ -3843,6 +3877,7 @@ class App:
         self._metronome_thread.join(timeout=1.0)
         self._close_link_dialog()
         self.listener.close()
+        self.midi_clock_sender.close()
         if self.link is not None:
             self.link.close()
         self.live_osc.close()

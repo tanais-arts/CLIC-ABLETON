@@ -18,6 +18,7 @@ DEFAULTS = {
     "midi_port": "",
     "beats_per_bar": 4,
     "web_port": 8765,
+    "midi_clock_port": "YAMAHA 01V96 Port1",
     # YAMAHA 01V96 (Note On canal 1) : G-2 pour -1, Sol#-2 pour +1.
     "controller_map_minus": ["note", 0, 7],
     "controller_map_plus": ["note", 0, 8],
