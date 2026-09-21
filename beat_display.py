@@ -2965,11 +2965,18 @@ class App:
             cache.append(cache[-1] + self._count_for_mes(bar_just_started))
         return cache[mes - 1]
 
-    def _push_lyrics_state(self, beat: int, fractional: float) -> None:
+    def _push_lyrics_state(self, beat: int, fractional: float, connected: bool = True) -> None:
         """Pousse vers la page web la position continue dans le morceau (même
         calcul que _draw_lyrics_scroll) : elle fait ainsi défiler les paroles
         à la même vitesse que le grand écran (le texte lui-même est poussé
-        une seule fois par morceau, voir set_lyrics_lines)."""
+        une seule fois par morceau, voir set_lyrics_lines).
+
+        `connected=False` (arrêt) : ne pousse rien, pour que la page web garde
+        la dernière position connue au lieu de continuer d'avancer jusqu'à la
+        fin de la mesure en cours (Link continue de faire tourner sa propre
+        horloge même à l'arrêt, donc `beat`/`fractional` seuls ne gèlent pas)."""
+        if not connected:
+            return
         if self._lyrics_sheet is None or self._bar_count is None:
             self.shared_state.set_lyrics_position(None)
             return
@@ -3218,7 +3225,7 @@ class App:
                 self.midi_state.phase(), self.midi_state.beats_per_bar,
                 self.midi_state.bpm, connected, running, "midi",
             )
-            self._push_lyrics_state(beat, phase % 1.0)
+            self._push_lyrics_state(beat, phase % 1.0, connected=connected)
             # Le fader 16 pilote le tempo via Link indépendamment du mode
             # d'affichage choisi (comme les boutons -1/+1) : on garde le tempo
             # de référence et le champ de tempo à jour même si l'affichage
@@ -3263,7 +3270,7 @@ class App:
             else:
                 self._update_display(1, int(quantum), 0.0, None, False, False)
                 self.shared_state.update(0.0, quantum, None, False, False, "offline")
-                self._push_lyrics_state(1, 0.0)
+                self._push_lyrics_state(1, 0.0, connected=False)
         else:
             link = self._ensure_link()
             if link is not None:
@@ -3359,7 +3366,7 @@ class App:
                 self.shared_state.update(
                     bar_relative_phase, quantum, snapshot["bpm"], connected, snapshot["is_playing"], "link",
                 )
-                self._push_lyrics_state(beat, fractional)
+                self._push_lyrics_state(beat, fractional, connected=connected)
 
         self.root.after(30, self._poll)
 
@@ -3724,22 +3731,21 @@ class App:
             )
 
     def _draw_pulse_dot(self, fractional: float, top_aligned: bool = False) -> None:
-        # À l'arrêt (tempo déjà connu) : un point qui pulse à chaque temps,
-        # même principe que le point d'amorce des scènes chiffrées côté page
-        # web (#prerollDot) — remplace l'ancienne barre de progression.
+        # Carré STOP simple, fixe, évidé, avec un fade noir léger sur un temps
+        # court pour le faire clignoter sans jamais se remplir.
         self._hide_canvas_items("digit", "circle_left", "circle_right")
         canvas = self.display
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width <= 1 or height <= 1:
             return
-        diameter = min(width, height) * 0.3
-        radius = diameter / 2
+        size = min(width, height) * 0.2
         cx = width / 2
         cy = height * 0.25 if top_aligned else height / 2
-        item, _ = self._get_canvas_item("pulse_dot", lambda: canvas.create_oval(0, 0, 0, 0))
-        canvas.coords(item, cx - radius, cy - radius, cx + radius, cy + radius)
-        fill = _lerp_color(FG_TEXT, BG_IDLE, fractional)
-        canvas.itemconfigure(item, fill=fill, outline=fill, state="normal")
+        item, _ = self._get_canvas_item("pulse_dot", lambda: canvas.create_rectangle(0, 0, 0, 0))
+        half = size / 2
+        canvas.coords(item, cx - half, cy - half, cx + half, cy + half)
+        outline = _lerp_color(FG_TEXT, BG_IDLE, fractional)
+        canvas.itemconfigure(item, fill="", outline=outline, width=max(1, int(size * 0.08)), state="normal")
 
     def _scene_flash_bg(self, bg: str) -> str:
         """Double flash blanc (2×150 ms, séparés d'un court silence) au-dessus

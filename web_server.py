@@ -85,6 +85,17 @@ _PAGE = """<!DOCTYPE html>
     from { transform: scale(1.25); opacity: 1; }
     to { transform: scale(0.85); opacity: 0.35; }
   }
+  /* A l'arret (tempo connu, transport stoppe) : carré fixe, vide, bord fin,
+     avec un fade vers le noir sur un temps court. */
+  #stopIcon {
+    display: none; width: 10vh; height: 10vh; background: transparent;
+    border: 0.4vh solid #f5f5f5; box-sizing: border-box;
+    animation: stopIconFade 400ms ease-in-out infinite alternate;
+  }
+  @keyframes stopIconFade {
+    from { border-color: #f5f5f5; opacity: 1; }
+    to { border-color: #000000; opacity: 0.45; }
+  }
   #digit {
     display: none;
     font-size: 40vh; font-weight: bold; color: #f5f5f5;
@@ -288,6 +299,7 @@ _PAGE = """<!DOCTYPE html>
   <div id="beat">
     <div id="dot">•</div>
     <div id="prerollDot"></div>
+    <div id="stopIcon"></div>
     <div id="digit"></div>
     <div id="dotsPair"><div id="dotLeft" class="circle"></div><div id="dotRight" class="circle"></div></div>
     <div id="offline">OFFLINE</div>
@@ -363,7 +375,6 @@ slider.addEventListener('input', () => {
 });
 
 let lastBeat = null;
-let lastBarPhase = 0;
 let lastPrerollPhase = 0;
 let lastSceneLaunched = false;
 const SCENE_FLASH_PULSE_MS = 150;
@@ -380,6 +391,7 @@ function sceneFlashDouble() {
 const beatEl = document.getElementById('beat');
 const dotEl = document.getElementById('dot');
 const prerollDotEl = document.getElementById('prerollDot');
+const stopIconEl = document.getElementById('stopIcon');
 const digitEl = document.getElementById('digit');
 const dotsPairEl = document.getElementById('dotsPair');
 const dotLeftEl = document.getElementById('dotLeft');
@@ -677,6 +689,7 @@ async function poll() {
     if (data.offline) {
       dotEl.style.display = 'none';
       prerollDotEl.style.display = 'none';
+      stopIconEl.style.display = 'none';
       digitEl.style.display = 'none';
       dotsPairEl.style.display = 'none';
       offlineEl.style.display = 'block';
@@ -687,6 +700,7 @@ async function poll() {
     offlineEl.style.display = 'none';
     if (data.connected) {
       dotEl.style.display = 'none';
+      stopIconEl.style.display = 'none';
       if (data.preroll) {
         // Amorce chiffrée (voir beat_display._scene_launch) : un point qui
         // pulse au tempo remplace le chiffre "1" fixe (toujours 1 en 1/4).
@@ -742,21 +756,14 @@ async function poll() {
       lastBeat = null;
       nextClickAt = null;
       if (data.bpm && !data.running) {
-        // À l'arrêt (mais tempo connu) : un point qui pulse à chaque temps,
-        // même animation que le point d'amorce des scènes chiffrées
-        // (#prerollDot ci-dessus) — remplace l'ancienne barre de progression.
+        // A l'arret (tempo connu) : logo STOP fixe, sans clignotement,
+        // remplace l'ancienne barre de progression.
         dotEl.style.display = 'none';
-        prerollDotEl.style.display = 'block';
-        const barPhase = data.bar_phase || 0;
-        if (barPhase < lastBarPhase) {
-          prerollDotEl.style.animationDuration = (60000 / data.bpm) + 'ms';
-          retrigger(prerollDotEl, 'pulse');
-        }
-        lastBarPhase = barPhase;
+        stopIconEl.style.display = 'block';
       } else {
-        // Pas de tempo connu, ou transport relancé mais pas encore
-        // resynchronisé sur le temps 1 : rien qui induirait en erreur.
-        prerollDotEl.style.display = 'none';
+        // Pas de tempo connu, ou transport relance mais pas encore
+        // resynchronise sur le temps 1 : rien qui induirait en erreur.
+        stopIconEl.style.display = 'none';
         dotEl.style.display = data.bpm ? 'none' : 'block';
       }
     }
@@ -885,6 +892,12 @@ _LEGACY_PAGE = """<!DOCTYPE html>
     from { transform: scale(1.25); opacity: 1; }
     to { transform: scale(0.85); opacity: 0.35; }
   }
+  /* A l'arret (tempo connu, transport stoppe) : logo carre fixe, jamais
+     anime (contrairement a #prerollDot ci-dessus). */
+  #stopIcon {
+    display: none; width: 10vh; height: 10vh; background: transparent;
+    border: 0.7vh solid #f5f5f5; box-sizing: border-box; margin: 1vh 0;
+  }
   #digit { display: none; font-size: 40vh; font-weight: bold; color: #f5f5f5; margin: 1vh 0; }
   #dotsPair { display: none; margin: 1vh 0; }
   #dotsPair .circle {
@@ -990,6 +1003,7 @@ _LEGACY_PAGE = """<!DOCTYPE html>
   <div id="beat">
     <div id="dot">&bull;</div>
     <div id="prerollDot"></div>
+    <div id="stopIcon"></div>
     <div id="digit">--</div>
     <div id="dotsPair"><span id="dotLeft" class="circle"></span><span id="dotRight" class="circle"></span></div>
     <div id="offline">OFFLINE</div>
@@ -1026,7 +1040,8 @@ if ('wakeLock' in navigator) {
 // moderne ci-dessus.
 var noSleepVideo = document.getElementById('noSleepVideo');
 function keepScreenAwake() {
-  noSleepVideo.play().catch(function () {});
+  var playResult = noSleepVideo.play();
+  if (playResult && playResult.catch) { playResult.catch(function () {}); }
 }
 keepScreenAwake();
 document.addEventListener('visibilitychange', function () {
@@ -1038,10 +1053,11 @@ document.addEventListener('visibilitychange', function () {
 function unmuteNoSleepAudio() {
   noSleepVideo.muted = false;
   noSleepVideo.volume = 1;
-  noSleepVideo.play().catch(function () {});
+  var playResult = noSleepVideo.play();
+  if (playResult && playResult.catch) { playResult.catch(function () {}); }
 }
-document.addEventListener('click', unmuteNoSleepAudio, { once: true });
-document.addEventListener('touchstart', unmuteNoSleepAudio, { once: true });
+document.addEventListener('click', unmuteNoSleepAudio, false);
+document.addEventListener('touchstart', unmuteNoSleepAudio, false);
 
 var KEY = 'beatDisplayLatencyMs';
 var slider = document.getElementById('latencySlider');
@@ -1053,6 +1069,7 @@ slider.oninput = saveLatency;
 
 var dotEl = document.getElementById('dot');
 var prerollDotEl = document.getElementById('prerollDot');
+var stopIconEl = document.getElementById('stopIcon');
 var digitEl = document.getElementById('digit');
 var dotsPairEl = document.getElementById('dotsPair');
 var dotLeftEl = document.getElementById('dotLeft');
@@ -1064,7 +1081,6 @@ var barCountEl = document.getElementById('barCount');
 var sceneLabelCurrentEl = document.getElementById('sceneLabelCurrent');
 var sceneLabelNextEl = document.getElementById('sceneLabelNext');
 var lastBeat = null;
-var lastBarPhase = 0;
 var lastPrerollPhase = 0;
 
 function retrigger(className) {
@@ -1353,6 +1369,7 @@ function render(data) {
   if (data.offline) {
     dotEl.style.display = 'none';
     prerollDotEl.style.display = 'none';
+    stopIconEl.style.display = 'none';
     digitEl.style.display = 'none';
     dotsPairEl.style.display = 'none';
     offlineEl.style.display = 'block';
@@ -1361,6 +1378,7 @@ function render(data) {
   offlineEl.style.display = 'none';
   if (data.connected) {
     dotEl.style.display = 'none';
+    stopIconEl.style.display = 'none';
     if (data.preroll) {
       // Amorce chiffrée (voir beat_display._scene_launch) : un point qui
       // pulse au tempo remplace le chiffre "1" fixe (toujours 1 en 1/4).
@@ -1405,19 +1423,12 @@ function render(data) {
     lastBeat = null;
     nextClickAt = null;
     if (data.bpm && !data.running) {
-      // À l'arrêt (mais tempo connu) : un point qui pulse à chaque temps,
-      // même animation que le point d'amorce des scènes chiffrées
-      // (#prerollDot ci-dessus) — remplace l'ancienne barre de progression.
+      // A l'arret (tempo connu) : logo STOP fixe, sans clignotement,
+      // remplace l'ancienne barre de progression.
       dotEl.style.display = 'none';
-      prerollDotEl.style.display = 'block';
-      var barPhase = data.bar_phase || 0;
-      if (barPhase < lastBarPhase) {
-        prerollDotEl.style.animationDuration = (60000 / data.bpm) + 'ms';
-        retriggerEl(prerollDotEl, 'pulse');
-      }
-      lastBarPhase = barPhase;
+      stopIconEl.style.display = 'block';
     } else {
-      prerollDotEl.style.display = 'none';
+      stopIconEl.style.display = 'none';
       dotEl.style.display = data.bpm ? 'none' : 'block';
     }
   }
@@ -1740,15 +1751,16 @@ def _make_handler(shared_state: SharedBeatState):
 
 
 def local_ip() -> str:
-    """Meilleure estimation de l'IP locale (celle utilisée pour sortir sur le réseau)."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    """Retourne uniquement une adresse locale en 192.x pour l'affichage."""
     try:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        sock.close()
+        addresses = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        for address in addresses:
+            ip = address[4][0]
+            if ip.startswith("192."):
+                return ip
+    except socket.gaierror:
+        pass
+    return "127.0.0.1"
 
 
 class BeatWebServer:
