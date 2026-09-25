@@ -52,6 +52,8 @@ DEFAULTS = {
     "metronome_audio_channels_2": 2,
     "metronome_kit_2": "Kit1",
     "metronome_audio_latency_ms_2": 10,
+    # Volume commun aux deux sorties du métronome (pourcentage).
+    "metronome_audio_volume": 100,
     # Live 1-5 -> console 1-5 ; Live 6-12 -> console 8,9,11-15.
     # Console 16 reste réservée au tempo ; Live 13-16 sont non affectées.
     "hui_track_mapping": list(DEFAULT_HUI_TRACK_MAPPING),

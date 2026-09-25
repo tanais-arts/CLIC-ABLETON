@@ -413,6 +413,8 @@ class App:
         self._audio_metronome.configure(
             self.config["metronome_audio_device"], self.config["metronome_audio_channels"],
         )
+        self._metronome_volume = max(0, min(100, int(self.config["metronome_audio_volume"])))
+        self._audio_metronome.set_volume(self._metronome_volume / 100.0)
         self._audio_metronome.set_enabled(True)
         # Deuxième sortie (voir _build_ui metronome_frame_2) : jouée en
         # parallèle de la première quand activée, propre carte son/kit/latence.
@@ -421,6 +423,7 @@ class App:
         self._audio_metronome_2.configure(
             self.config["metronome_audio_device_2"], self.config["metronome_audio_channels_2"],
         )
+        self._audio_metronome_2.set_volume(self._metronome_volume / 100.0)
         # Cache non-Tkinter du mode courant, lu par _metronome_loop (thread
         # séparé : lire un tk.StringVar hors du thread Tk n'est pas sûr).
         self._mode_cache: str = self.config["mode"]
@@ -942,11 +945,13 @@ class App:
         controls_row_2 = tk.Frame(controls_rows, bg=BG_IDLE)
         controls_row_2.pack(fill="x")
         MINI_SIZE = 22  # pixels : taille fixe pour que A/E soient réellement carrés
+        VOLUME_SLIDER_WIDTH = 44
         self.learn_buttons: dict[str, tk.Button] = {}
         self.clear_buttons: dict[str, tk.Button] = {}
         self.action_buttons: dict[str, tk.Frame] = {}
         self._control_buttons: dict[str, tk.Button] = {}
         self._action_flash_after_id: dict[str, str] = {}
+        self.metronome_volume_var = tk.IntVar(value=self._metronome_volume)
         # Fond persistant (jaune si actif) des boutons Lecture/M1/M2, distinct
         # du flash bref MIDI ci-dessous (_flash_action_button le restaure ici
         # plutôt que vers BG_IDLE une fois le flash terminé).
@@ -972,8 +977,16 @@ class App:
                 self.learn_buttons[action] = add_mini_button(mini, "A", lambda: self._start_learn(action))
                 self.clear_buttons[action] = add_mini_button(mini, "E", lambda: self._clear_assignment(action))
             else:
-                mini.config(width=MINI_SIZE)
+                mini.config(width=VOLUME_SLIDER_WIDTH, height=56)
                 mini.pack_propagate(False)
+                if action == "metronome_2":
+                    tk.Scale(
+                        mini, from_=100, to=0, resolution=1, orient="vertical",
+                        variable=self.metronome_volume_var, showvalue=False,
+                        command=self._on_metronome_volume_change, length=56,
+                        width=14, sliderlength=16, bd=0, highlightthickness=0,
+                        bg=BG_IDLE, troughcolor="#555555",
+                    ).pack(fill="both", expand=True)
             # macOS Aqua ignore le bg d'un tk.Button natif : on flashe ce cadre autour, pas le bouton.
             # Taille de la boîte fixée en pixels (pack_propagate(False)) plutôt qu'en
             # largeur/hauteur "caractères" du Button : cette dernière dépend de la
@@ -2222,6 +2235,16 @@ class App:
             return
         self._metronome_latency_ms_cache_2 = latency
         self.config["metronome_audio_latency_ms_2"] = latency
+        save_config(self.config)
+
+    def _on_metronome_volume_change(self, value: str) -> None:
+        """Applique le volume commun à M1/M2 sans rouvrir leurs flux audio."""
+        volume = max(0, min(100, round(float(value))))
+        self._metronome_volume = volume
+        gain = volume / 100.0
+        self._audio_metronome.set_volume(gain)
+        self._audio_metronome_2.set_volume(gain)
+        self.config["metronome_audio_volume"] = volume
         save_config(self.config)
 
     # --------------------------------------------------------- Ableton Link --

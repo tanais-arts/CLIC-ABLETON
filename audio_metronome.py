@@ -70,6 +70,7 @@ class AudioMetronome:
         self._click_up, _ = _load_wav_mono(_SOUNDS_DIR / DEFAULT_KIT / "click_up.wav")
         self.device_name: str | None = None
         self.channels: int = 2
+        self.volume: float = 1.0
         self._prepared_click: np.ndarray
         self._prepared_click_up: np.ndarray
         self._prepare_buffers()
@@ -108,6 +109,11 @@ class AudioMetronome:
             self._open_stream()
         else:
             self._close_stream()
+
+    def set_volume(self, volume: float) -> None:
+        """Règle le gain de sortie (0.0 à 1.0) sans rouvrir le flux audio."""
+        self.volume = max(0.0, min(1.0, float(volume)))
+        self._prepare_buffers()
 
     def close(self) -> None:
         self._close_stream()
@@ -156,6 +162,7 @@ class AudioMetronome:
         self._play_pos += n
 
     def _prepare(self, mono: np.ndarray) -> np.ndarray:
+        mono = mono * self.volume
         if self.channels == 1:
             return mono.reshape(-1, 1)
         return np.column_stack([mono, mono])
