@@ -16,6 +16,7 @@ import sounddevice as sd
 
 _SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
 DEFAULT_KIT = "Kit1"
+SILENT_KIT = "Inactif"
 
 
 def list_output_devices() -> list[str]:
@@ -31,8 +32,8 @@ def list_kits() -> list[str]:
     """Sous-dossiers de sounds/ contenant bien click.wav + click_up.wav
     (un "kit" de sons de clic), pour peupler le sélecteur."""
     if not _SOUNDS_DIR.is_dir():
-        return []
-    return sorted(
+        return [SILENT_KIT]
+    return [SILENT_KIT] + sorted(
         p.name for p in _SOUNDS_DIR.iterdir()
         if p.is_dir() and (p / "click.wav").is_file() and (p / "click_up.wav").is_file()
     )
@@ -89,6 +90,13 @@ class AudioMetronome:
     def set_kit(self, kit_name: str) -> None:
         """Change de dossier de sons de clic (voir list_kits) ; ignoré si le
         dossier ou ses fichiers sont introuvables (kit toujours utilisable)."""
+        if kit_name == SILENT_KIT:
+            self.kit_name = SILENT_KIT
+            self._play_buf = None
+            self._pending = None
+            self._play_pos = 0
+            self._prepare_buffers()
+            return
         kit_dir = _SOUNDS_DIR / (kit_name or DEFAULT_KIT)
         try:
             click, click_sr = _load_wav_mono(kit_dir / "click.wav")
@@ -169,8 +177,12 @@ class AudioMetronome:
 
     def _prepare_buffers(self) -> None:
         """Prépare les deux samples au format de sortie hors du chemin temps réel."""
-        self._prepared_click = self._prepare(self._click)
-        self._prepared_click_up = self._prepare(self._click_up)
+        if self.kit_name == SILENT_KIT:
+            self._prepared_click = self._prepare(np.zeros_like(self._click))
+            self._prepared_click_up = self._prepare(np.zeros_like(self._click_up))
+        else:
+            self._prepared_click = self._prepare(self._click)
+            self._prepared_click_up = self._prepare(self._click_up)
 
     def play(self, beat: int) -> None:
         if self._stream is None:

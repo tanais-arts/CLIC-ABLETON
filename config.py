@@ -79,6 +79,9 @@ def load_config() -> dict:
             config.update(json.load(handle))
     except (FileNotFoundError, json.JSONDecodeError):
         pass
+    for kit_key in ("metronome_kit", "metronome_kit_2"):
+        if config.get(kit_key) == "Silence":
+            config[kit_key] = "Inactif"
     # Migration des anciens mappings : M2 n'est plus piloté en MIDI et la
     # note 3 appartient à M1. Corrige aussi un ancien conflit enregistré où
     # M1 partageait la note 1/2 avec Stop ou Play.
