@@ -945,7 +945,7 @@ class App:
         controls_row_2 = tk.Frame(controls_rows, bg=BG_IDLE)
         controls_row_2.pack(fill="x")
         MINI_SIZE = 22  # pixels : taille fixe pour que A/E soient réellement carrés
-        VOLUME_SLIDER_WIDTH = 44
+        VOLUME_SLIDER_WIDTH = 26
         self.learn_buttons: dict[str, tk.Button] = {}
         self.clear_buttons: dict[str, tk.Button] = {}
         self.action_buttons: dict[str, tk.Frame] = {}
@@ -970,7 +970,9 @@ class App:
             font_size: int = 14, learnable: bool = True,
         ) -> None:
             group = tk.Frame(parent_row, bg=BG_IDLE)
-            group.pack(side="left", padx=4)
+            # Le curseur de M2 utilise la marge gauche de son groupe : sa
+            # largeur visible augmente sans déplacer M2 par rapport à ▼.
+            group.pack(side="left", padx=(0, 4) if action == "metronome_2" else 4)
             mini = tk.Frame(group, bg=BG_IDLE)
             mini.pack(side="left", padx=(0, 2))
             if learnable:
