@@ -23,7 +23,7 @@ from tkinter import font as tkfont, ttk
 
 import rtmidi
 
-from audio_metronome import AudioMetronome, list_kits, list_output_devices
+from audio_metronome import AudioMetronome, list_kits, list_output_devices, output_channel_starts
 from config import DEFAULT_HUI_TRACK_MAPPING, load_config, save_config
 from hui_bridge import HuiBridge
 from link_client import AbletonLink, LinkUnavailable
@@ -412,6 +412,7 @@ class App:
         self._audio_metronome.set_kit(self.config["metronome_kit"])
         self._audio_metronome.configure(
             self.config["metronome_audio_device"], self.config["metronome_audio_channels"],
+            self.config["metronome_audio_output_channel"],
         )
         self._metronome_volume = max(0, min(100, int(self.config["metronome_audio_volume"])))
         self._audio_metronome.set_volume(self._metronome_volume / 100.0)
@@ -422,6 +423,7 @@ class App:
         self._audio_metronome_2.set_kit(self.config["metronome_kit_2"])
         self._audio_metronome_2.configure(
             self.config["metronome_audio_device_2"], self.config["metronome_audio_channels_2"],
+            self.config["metronome_audio_output_channel_2"],
         )
         self._audio_metronome_2.set_volume(self._metronome_volume / 100.0)
         # Cache non-Tkinter du mode courant, lu par _metronome_loop (thread
@@ -436,6 +438,7 @@ class App:
         # que l'affichage irréguliers puisque tout passait par _poll(). Ce
         # thread ne touche à aucun widget Tk (voir _metronome_loop).
         self._metronome_thread_stop = threading.Event()
+        self._metronome_state_lock = threading.Lock()
         self._metronome_thread = threading.Thread(target=self._metronome_loop, daemon=True)
         # Comptage continu du temps DANS la mesure pour chaque sortie
         # métronome (même logique que self._link_beat_in_bar pour
@@ -673,6 +676,7 @@ class App:
         self._loop_jump_sent_for: int | None = None
         self._loop_exit_pending = False
         self._loop_warning = False
+        self._loop_reprise = False
         self._emergency_active = False
         self._emergency_waiting_for_tracks = False
         self._emergency_volume_waiting: set[int] = set()
@@ -1157,6 +1161,17 @@ class App:
             command=self._on_metronome_audio_change, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
             activebackground=BG_IDLE, activeforeground=FG_TEXT,
         ).pack(side="left", padx=(6, 0))
+        tk.Label(metronome_frame, text="Canaux carte :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", padx=(10, 0))
+        self.metronome_output_channel_var = tk.StringVar(
+            value=str(self.config["metronome_audio_output_channel"]),
+        )
+        self.metronome_output_channel_combo = ttk.Combobox(
+            metronome_frame, textvariable=self.metronome_output_channel_var, state="readonly", width=6,
+        )
+        self.metronome_output_channel_combo.pack(side="left", padx=(4, 0))
+        self.metronome_output_channel_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_metronome_audio_change(),
+        )
         tk.Label(metronome_frame, text="Latence clic (ms) :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", padx=(16, 0))
         self.metronome_latency_var = tk.IntVar(value=self.config["metronome_audio_latency_ms"])
         self.metronome_latency_spinbox = tk.Spinbox(
@@ -1204,6 +1219,17 @@ class App:
             command=self._on_metronome_audio_change_2, bg=BG_IDLE, fg=FG_TEXT, selectcolor="#333333",
             activebackground=BG_IDLE, activeforeground=FG_TEXT,
         ).pack(side="left", padx=(6, 0))
+        tk.Label(metronome_frame_2, text="Canaux carte :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", padx=(10, 0))
+        self.metronome_output_channel_var_2 = tk.StringVar(
+            value=str(self.config["metronome_audio_output_channel_2"]),
+        )
+        self.metronome_output_channel_combo_2 = ttk.Combobox(
+            metronome_frame_2, textvariable=self.metronome_output_channel_var_2, state="readonly", width=6,
+        )
+        self.metronome_output_channel_combo_2.pack(side="left", padx=(4, 0))
+        self.metronome_output_channel_combo_2.bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_metronome_audio_change_2(),
+        )
         tk.Label(metronome_frame_2, text="Latence clic (ms) :", bg=BG_IDLE, fg=FG_TEXT).pack(side="left", padx=(16, 0))
         self.metronome_latency_var_2 = tk.IntVar(value=self.config["metronome_audio_latency_ms_2"])
         self.metronome_latency_spinbox_2 = tk.Spinbox(
@@ -1900,6 +1926,8 @@ class App:
         LOOP explicite (0 ou 1), ou demande sa sortie si elle est active."""
         if self._loop_button_state == "active":
             self._loop_exit_pending = True
+            self._loop_reprise = False
+            self._render_next_scene_label()
             return
         if (
             self._loop_button_state != "available"
@@ -1956,7 +1984,24 @@ class App:
         if state not in {"unavailable", "available", "active"}:
             raise ValueError(f"État de bouton Boucle inconnu : {state}")
         self._loop_button_state = state
+        self._loop_reprise = False
+        self._render_next_scene_label()
         self._render_loop_button()
+
+    def _render_next_scene_label(self) -> None:
+        looping = self._loop_button_state == "active" and not self._loop_exit_pending
+        reprise = looping and self._loop_reprise
+        label = "REPRISE" if reprise else ("" if looping else self._next_scene_label_sticky)
+        self.shared_state.set_loop_active(looping)
+        self.shared_state.set_loop_reprise(reprise)
+        self.shared_state.set_next_scene_label(self._next_scene_label_sticky)
+        if not hasattr(self, "next_scene_label_label"):
+            return
+        self.next_scene_label_label.config(text=label, fg="#e0342b" if reprise else "#ffffff")
+        if label and not self.next_scene_label_label.winfo_manager():
+            self.next_scene_label_label.pack(side="left", padx=(10, 0))
+        elif not label and self.next_scene_label_label.winfo_manager():
+            self.next_scene_label_label.pack_forget()
 
     def _render_loop_button(self, fractional: float = 0.0, connected: bool = False) -> None:
         state = self._loop_button_state
@@ -2180,6 +2225,34 @@ class App:
         self.metronome_device_combo_2["values"] = values
         if self.metronome_device_var_2.get() not in devices:
             self.metronome_device_var_2.set(self.METRONOME_DEFAULT_DEVICE_LABEL)
+        self._refresh_metronome_output_channel_options(
+            self.metronome_device_var.get(), self.metronome_channels_var.get(),
+            self.metronome_output_channel_var, self.metronome_output_channel_combo,
+            "metronome_audio_output_channel",
+        )
+        self._refresh_metronome_output_channel_options(
+            self.metronome_device_var_2.get(), self.metronome_channels_var_2.get(),
+            self.metronome_output_channel_var_2, self.metronome_output_channel_combo_2,
+            "metronome_audio_output_channel_2",
+        )
+
+    def _refresh_metronome_output_channel_options(
+        self, device_label: str, channels: int, variable: tk.StringVar,
+        combo: ttk.Combobox, config_key: str,
+    ) -> int:
+        device = "" if device_label == self.METRONOME_DEFAULT_DEVICE_LABEL else device_label
+        channel_count = 1 if int(channels) == 1 else 2
+        starts = output_channel_starts(device, channel_count)
+        labels = [f"{start}-{start + 1}" if channel_count == 2 else str(start) for start in starts]
+        combo["values"] = labels
+        try:
+            selected = int(variable.get().split("-")[0])
+        except (ValueError, tk.TclError):
+            selected = int(self.config.get(config_key, 1))
+        if selected not in starts:
+            selected = starts[0]
+        variable.set(f"{selected}-{selected + 1}" if channel_count == 2 else str(selected))
+        return selected
 
     def _on_metronome_audio_change(self) -> None:
         device = self.metronome_device_var.get()
@@ -2189,10 +2262,15 @@ class App:
             channels = 1 if int(self.metronome_channels_var.get()) == 1 else 2
         except (tk.TclError, ValueError):
             channels = 2
+        first_channel = self._refresh_metronome_output_channel_options(
+            self.metronome_device_var.get(), channels, self.metronome_output_channel_var,
+            self.metronome_output_channel_combo, "metronome_audio_output_channel",
+        )
         self._audio_metronome.set_kit(self.metronome_kit_var.get())
-        self._audio_metronome.configure(device, channels)
+        self._audio_metronome.configure(device, channels, first_channel)
         self.config["metronome_audio_device"] = device
         self.config["metronome_audio_channels"] = channels
+        self.config["metronome_audio_output_channel"] = first_channel
         self.config["metronome_kit"] = self.metronome_kit_var.get()
         self._metronome_latency_ms_cache = self._safe_int_var(
             self.metronome_latency_var, "_metronome_latency_ms_cache",
@@ -2218,10 +2296,15 @@ class App:
             channels = 1 if int(self.metronome_channels_var_2.get()) == 1 else 2
         except (tk.TclError, ValueError):
             channels = 2
+        first_channel = self._refresh_metronome_output_channel_options(
+            self.metronome_device_var_2.get(), channels, self.metronome_output_channel_var_2,
+            self.metronome_output_channel_combo_2, "metronome_audio_output_channel_2",
+        )
         self._audio_metronome_2.set_kit(self.metronome_kit_var_2.get())
-        self._audio_metronome_2.configure(device, channels)
+        self._audio_metronome_2.configure(device, channels, first_channel)
         self.config["metronome_audio_device_2"] = device
         self.config["metronome_audio_channels_2"] = channels
+        self.config["metronome_audio_output_channel_2"] = first_channel
         self.config["metronome_kit_2"] = self.metronome_kit_var_2.get()
         self._metronome_latency_ms_cache_2 = self._safe_int_var(
             self.metronome_latency_var_2, "_metronome_latency_ms_cache_2",
@@ -2641,7 +2724,7 @@ class App:
                 # sélectionne automatiquement la scène suivante (comme un
                 # appui sur ▼), prête à être lancée avec le bouton ▶.
                 launched_index = self._scene_index
-                self.root.after(2000, lambda: self._auto_advance_scene(launched_index))
+                self.root.after(500, lambda: self._auto_advance_scene(launched_index))
             else:
                 self._reset_loop_state()
                 self.scene_name_label.config(fg=SCENE_LAUNCHED)
@@ -2659,14 +2742,9 @@ class App:
                 self._bar_count_prev_beat = None
                 self._bar_count_signature_pushed_for = None
                 self._awaiting_bar_start = True
-                # Même ancrage que l'affichage : M1/M2 attendent la prochaine
-                # frontière de noire, puis repartent par un clic UP sur 1.
-                # Ne pas utiliser phase % quantum ici : après le préroll 1/4,
-                # la phase absolue Link peut correspondre à 2, 3 ou 4 en 4/4.
-                self._metronome_beat_in_bar = 1
-                self._metronome_awaiting_scene_start = True
-                self._metronome_beat_in_bar_2 = 1
-                self._metronome_awaiting_scene_start_2 = True
+                # Repart sur une frontière postérieure au lancement, sans
+                # réutiliser un wrap déjà observé pendant le préroll.
+                self._arm_scene_downbeat()
                 self.bar_count_label.config(text="")
                 self.shared_state.set_bar_count(None)
                 # Feuille de scène XLSX (Feuilles/<nom de scène>.xlsx, voir
@@ -2712,6 +2790,36 @@ class App:
                 self._pending_goto_jump_beats = jump_beats or None
         except OSError as exc:
             self.scene_name_label.config(text=f"Erreur OSC : {exc}")
+
+    def _arm_scene_downbeat(self) -> None:
+        """Réinitialise l'affichage et M1/M2 sur la prochaine frontière Link
+        après la demande de lancement d'une scène réelle."""
+        link = self._ensure_link()
+        with self._metronome_state_lock:
+            display_fractional = metronome_fractional = metronome_fractional_2 = None
+            if link is not None:
+                try:
+                    display_fractional = link.snapshot(quantum=1.0)["phase"] % 1.0
+                    metronome_fractional = link.snapshot(
+                        quantum=1.0, offset_micros=int(self._metronome_latency_ms_cache * 1000),
+                    )["phase"] % 1.0
+                    metronome_fractional_2 = link.snapshot(
+                        quantum=1.0, offset_micros=int(self._metronome_latency_ms_cache_2 * 1000),
+                    )["phase"] % 1.0
+                except Exception:
+                    display_fractional = metronome_fractional = metronome_fractional_2 = None
+            now = time.monotonic()
+            self._link_beat_in_bar = 1
+            self._link_prev_fractional = display_fractional
+            self._link_last_update_time = now
+            self._metronome_beat_in_bar = 1
+            self._metronome_prev_fractional = metronome_fractional
+            self._metronome_last_update_time = now
+            self._metronome_awaiting_scene_start = True
+            self._metronome_beat_in_bar_2 = 1
+            self._metronome_prev_fractional_2 = metronome_fractional_2
+            self._metronome_last_update_time_2 = now
+            self._metronome_awaiting_scene_start_2 = True
 
     def _auto_advance_scene(self, expected_index: int) -> None:
         """Callback différée de _scene_launch : n'avance que si on est
@@ -3044,11 +3152,7 @@ class App:
             beats_until = self._cumulative_beats_at_bar(next_label_bar) - self._cumulative_beats_at_bar(mes)
             if beats_until <= NEXT_LABEL_ANNOUNCE_BEATS:
                 self._next_scene_label_sticky = self._scene_sheet.get(next_label_bar).label
-        self.shared_state.set_next_scene_label(self._next_scene_label_sticky)
-        if self._next_scene_label_sticky:
-            self.next_scene_label_label.pack(side="left", padx=(10, 0))
-        else:
-            self.next_scene_label_label.pack_forget()
+        self._render_next_scene_label()
         if self._scene_label_sticky.strip().upper() == "END":
             self._metronome_end_muted = True
             self.shared_state.set_metronome_end_muted(True)
@@ -3427,41 +3531,43 @@ class App:
             if self._mode_cache == "link" and self.link is not None:
                 if self._metronome_on and not self._metronome_end_muted:
                     try:
-                        quantum = float(max(1, self._beats_per_bar_cache))
-                        # Latence positive = interroge Link dans le futur, donc
-                        # déclenche le clic plus tôt (compense la latence de
-                        # sortie audio, voir "Latence clic (ms)" dans l'UI).
-                        offset_micros = int(self._metronome_latency_ms_cache * 1000)
-                        snapshot = self.link.snapshot(quantum=quantum, offset_micros=offset_micros)
-                        connected = self.link.num_peers >= 1 and snapshot["is_playing"]
-                        if connected:
-                            beat = self._metronome_next_beat(
-                                quantum, snapshot, "_metronome_beat_in_bar",
-                                "_metronome_prev_fractional", "_metronome_last_update_time",
-                                "_metronome_awaiting_downbeat", "_metronome_awaiting_scene_start",
-                            )
-                            if beat is not None:
-                                self._audio_metronome.play(beat)
-                        else:
-                            self._metronome_awaiting_downbeat = True
+                        with self._metronome_state_lock:
+                            quantum = float(max(1, self._beats_per_bar_cache))
+                            # Latence positive = interroge Link dans le futur, donc
+                            # déclenche le clic plus tôt (compense la latence de
+                            # sortie audio, voir "Latence clic (ms)" dans l'UI).
+                            offset_micros = int(self._metronome_latency_ms_cache * 1000)
+                            snapshot = self.link.snapshot(quantum=quantum, offset_micros=offset_micros)
+                            connected = self.link.num_peers >= 1 and snapshot["is_playing"]
+                            if connected:
+                                beat = self._metronome_next_beat(
+                                    quantum, snapshot, "_metronome_beat_in_bar",
+                                    "_metronome_prev_fractional", "_metronome_last_update_time",
+                                    "_metronome_awaiting_downbeat", "_metronome_awaiting_scene_start",
+                                )
+                                if beat is not None:
+                                    self._audio_metronome.play(beat)
+                            else:
+                                self._metronome_awaiting_downbeat = True
                     except Exception:
                         pass
                 if self._metronome_on_2 and not self._metronome_end_muted:
                     try:
-                        quantum = float(max(1, self._beats_per_bar_cache))
-                        offset_micros_2 = int(self._metronome_latency_ms_cache_2 * 1000)
-                        snapshot_2 = self.link.snapshot(quantum=quantum, offset_micros=offset_micros_2)
-                        connected_2 = self.link.num_peers >= 1 and snapshot_2["is_playing"]
-                        if connected_2:
-                            beat_2 = self._metronome_next_beat(
-                                quantum, snapshot_2, "_metronome_beat_in_bar_2",
-                                "_metronome_prev_fractional_2", "_metronome_last_update_time_2",
-                                "_metronome_awaiting_downbeat_2", "_metronome_awaiting_scene_start_2",
-                            )
-                            if beat_2 is not None:
-                                self._audio_metronome_2.play(beat_2)
-                        else:
-                            self._metronome_awaiting_downbeat_2 = True
+                        with self._metronome_state_lock:
+                            quantum = float(max(1, self._beats_per_bar_cache))
+                            offset_micros_2 = int(self._metronome_latency_ms_cache_2 * 1000)
+                            snapshot_2 = self.link.snapshot(quantum=quantum, offset_micros=offset_micros_2)
+                            connected_2 = self.link.num_peers >= 1 and snapshot_2["is_playing"]
+                            if connected_2:
+                                beat_2 = self._metronome_next_beat(
+                                    quantum, snapshot_2, "_metronome_beat_in_bar_2",
+                                    "_metronome_prev_fractional_2", "_metronome_last_update_time_2",
+                                    "_metronome_awaiting_downbeat_2", "_metronome_awaiting_scene_start_2",
+                                )
+                                if beat_2 is not None:
+                                    self._audio_metronome_2.play(beat_2)
+                            else:
+                                self._metronome_awaiting_downbeat_2 = True
                     except Exception:
                         pass
             self._metronome_thread_stop.wait(0.01)
@@ -3794,6 +3900,16 @@ class App:
             and loop_beats_remaining is not None
             and 0 < loop_beats_remaining <= 4
         )
+        loop_reprise = (
+            connected
+            and self._loop_button_state == "active"
+            and not self._loop_exit_pending
+            and loop_beats_remaining is not None
+            and 0 < loop_beats_remaining <= NEXT_LABEL_ANNOUNCE_BEATS
+        )
+        if loop_reprise != self._loop_reprise:
+            self._loop_reprise = loop_reprise
+            self._render_next_scene_label()
         self._render_loop_button(fractional, connected)
         # En mode Link, le clic est déclenché par _metronome_loop (thread à
         # part, insensible aux gels de _poll/after() sous macOS) ; ici on ne
@@ -3812,7 +3928,12 @@ class App:
         # clignotant SANS fade (bascule nette, pas d'interpolation), sur une
         # demi-temps, à CHAQUE temps (2x plus vite que le "un temps sur deux"
         # précédent), fixe (pas de clignotement) si pas connecté.
-        if self._next_scene_label_sticky:
+        if self._loop_reprise:
+            next_label_fg = "#e0342b" if fractional < 0.5 else BG_IDLE
+            self.next_scene_label_label.config(text="REPRISE", fg=next_label_fg)
+        elif self._loop_button_state == "active" and not self._loop_exit_pending:
+            self.next_scene_label_label.config(text="")
+        elif self._next_scene_label_sticky:
             next_label_fg = (
                 ("#ffffff" if fractional < 0.5 else BG_IDLE) if connected else "#ffffff"
             )

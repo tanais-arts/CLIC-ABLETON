@@ -15,11 +15,45 @@ paroles" attendu par beat_display.py, jamais une exception.
 from __future__ import annotations
 
 import csv
+import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 BARS_PER_LINE = 8
 TEXT_COLUMN_INDEX = 5  # colonne "Discours" (6e, 0-indexée)
+
+
+def _canonical_scene_name(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name.replace("’", "'"))
+    normalized = normalized.encode("ascii", "ignore").decode().lower()
+    normalized = re.sub(r"\b[ldjtmns]'", "", normalized)
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _one_substitution_apart(left: str, right: str) -> bool:
+    return len(left) == len(right) and sum(a != b for a, b in zip(left, right)) == 1
+
+
+def _lyrics_path(scene_name: str, base_dir: Path) -> Path | None:
+    folder = base_dir / "Lyrics"
+    exact = folder / f"{scene_name}.csv"
+    if exact.is_file():
+        return exact
+
+    wanted = _canonical_scene_name(scene_name)
+    candidates = list(folder.glob("*.csv"))
+    normalized_matches = [path for path in candidates if _canonical_scene_name(path.stem) == wanted]
+    if len(normalized_matches) == 1:
+        return normalized_matches[0]
+    if normalized_matches:
+        return None
+
+    near_matches = [
+        path for path in candidates
+        if _one_substitution_apart(_canonical_scene_name(path.stem), wanted)
+    ]
+    return near_matches[0] if len(near_matches) == 1 else None
 
 
 @dataclass(frozen=True)
@@ -46,11 +80,11 @@ class LyricsSheet:
 
 
 def load_lyrics(scene_name: str, base_dir: Path, log=print) -> LyricsSheet | None:
-    """Charge `<base_dir>/Lyrics/<scene_name>.csv` si le fichier existe, sinon None."""
+    """Charge le CSV de paroles correspondant au nom de scène, sinon None."""
     if not scene_name:
         return None
-    path = base_dir / "Lyrics" / f"{scene_name}.csv"
-    if not path.is_file():
+    path = _lyrics_path(scene_name, base_dir)
+    if path is None:
         return None
     try:
         with open(path, "r", encoding="utf-8", newline="") as handle:
@@ -72,8 +106,8 @@ def save_lyrics_line(scene_name: str, base_dir: Path, line_index: int, text: str
     l'en-tête) dans le CSV, sans toucher aux autres colonnes/lignes (édition
     en direct depuis beat_display.py). False si le fichier ou la ligne
     n'existe pas (jamais d'exception)."""
-    path = base_dir / "Lyrics" / f"{scene_name}.csv"
-    if not path.is_file():
+    path = _lyrics_path(scene_name, base_dir)
+    if path is None:
         return False
     try:
         with open(path, "r", encoding="utf-8", newline="") as handle:

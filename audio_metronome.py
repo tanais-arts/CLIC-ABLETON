@@ -28,6 +28,24 @@ def list_output_devices() -> list[str]:
         return []
 
 
+def output_channel_count(device_name: str = "") -> int:
+    """Nombre de sorties disponibles sur le périphérique choisi (ou par défaut)."""
+    try:
+        info = sd.query_devices(device_name or None, "output")
+        return max(1, int(info["max_output_channels"]))
+    except Exception:
+        return 2
+
+
+def output_channel_starts(device_name: str, channels: int) -> list[int]:
+    """Premiers canaux valides pour les choix mono ou paires stéréo."""
+    count = output_channel_count(device_name)
+    if channels == 1:
+        return list(range(1, count + 1))
+    starts = list(range(1, count, 2))
+    return starts or [1]
+
+
 def list_kits() -> list[str]:
     """Sous-dossiers de sounds/ contenant bien click.wav + click_up.wav
     (un "kit" de sons de clic), pour peupler le sélecteur."""
@@ -55,9 +73,7 @@ def _load_wav_mono(path: Path) -> tuple[np.ndarray, int]:
 
 
 class AudioMetronome:
-    """Joue click.wav (temps normal) / click_up.wav (temps 1) sur la carte
-    son et le nombre de canaux choisis (paire stéréo ou mono — toujours les
-    premiers canaux du périphérique).
+    """Joue les samples sur les canaux mono/stéréo choisis de la carte son.
 
     Garde un unique OutputStream ouvert tant que le métronome est activé
     (voir set_enabled) : sd.play() ouvre/ferme un flux CoreAudio à CHAQUE
@@ -71,6 +87,8 @@ class AudioMetronome:
         self._click_up, _ = _load_wav_mono(_SOUNDS_DIR / DEFAULT_KIT / "click_up.wav")
         self.device_name: str | None = None
         self.channels: int = 2
+        self.first_channel: int = 1
+        self.stream_channels: int = 2
         self.volume: float = 1.0
         self._prepared_click: np.ndarray
         self._prepared_click_up: np.ndarray
@@ -80,9 +98,12 @@ class AudioMetronome:
         self._play_pos: int = 0
         self._pending: np.ndarray | None = None
 
-    def configure(self, device_name: str, channels: int) -> None:
+    def configure(self, device_name: str, channels: int, first_channel: int = 1) -> None:
         self.device_name = device_name or None
         self.channels = 1 if channels == 1 else 2
+        valid_starts = output_channel_starts(device_name, self.channels)
+        self.first_channel = first_channel if first_channel in valid_starts else valid_starts[0]
+        self.stream_channels = self.first_channel + self.channels - 1
         self._prepare_buffers()
         if self._stream is not None:
             self._open_stream()
@@ -130,7 +151,7 @@ class AudioMetronome:
         self._close_stream()
         try:
             self._stream = sd.OutputStream(
-                samplerate=self._click_sr, device=self.device_name, channels=self.channels,
+                samplerate=self._click_sr, device=self.device_name, channels=self.stream_channels,
                 dtype="float32", callback=self._audio_callback,
             )
             self._stream.start()
@@ -171,9 +192,12 @@ class AudioMetronome:
 
     def _prepare(self, mono: np.ndarray) -> np.ndarray:
         mono = mono * self.volume
-        if self.channels == 1:
-            return mono.reshape(-1, 1)
-        return np.column_stack([mono, mono])
+        output = np.zeros((len(mono), self.stream_channels), dtype=np.float32)
+        first = self.first_channel - 1
+        output[:, first] = mono
+        if self.channels == 2:
+            output[:, first + 1] = mono
+        return output
 
     def _prepare_buffers(self) -> None:
         """Prépare les deux samples au format de sortie hors du chemin temps réel."""

@@ -39,6 +39,9 @@ pip install -r requirements.txt
 5. Les champs **Latence clic (ms)** des réglages AUDIO compensent séparément
    le délai de M1 et M2 sur leurs interfaces respectives. Une valeur positive
    avance le clic ; elle agit dès la saisie et est mémorisée automatiquement.
+   Le menu **Canaux carte** permet de choisir la paire physique de chaque
+   métronome (par exemple **3-4** sur l'AIR 192) ; en mono, il propose une
+   sortie individuelle. Le réglage est mémorisé séparément pour M1 et M2.
 6. **Régler le tempo** : saisir la valeur voulue dans le champ "Régler le
    tempo" — elle est envoyée à toute la session Link (Live inclus) à la
    validation (flèches, touche Entrée ou en cliquant ailleurs), pas à chaque
@@ -166,4 +169,7 @@ affiche son adresse dans la fenêtre (ex. `http://192.168.1.144:8765`). Sur le
 téléphone du batteur (connecté au **même réseau Wi-Fi** que l'ordinateur),
 ouvrir cette adresse dans un navigateur : le même compteur (grand chiffre +
 BPM) s'affiche et se met à jour en continu, sans rien installer.
+La page tente automatiquement d'empêcher la veille à son ouverture et à chaque
+retour au premier plan. Sur iPhone, l'API native exige HTTPS; avec l'adresse
+HTTP locale, la vidéo muette reste un secours sans garantie de blocage.
 

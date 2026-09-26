@@ -34,11 +34,11 @@ DEFAULTS = {
     # E-2 (note 4) active/désactive la boucle définie par la colonne LOOP.
     # M2 reste commandé uniquement depuis son bouton dans l'interface.
     "controller_map_loop": ["note", 0, 4],
-    # Carte son et nombre de canaux pour le métronome audio local.
-    # "" = périphérique de sortie par défaut du système. channels : 2 = paire
-    # stéréo, 1 = mono (toujours les premiers canaux du périphérique).
+    # Carte son et canaux physiques pour le métronome audio local.
+    # "" = périphérique par défaut ; output_channel = premier canal (1-based).
     "metronome_audio_device": "",
     "metronome_audio_channels": 2,
+    "metronome_audio_output_channel": 1,
     # Dossier de sons de clic (sounds/<kit>/click.wav + click_up.wav), voir
     # audio_metronome.list_kits().
     "metronome_kit": "Kit1",
@@ -50,6 +50,7 @@ DEFAULTS = {
     # parallèle de la première quand activée (2 musiciens, clics différents).
     "metronome_audio_device_2": "",
     "metronome_audio_channels_2": 2,
+    "metronome_audio_output_channel_2": 1,
     "metronome_kit_2": "Kit1",
     "metronome_audio_latency_ms_2": 10,
     # Volume commun aux deux sorties du métronome (pourcentage).
